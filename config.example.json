@@ -1,0 +1,61 @@
+{
+  "database": "scholar.db",
+  "start_year": 2000,
+  "max_results": 1000,
+
+  "browser": {
+    "kind": "",
+    "executable": "",
+    "profile_dir": "",
+    "debug_port": 9222,
+    "headless": false
+  },
+
+  "timing": {
+    "between_pages_ms": [30000, 60000],
+    "between_searches_ms": [60000, 120000],
+    "plan_between_searches_ms": [15000, 30000],
+    "typing_char_ms": [80, 250],
+    "after_captcha_ms": [30000, 90000],
+    "click_move_step_ms": [12, 40],
+    "scroll_step_ms": [100, 350],
+    "read_scroll_prob": 0.5
+  },
+
+  "adaptive_throttle": {
+    "enabled": true,
+    "step": 0.2,
+    "max": 2.5
+  },
+
+  "keywords": [
+    "learning", "neural", "network", "model", "data", "deep",
+    "training", "image", "language", "system", "method", "optimization",
+    "algorithm", "approach", "classification", "detection", "generation",
+    "reinforcement", "representation", "attention", "graph", "clustering",
+    "robot", "speech", "recognition", "prediction", "text", "video"
+  ],
+
+  "conferences": [
+    { "name": "ICML",       "query": "\"International Conference on Machine Learning\"" },
+    { "name": "ICLR",       "query": "\"International Conference on Learning Representations\"" },
+    { "name": "AAAI",       "query": "\"AAAI Conference on Artificial Intelligence\"" },
+    { "name": "IJCAI",      "query": "\"International Joint Conference on Artificial Intelligence\"" },
+    { "name": "CVPR",       "query": "\"IEEE/CVF Conference on Computer Vision and Pattern Recognition\"" },
+    { "name": "ICCV",       "query": "\"International Conference on Computer Vision\"" },
+    { "name": "ECCV",       "query": "\"European Conference on Computer Vision\"" },
+    { "name": "ACL",        "query": "\"Annual Meeting of the Association for Computational Linguistics\"" },
+    { "name": "EMNLP",      "query": "\"Conference on Empirical Methods in Natural Language Processing\"" },
+    { "name": "NAACL",      "query": "\"Annual Conference of the North American Chapter of the ACL\"" },
+    { "name": "KDD",        "query": "\"ACM SIGKDD Conference on Knowledge Discovery and Data Mining\"" },
+    { "name": "WWW",        "query": "\"International World Wide Web Conference\"" },
+    { "name": "SIGIR",      "query": "\"ACM SIGIR Conference on Research and Development in Information Retrieval\"" },
+    { "name": "UAI",        "query": "\"Conference on Uncertainty in Artificial Intelligence\"" },
+    { "name": "ICRA",       "query": "\"IEEE International Conference on Robotics and Automation\"" },
+    { "name": "IROS",       "query": "\"IEEE/RSJ International Conference on Intelligent Robots and Systems\"" },
+    { "name": "AAMAS",      "query": "\"International Conference on Autonomous Agents and Multiagent Systems\"" },
+    { "name": "ICDM",       "query": "\"IEEE International Conference on Data Mining\"" },
+    { "name": "INTERSPEECH", "query": "\"Conference of the International Speech Communication Association\"" },
+    { "name": "NeurIPS",    "query": "\"Conference on Neural Information Processing Systems\"" }
+  ]
+}

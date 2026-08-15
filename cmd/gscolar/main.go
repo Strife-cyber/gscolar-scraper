@@ -1,0 +1,178 @@
+// Command gscolar is the Google Scholar scraper's single executable.
+//
+// Usage:
+//
+//	gscolar -config config.json -status
+//	gscolar -config config.json -plan            # plan every conference
+//	gscolar -config config.json -plan -conference ICML
+//	gscolar -config config.json -crawl           # crawl pending tasks
+//	gscolar -config config.json -crawl -conference ICML
+//	gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
+//
+// -plan and -crawl both drive the real browser and are resumable: re-running
+// them continues from the database's checkpoints (every page is committed
+// atomically with the task's page pointer).
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+
+	"gscolar-scraper/internal/browser"
+	"gscolar-scraper/internal/config"
+	"gscolar-scraper/internal/crawl"
+	"gscolar-scraper/internal/db"
+)
+
+func main() {
+	cfgPath := flag.String("config", "config.json", "path to the JSON config")
+	dbPath := flag.String("db", "", "SQLite database path (overrides config.database)")
+	doPlan := flag.Bool("plan", false, "compute/sync the task plan (drives the browser)")
+	doCrawl := flag.Bool("crawl", false, "crawl pending tasks (drives the browser)")
+	doStatus := flag.Bool("status", false, "print progress statistics and exit")
+	confName := flag.String("conference", "", "restrict -plan/-crawl to one conference by name")
+	flag.Usage = usage
+	flag.Parse()
+
+	logger := log.New(os.Stderr, "gscolar ", log.LstdFlags)
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		logger.Fatalf("config: %v", err)
+	}
+	if *dbPath != "" {
+		cfg.Database = *dbPath
+	}
+
+	ctx := context.Background()
+	d, err := db.Open(cfg.Database)
+	if err != nil {
+		logger.Fatalf("db: %v", err)
+	}
+	defer d.Close()
+
+	// Keep the conferences table in sync with the config (upserts are idempotent).
+	if err := seedConferences(ctx, d, cfg.Conferences); err != nil {
+		logger.Fatalf("seed conferences: %v", err)
+	}
+
+	if *doStatus {
+		printStatus(ctx, d)
+		if !*doPlan && !*doCrawl {
+			return
+		}
+		fmt.Println()
+	}
+
+	if !*doPlan && !*doCrawl {
+		flag.Usage()
+		return
+	}
+
+	confs, err := selectConferences(ctx, d, *confName)
+	if err != nil {
+		logger.Fatalf("%v", err)
+	}
+
+	br := browser.New(cfg)
+	if err := br.Connect(); err != nil {
+		logger.Fatalf("browser: %v", err)
+	}
+	defer br.Close()
+
+	c := crawl.New(cfg, d, br, logger)
+
+	for _, conf := range confs {
+		if *doPlan {
+			need, err := c.PlanConference(ctx, conf)
+			if err != nil {
+				logger.Printf("plan %s: %v", conf.Name, err)
+				continue
+			}
+			logger.Printf("%s planned: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need)
+		}
+		if *doCrawl {
+			if err := c.CrawlConference(ctx, conf.ID); err != nil {
+				logger.Printf("crawl %s: %v", conf.Name, err)
+				continue
+			}
+		}
+	}
+}
+
+// seedConferences upserts every config entry into the conferences table.
+func seedConferences(ctx context.Context, d *db.DB, cfgs []config.ConferenceCfg) error {
+	for _, c := range cfgs {
+		if _, err := d.UpsertConference(ctx, c.Name, c.Query); err != nil {
+			return fmt.Errorf("%s: %w", c.Name, err)
+		}
+	}
+	return nil
+}
+
+// selectConferences filters the stored list by name, or returns all.
+func selectConferences(ctx context.Context, d *db.DB, name string) ([]db.Conference, error) {
+	all, err := d.ListConferences(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list conferences: %w", err)
+	}
+	if name == "" {
+		return all, nil
+	}
+	for _, c := range all {
+		if c.Name == name {
+			return []db.Conference{c}, nil
+		}
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		names = append(names, c.Name)
+	}
+	return nil, fmt.Errorf("no conference named %q (known: %v)", name, names)
+}
+
+// countLeaves returns the number of tasks recorded for a conference.
+func countLeaves(ctx context.Context, d *db.DB, confID int64) int {
+	tasks, err := d.AllTasks(ctx, confID)
+	if err != nil {
+		return -1
+	}
+	return len(tasks)
+}
+
+// printStatus prints global and per-conference progress counters.
+func printStatus(ctx context.Context, d *db.DB) {
+	s, err := d.GetStats(ctx)
+	if err != nil {
+		log.Printf("status: %v", err)
+		return
+	}
+	fmt.Printf("conferences:  %d\n", s.Conferences)
+	fmt.Printf("papers:       %d unique\n", s.Papers)
+	fmt.Printf("pages:        %d raw pages stored\n", s.Pages)
+	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split\n",
+		s.Pending, s.Running, s.Completed, s.NeedsSplit)
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `gscolar - stealthy Google Scholar scraper
+
+Usage:
+  gscolar [flags]
+
+Flags:
+  -config path     JSON config file (default "config.json")
+  -db path         SQLite database path (overrides config.database)
+  -plan            compute/sync the task plan for each conference
+  -crawl           crawl pending tasks (resumable from checkpoints)
+  -conference name restrict -plan/-crawl to one conference (e.g. ICML)
+  -status          print progress statistics
+
+The crawler drives your real Chrome/Edge on its normal profile. Before the
+first run, close your browser so the scraper can relaunch it with remote
+debugging enabled.
+`)
+}
