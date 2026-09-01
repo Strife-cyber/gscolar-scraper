@@ -56,9 +56,14 @@ func main() {
 	if err != nil {
 		logger.Fatalf("db: %v", err)
 	}
-	defer d.Close()
+	defer func(d *db.DB) {
+		err := d.Close()
+		if err != nil {
+			return
+		}
+	}(d)
 
-	// Keep the conferences table in sync with the config (upserts are idempotent).
+	// Keep the conference table in sync with the config (upserts are idempotent).
 	if err := seedConferences(ctx, d, cfg.Conferences); err != nil {
 		logger.Fatalf("seed conferences: %v", err)
 	}
@@ -85,11 +90,16 @@ func main() {
 	// never touches the browser; only -plan/-crawl launch it. browser.New(cfg)
 	// merely constructs the client — Connect() is what spawns/attaches Chrome.
 	br := browser.New(cfg)
-	if (*doPlan || *doCrawl) {
+	if *doPlan || *doCrawl {
 		if err := br.Connect(); err != nil {
 			logger.Fatalf("browser: %v", err)
 		}
-		defer br.Close()
+		defer func(br *browser.Browser) {
+			err := br.Close()
+			if err != nil {
+				return
+			}
+		}(br)
 	}
 	c := crawl.New(cfg, d, br, logger)
 
@@ -174,7 +184,7 @@ func printStatus(ctx context.Context, d *db.DB) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `gscolar - stealthy Google Scholar scraper
+	_, err := fmt.Fprintf(os.Stderr, `gscolar - stealthy Google Scholar scraper
 
 Usage:
   gscolar [flags]
@@ -192,4 +202,7 @@ The crawler drives your real Chrome/Edge on its normal profile. Before the
 first run, close your browser so the scraper can relaunch it with remote
 debugging enabled.
 `)
+	if err != nil {
+		return
+	}
 }

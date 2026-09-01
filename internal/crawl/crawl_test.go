@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-rod/rod"
 
+	"gscolar-scraper/internal/browser"
 	"gscolar-scraper/internal/config"
 	"gscolar-scraper/internal/db"
 	"gscolar-scraper/internal/hash"
@@ -20,33 +21,53 @@ import (
 
 // fakeBrowser serves recorded pages in order. A fresh Search rewinds to the
 // first page; ClickNext advances. It satisfies the Browserer interface so the
-// whole crawl loop runs offline.
+// whole crawl loop runs offline. The err* fields let tests inject a failure
+// from a specific method to exercise crawlTask's error paths.
 type fakeBrowser struct {
 	contents []string // page HTML in the order ClickNext would reach them
 	idx      int
+
+	searchErr    error // returned by Search, once, then cleared
+	contentErr   error // returned by Content on every call
+	clickNextErr error // returned by ClickNext instead of the normal advance/end behavior
+	blocked      bool  // IsBlocked() return value
+	captchaErr   error // returned by WaitForCaptchaResolved
 }
 
-func (f *fakeBrowser) Search(_ string, _, _ int) error { f.idx = 0; return nil }
+func (f *fakeBrowser) Search(_ string, _, _ int) error {
+	f.idx = 0
+	if err := f.searchErr; err != nil {
+		f.searchErr = nil
+		return err
+	}
+	return nil
+}
 func (f *fakeBrowser) Content() (string, error) {
+	if f.contentErr != nil {
+		return "", f.contentErr
+	}
 	if f.idx >= len(f.contents) {
 		return "", nil
 	}
 	return f.contents[f.idx], nil
 }
 func (f *fakeBrowser) ClickNext() error {
+	if f.clickNextErr != nil {
+		return f.clickNextErr
+	}
 	if f.idx+1 >= len(f.contents) {
 		return &rod.ElementNotFoundError{}
 	}
 	f.idx++
 	return nil
 }
-func (f *fakeBrowser) IsBlocked() bool                     { return false }
-func (f *fakeBrowser) WaitForCaptchaResolved() error       { return nil }
-func (f *fakeBrowser) IncreaseThrottle()                   {}
-func (f *fakeBrowser) PauseBetweenPages()                  {}
-func (f *fakeBrowser) PauseBetweenSearches()               {}
-func (f *fakeBrowser) PausePlanning()                      {}
-func (f *fakeBrowser) MaybeReadingScroll() error           { return nil }
+func (f *fakeBrowser) IsBlocked() bool               { return f.blocked }
+func (f *fakeBrowser) WaitForCaptchaResolved() error { return f.captchaErr }
+func (f *fakeBrowser) IncreaseThrottle()             {}
+func (f *fakeBrowser) PauseBetweenPages()            {}
+func (f *fakeBrowser) PauseBetweenSearches()         {}
+func (f *fakeBrowser) PausePlanning()                {}
+func (f *fakeBrowser) MaybeReadingScroll() error     { return nil }
 
 // readSample loads one of the recorded Scholar pages used by the parser tests.
 func readSample(t *testing.T, name string) string {
@@ -274,6 +295,100 @@ func TestCrawlTaskStartsEmpty(t *testing.T) {
 	s := statusCounts(t, d)
 	if s.Completed != 1 || s.Papers != 0 {
 		t.Fatalf("expected empty completion, got %+v", s)
+	}
+}
+
+// TestCrawlTaskSearchFails: a non-blocked Search error must fail the task
+// with StatusError, not silently retry or hang.
+func TestCrawlTaskSearchFails(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{readSample(t, "normal")}, searchErr: fmt.Errorf("network unreachable")}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error, got %+v", task)
+	}
+	if task.Error == "" {
+		t.Error("expected the search failure reason to be recorded")
+	}
+}
+
+// TestCrawlTaskCaptchaNotResolvedDuringSearch: issueSearch propagates a failed
+// CAPTCHA wait as a task error rather than looping forever.
+func TestCrawlTaskCaptchaNotResolvedDuringSearch(t *testing.T) {
+	fb := &fakeBrowser{
+		contents:   []string{readSample(t, "normal")},
+		searchErr:  browser.ErrBlocked,
+		captchaErr: fmt.Errorf("captcha timed out"),
+	}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error, got %+v", task)
+	}
+}
+
+// TestCrawlTaskResumeClickNextFails: a ClickNext failure other than
+// end-of-results during the resume fast-forward must fail the task, not be
+// mistaken for "resume pointer past end".
+func TestCrawlTaskResumeClickNextFails(t *testing.T) {
+	fb := &fakeBrowser{
+		contents:     []string{readSample(t, "normal"), readSample(t, "normal")},
+		clickNextErr: fmt.Errorf("stale element"),
+	}
+	d, c := setup(t, 3, fb) // pointer 3 forces at least one resume ClickNext
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error on resume ClickNext failure, got %+v", task)
+	}
+	if task.Page != 3 {
+		t.Errorf("resume pointer must be untouched on failure, got %d", task.Page)
+	}
+}
+
+// TestCrawlTaskContentFails: a browser Content() failure mid-crawl fails the
+// task with StatusError.
+func TestCrawlTaskContentFails(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{readSample(t, "normal")}, contentErr: fmt.Errorf("tab crashed")}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error, got %+v", task)
+	}
+}
+
+// TestCrawlTaskCaptchaNotResolvedDuringPagination: IsBlocked() true plus a
+// failed CAPTCHA wait inside the main pagination loop fails the task instead
+// of looping forever.
+func TestCrawlTaskCaptchaNotResolvedDuringPagination(t *testing.T) {
+	fb := &fakeBrowser{
+		contents:   []string{readSample(t, "normal"), readSample(t, "empty")},
+		blocked:    true,
+		captchaErr: fmt.Errorf("captcha timed out"),
+	}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error, got %+v", task)
 	}
 }
 

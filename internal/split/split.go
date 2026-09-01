@@ -14,33 +14,27 @@
 //     This is an exact, exhaustive partition — every paper has exactly one
 //     year, so nothing overlaps or falls between the cracks.
 //
-//  2. Sequential keyword subtraction (for a single year still over the cap).
-//     With an ordered keyword list [A, B, C, …] we emit the chain
+//  2. Recursive balance-guided keyword splitting (for a single year still over
+//     the cap), via ResolveOverCap. At each over-cap node, up to probesPerNode
+//     keyword candidates are counted and the one whose with/without split is
+//     closest to even (and at least minBalance) is chosen. The node then
+//     becomes exactly two disjoint children:
 //
-//     q AND "A"
-//     q AND "B" -"A"
-//     q AND "C" -"A" -"B"
-//     …        (each paper lands in the first keyword bucket it matches)
-//     q -"A" -"B" -"C" …   (residual: papers matching none of the words)
+//     parent AND "keyword"
+//     parent AND NOT "keyword"
 //
-//     Buckets that count as 0 results are omitted (they contribute no papers),
-//     and if one keyword already accounts for every result the chain stops
-//     early — later buckets and the residual are then provably empty.
+//     and recursion continues independently on each until every leaf is under
+//     the cap. A keyword is never reused on a branch once it has split that
+//     branch's ancestor. Degenerate keywords (substrings of the base query,
+//     which cannot split anything) are dropped before recursion begins, and at
+//     most maxKeywords candidates are considered.
 //
-//     A keyword that is a substring of the base query is dropped before the
-//     chain runs. Such a keyword appears in every paper's publication field
-//     (e.g. "learning" for "International Conference on Machine Learning"), so
-//     including it captures every result and excluding it removes every result —
-//     it cannot split the space and would otherwise force the chain to collapse
-//     into a single leaf.
-//
-//     Only the first maxKeywords keywords are used, so every query carries at
-//     most that many keyword terms (no unbounded subtraction lists); papers
-//     matching keywords beyond the cap land in the residual bucket.
-//
-//     Every leaf that still exceeds the cap is flagged NeedsSplit instead of
-//     being subdivided further — it is recorded as a TODO for a later,
-//     conference-specific re-split (the spec's "note it and tackle it later").
+//     If a node cannot be proven to split (no candidate keyword divides it
+//     within budget, or every candidate falls below minBalance, or the keyword
+//     or probe budget is exhausted), the whole subtree fails atomically: no
+//     partial set of resolved leaves is returned, and the original node is kept
+//     as a single NeedsSplit leaf — a TODO for a later, conference-specific
+//     re-split (the spec's "note it and tackle it later").
 package split
 
 import (
@@ -67,33 +61,36 @@ type CountFunc func(query string, yearFrom, yearTo int) (count int, ok bool)
 // Plan partitions the [yearFrom, yearTo] result space of baseQuery into
 // disjoint leaf tasks, walking the range in 2-year windows (a trailing odd year
 // is its own window), narrowing an oversized 2-year window to its two single
-// years, and applying the sequential keyword chain to any single year still
-// over the cap.
+// years, and recursively splitting any single year still over the cap via
+// ResolveOverCap.
 //
-// maxKeywords caps the number of keywords the chain may use: it bounds the
-// length of every generated query to at most maxKeywords keyword terms (the
-// include word plus its excludes), and papers matching keywords beyond the cap
-// fall into the residual bucket.
-func Plan(baseQuery string, yearFrom, yearTo, limit int, keywords []string, count CountFunc, maxKeywords int) ([]Leaf, error) {
+// maxKeywords caps the number of candidate keywords considered for recursive
+// splitting (see ResolveOverCap for the >=0 / ==0 / <0 convention). maxProbes
+// is the per-node probe budget and minBalance the minimum acceptable
+// with/without balance; both are forwarded to ResolveOverCap unchanged.
+func Plan(baseQuery string, yearFrom, yearTo, limit, maxKeywords, maxProbes int, keywords []string, count CountFunc, minBalance float64) ([]Leaf, error) {
 	if baseQuery == "" {
 		return nil, fmt.Errorf("split: empty base query")
 	}
 	if yearTo < yearFrom {
 		return nil, fmt.Errorf("split: yearTo %d < yearFrom %d", yearTo, yearFrom)
 	}
-	return planRange(baseQuery, yearFrom, yearTo, limit, keywords, count, maxKeywords)
+	if minBalance < 0.0 || minBalance > 1.0 {
+		return nil, fmt.Errorf("split: minBalance %v out of range [0.0, 1.0]", minBalance)
+	}
+	return planRange(baseQuery, yearFrom, yearTo, limit, keywords, count, maxKeywords, maxProbes, minBalance)
 }
 
 // planRange walks [ylo, yhi] in chronological 2-year windows so the plan reads
 // 2000-2001, 2002-2003, … rather than starting from the whole-range count.
-func planRange(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, maxKeywords int) ([]Leaf, error) {
+func planRange(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, maxKeywords, maxProbes int, minBalance float64) ([]Leaf, error) {
 	var leaves []Leaf
 	for a := ylo; a <= yhi; a += 2 {
 		b := a + 1
 		if b > yhi {
 			b = a // trailing odd year
 		}
-		ws, err := planWindow(baseQuery, a, b, limit, keywords, count, maxKeywords)
+		ws, err := planWindow(baseQuery, a, b, limit, keywords, count, maxKeywords, maxProbes, minBalance)
 		if err != nil {
 			return nil, err
 		}
@@ -105,7 +102,7 @@ func planRange(baseQuery string, ylo, yhi, limit int, keywords []string, count C
 // planWindow plans one base window of one or two years. A window under the cap
 // (or whose count could not be read) is a single leaf; a 2-year window over the
 // cap narrows to its two single years, each planned recursively.
-func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, maxKeywords int) ([]Leaf, error) {
+func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, maxKeywords, maxProbes int, minBalance float64) ([]Leaf, error) {
 	n, ok := count(baseQuery, ylo, yhi)
 	if !ok || n <= limit {
 		return []Leaf{{
@@ -122,7 +119,7 @@ func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count 
 	if ylo < yhi {
 		var leaves []Leaf
 		for _, y := range []int{ylo, yhi} {
-			l, err := planWindow(baseQuery, y, y, limit, keywords, count, maxKeywords)
+			l, err := planWindow(baseQuery, y, y, limit, keywords, count, maxKeywords, maxProbes, minBalance)
 			if err != nil {
 				return nil, err
 			}
@@ -131,107 +128,39 @@ func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count 
 		return leaves, nil
 	}
 
-	// A single year over the cap: sequential keyword chain. The base count is
-	// passed along so the chain can detect the (common) case where one keyword
-	// already covers every result and stop early.
-	return chainSplit(baseQuery, ylo, yhi, limit, keywords, count, n, maxKeywords)
-}
-
-// chainSplit emits the ordered subtraction chain for one year. The residual
-// bucket (papers matching none of the keywords) is appended so the union of all
-// leaves is exhaustive.
-//
-// Only the first maxKeywords keywords are used (0 means none). Every generated
-// query therefore carries at most maxKeywords keyword terms — the include word
-// plus the preceding excludes — so no search box is ever stuffed with an
-// unbounded subtraction list. Keywords beyond the cap are never searched; their
-// papers fall into the residual.
-//
-// Two empty-bucket optimizations keep the chain from searching queries that are
-// provably empty:
-//
-//   - A keyword bucket reported as 0 results is not emitted (no paper's first
-//     match is that keyword, so it contributes nothing) and later buckets are
-//     unaffected.
-//   - If a bucket's count equals the base count, that keyword already accounts
-//     for every result; the chain verifies with a single residual search that
-//     nothing remains and stops. Every later bucket and the final residual are
-//     subsets of that zero set, so skipping them loses no coverage.
-func chainSplit(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, baseCount, maxKeywords int) ([]Leaf, error) {
-	// A keyword that is part of the venue phrase cannot split it (see the
-	// package doc); dropping it lets the remaining keywords actually partition
-	// the result space.
-	keywords = dropDegenerateKeywords(baseQuery, keywords)
-	if maxKeywords >= 0 && len(keywords) > maxKeywords {
-		keywords = keywords[:maxKeywords]
-	}
-	if len(keywords) == 0 {
-		n, ok := count(baseQuery, ylo, yhi)
-		return []Leaf{{
-			Query:      baseQuery,
-			YearFrom:   ylo,
-			YearTo:     yhi,
-			Count:      n,
-			HasCount:   ok,
-			NeedsSplit: ok && n > limit,
-		}}, nil
-	}
-
-	var leaves []Leaf
-	used := []string{}
-	for _, w := range keywords {
-		q := baseQuery + ` AND "` + w + `"`
-		for _, p := range used {
-			q += ` -"` + p + `"`
-		}
-		n, ok := count(q, ylo, yhi)
-		if ok && n == 0 {
-			used = append(used, w)
-			continue
-		}
-		leaves = append(leaves, Leaf{
-			Query:      q,
-			YearFrom:   ylo,
-			YearTo:     yhi,
-			Keywords:   append(append([]string{}, used...), w),
-			Count:      n,
-			HasCount:   ok,
-			NeedsSplit: ok && n > limit,
-		})
-		used = append(used, w)
-
-		// Keyword covers everything already -> nothing can be left after it.
-		if ok && n == baseCount {
-			remQ := baseQuery
-			for _, p := range used {
-				remQ += ` -"` + p + `"`
-			}
-			if remN, remOk := count(remQ, ylo, yhi); remOk && remN == 0 {
-				return leaves, nil
-			}
-		}
-	}
-
-	// Residual: base query minus every keyword. Skipped when known to be empty
-	// (either reported zero directly, or proven zero by the early stop above).
-	q := baseQuery
-	for _, w := range keywords {
-		q += ` -"` + w + `"`
-	}
-	n, ok := count(q, ylo, yhi)
-	if ok && n == 0 {
-		return leaves, nil
-	}
-	leaves = append(leaves, Leaf{
-		Query:      q,
+	// A single year over the cap: recursively split it via ResolveOverCap.
+	// Degenerate keywords (substrings of the base query) can never divide the
+	// space, and are dropped before the maxKeywords cap is applied so they
+	// don't waste one of the limited candidate slots.
+	leaf := Leaf{
+		Query:      baseQuery,
 		YearFrom:   ylo,
 		YearTo:     yhi,
-		Keywords:   append([]string{}, keywords...),
 		Count:      n,
-		HasCount:   ok,
-		NeedsSplit: ok && n > limit,
-	})
-	return leaves, nil
+		HasCount:   true,
+		NeedsSplit: true,
+	}
+
+	cand := dropDegenerateKeywords(baseQuery, keywords)
+	cand = capKeywords(cand, maxKeywords)
+
+	resolved, ok := ResolveOverCap(leaf, cand, count, maxProbes, minBalance, limit)
+	if !ok {
+		return []Leaf{leaf}, nil
+	}
+
+	return resolved, nil
+}
+
+// capKeywords bounds keywords to at most maxKeywords candidates, preserving
+// the caller's ranking (best-splitter-first). maxKeywords < 0 leaves the list
+// unbounded (existing convention: negative means "no cap"); maxKeywords == 0
+// yields no candidates, disabling keyword splitting entirely.
+func capKeywords(keywords []string, maxKeywords int) []string {
+	if maxKeywords < 0 || len(keywords) <= maxKeywords {
+		return keywords
+	}
+	return keywords[:maxKeywords]
 }
 
 // DropDegenerateKeywords exports the degenerate-keyword filter (keywords that
@@ -256,7 +185,22 @@ func DropDegenerateKeywords(baseQuery string, keywords []string) []string {
 // over-cap task. ResolveOverCap never emits an over-cap leaf itself.
 func ResolveOverCap(leaf Leaf, keywords []string, count CountFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
 	var out []Leaf
-	resolved := resolveNode(leaf.Query, leaf.YearFrom, leaf.YearTo, leaf.Count, leaf.HasCount, keywords, count, probesPerNode, minBalance, limit, nil, nil, &out, 0)
+
+	resolved := resolveNode(
+		leaf.Query,
+		leaf.YearFrom,
+		leaf.YearTo,
+		leaf.Count,
+		leaf.HasCount,
+		keywords,
+		count,
+		probesPerNode,
+		minBalance,
+		limit,
+		nil,
+		nil,
+		&out,
+		0)
 	if !resolved {
 		return nil, false
 	}
@@ -283,7 +227,9 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		return true
 	}
 	if depth > 32 || probesPerNode <= 0 {
-		// Deep runaway or a disabled probe budget: cannot provably resolve.
+		// depth > 32 is a defensive recursion bound only, not a correctness
+		// mechanism — a correct keyword set never approaches it. A non-positive
+		// probesPerNode simply cannot resolve an over-cap node.
 		return false
 	}
 
@@ -292,17 +238,21 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	var bestWith, bestWithout, bestIdx int
 	bestKey := ""
 	probed := 0
+
 	for k := range keywords {
 		if probed >= probesPerNode {
 			break
 		}
 		q := leafQuery(base, appendPred(inc, keywords[k]), exc)
 		n, okC := count(q, yFrom, yTo)
-		probed++ // a count() round-trip is the budgeted resource
+		probed++
 		if !okC {
 			continue
 		}
 		with := n
+		if with >= size {
+			continue
+		}
 		without := size - with
 		if with <= 0 || without <= 0 {
 			continue // this keyword does not divide the node
@@ -313,7 +263,7 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 			bestIdx, bestKey = k, keywords[k]
 		}
 	}
-	if bestKey == "" {
+	if bestKey == "" || best < minBalance {
 		return false // no keyword divides within budget
 	}
 
@@ -323,8 +273,18 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	// without side's size derives from the parent probe.
 	remaining := dropKW(keywords, bestIdx)
 	var withLeaves, withoutLeaves []Leaf
-	withOK := resolveNode(base, yFrom, yTo, bestWith, true, remaining, count, probesPerNode, minBalance, limit, appendPred(inc, bestKey), exc, &withLeaves, depth+1)
-	withoutOK := resolveNode(base, yFrom, yTo, bestWithout, true, remaining, count, probesPerNode, minBalance, limit, inc, appendPred(exc, bestKey), &withoutLeaves, depth+1)
+	withOK := resolveNode(
+		base, yFrom, yTo, bestWith, true,
+		remaining, count, probesPerNode,
+		minBalance, limit,
+		appendPred(inc, bestKey), exc,
+		&withLeaves, depth+1)
+	withoutOK := resolveNode(
+		base, yFrom, yTo, bestWithout, true,
+		remaining, count, probesPerNode,
+		minBalance, limit,
+		inc, appendPred(exc, bestKey),
+		&withoutLeaves, depth+1)
 	if !withOK || !withoutOK {
 		return false
 	}
@@ -396,8 +356,10 @@ func balanceOf(with, without int) float64 {
 //	AND "learning"  -> 582  (venue name itself contains it -> covers everything)
 //	-"learning"     -> 0    (every paper's venue field contains it)
 //
-// Either way the chain collapses: the include triggers the early stop and the
-// exclude zeroes the residual, so no keyword after it is ever tried. The
+// Either way the keyword cannot divide the node: the with-count equals the
+// parent's size (rejected as with >= size) and the without-count is zero
+// (rejected as without <= 0), so resolveNode would never select it anyway —
+// dropping it here just saves the wasted probe and a maxKeywords slot. The
 // comparison is a plain substring so "system" is dropped for a venue named
 // "Systems".
 func dropDegenerateKeywords(baseQuery string, keywords []string) []string {

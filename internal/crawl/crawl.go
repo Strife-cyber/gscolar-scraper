@@ -82,6 +82,7 @@ func New(cfg *config.Config, d *db.DB, br Browserer, l *log.Logger) *Crawler {
 //     single count probe. A bucket the offline estimate under-counted is
 //     re-split online via split.ResolveOverCap. Only what cannot be brought
 //     under the cap stays a needs_split TODO.
+//
 // probeBudget is a shared cap on real Scholar count searches (browser
 // round-trips) for one conference plan. Cache hits are free; only an actual
 // browser search costs budget. When the budget is exhausted, the count reports
@@ -103,7 +104,7 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	}
 
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, pl, live, c.cfg.MaxKeywords)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, c.cfg.MaxKeywords, c.cfg.MaxProbes, pl, live, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
@@ -314,7 +315,7 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 		return n, ok
 	}
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, pl, cacheOnly, c.cfg.MaxKeywords)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, c.cfg.MaxKeywords, c.cfg.MaxProbes, pl, cacheOnly, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
@@ -363,7 +364,7 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 	var ok bool
 	for {
 		err := c.br.Search(query, yearFrom, yearTo)
-		if err == browser.ErrBlocked {
+		if errors.Is(err, browser.ErrBlocked) {
 			if werr := c.br.WaitForCaptchaResolved(); werr != nil {
 				c.log.Printf("plan count captcha not resolved: %v", werr)
 				return 0, false
@@ -469,7 +470,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	if page < 1 {
 		page = 1
 	}
-	if err := c.issueSearch(ctx, task); err != nil {
+	if err := c.issueSearch(task); err != nil {
 		_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
 		return err
 	}
@@ -477,11 +478,10 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	// Resume: a fresh search always lands on page 1, so skip forward to the
 	// task's page pointer. If the results actually end before that page (a
 	// previous run advanced the pointer past the end), the task is done.
-	var notFound *rod.ElementNotFoundError
 	for i := 1; i < page; i++ {
 		err := c.br.ClickNext()
 		if err != nil {
-			if errors.As(err, &notFound) {
+			if _, ok := errors.AsType[*rod.ElementNotFoundError](err); ok {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
 				c.log.Printf("task %d: resume pointer %d past end -> completed", task.ID, page)
 				return nil
@@ -498,7 +498,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	// from that and max_results with a little slack: a task right at its cap
 	// finishes naturally, a runaway task is stopped.
 	const scholarPageSize = 20
-	maxPages := (c.cfg.MaxResults + scholarPageSize - 1) / scholarPageSize + 2
+	maxPages := (c.cfg.MaxResults+scholarPageSize-1)/scholarPageSize + 2
 	emptyRuns := 0
 	prevKey := "" // fingerprint of the previous page's results, for stall detection
 
@@ -597,7 +597,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		_ = c.br.MaybeReadingScroll()
 		c.br.PauseBetweenPages()
 		if err := c.br.ClickNext(); err != nil {
-			if err == browser.ErrBlocked {
+			if errors.Is(err, browser.ErrBlocked) {
 				continue // resolved at the top of the loop
 			}
 			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
@@ -608,10 +608,10 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 }
 
 // issueSearch runs a task's search, resolving CAPTCHAs as they appear.
-func (c *Crawler) issueSearch(ctx context.Context, task db.Task) error {
+func (c *Crawler) issueSearch(task db.Task) error {
 	for {
 		err := c.br.Search(task.Query, task.YearFrom, task.YearTo)
-		if err == browser.ErrBlocked {
+		if errors.Is(err, browser.ErrBlocked) {
 			if werr := c.br.WaitForCaptchaResolved(); werr != nil {
 				return werr
 			}
@@ -632,7 +632,10 @@ func itemsKey(items []model.ResultItem) string {
 	}
 	h := fnv.New64a()
 	for _, it := range items {
-		fmt.Fprintf(h, "%x,", hash.PaperHash(it.Title, it.Year, it.Authors))
+		_, err := fmt.Fprintf(h, "%x,", hash.PaperHash(it.Title, it.Year, it.Authors))
+		if err != nil {
+			return ""
+		}
 	}
 	return fmt.Sprintf("%x", h.Sum64())
 }
