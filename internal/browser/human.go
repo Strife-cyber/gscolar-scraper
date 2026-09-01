@@ -140,8 +140,16 @@ func (b *Browser) humanMoveTo(tx, ty float64) error {
 }
 
 // humanClick moves to the element (with a small random offset from its centre)
-// and clicks the left button.
+// and clicks the left button. The element is scrolled into view first: its quad
+// is a document-space position, while the mouse events are viewport-space, so
+// clicking an element below the fold at its raw quad coordinates misses
+// entirely (the pagination Next link, ~2000px down a 20-result page, was the
+// casualty — the click silently did nothing and the crawler re-committed the
+// same page until the page cap flagged it).
 func (b *Browser) humanClick(el *rod.Element) error {
+	if err := el.ScrollIntoView(); err != nil {
+		return err
+	}
 	cx, cy, err := elementCenter(el)
 	if err != nil {
 		return err

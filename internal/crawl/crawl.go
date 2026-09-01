@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"time"
 
@@ -22,8 +23,10 @@ import (
 	"gscolar-scraper/internal/config"
 	"gscolar-scraper/internal/db"
 	"gscolar-scraper/internal/hash"
+	"gscolar-scraper/internal/mine"
 	"gscolar-scraper/internal/model"
 	"gscolar-scraper/internal/parse"
+	"gscolar-scraper/internal/partition"
 	"gscolar-scraper/internal/split"
 )
 
@@ -67,19 +70,74 @@ func New(cfg *config.Config, d *db.DB, br Browserer, l *log.Logger) *Crawler {
 // PlanConference computes the leaf plan for one conference, upserts every leaf
 // as a task and prunes obsolete needs_split TODOs. Returns how many leaves are
 // still flagged for re-splitting (>=0 even on a fully clean plan).
+//
+// Splitting uses double leverage from the scraped corpus:
+//
+//   - Mined keyword candidates from the conference's known papers seed the year
+//     chain (so the count-probe fallback subtracts discriminative words rather
+//     than generic config terms).
+//   - A single year that still exceeds the cap is first resolved offline: its
+//     known papers are partitioned by the Balance-ranked keywords into buckets
+//     of at most floor(limit*headroom), and each bucket query is verified with a
+//     single count probe. A bucket the offline estimate under-counted is
+//     re-split online via split.ResolveOverCap. Only what cannot be brought
+//     under the cap stays a needs_split TODO.
+// probeBudget is a shared cap on real Scholar count searches (browser
+// round-trips) for one conference plan. Cache hits are free; only an actual
+// browser search costs budget. When the budget is exhausted, the count reports
+// ok=false so both split.Plan and resolveYear stop probing further and the plan
+// still terminates (writing whatever tasks it has) instead of exploding the
+// CAPTCHA budget on a refractory year.
+type probeBudget struct {
+	confID int64
+	left   int
+}
+
+// exhausted reports whether the per-conference probe budget is spent.
+func (b *probeBudget) exhausted() bool { return b == nil || b.left <= 0 }
+
 func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, error) {
-	countFunc := func(query string, yearFrom, yearTo int) (int, bool) {
-		return c.countForPlan(ctx, query, yearFrom, yearTo)
+	budget := &probeBudget{confID: conf.ID, left: c.cfg.MaxProbesPerConf}
+	live := func(query string, yearFrom, yearTo int) (int, bool) {
+		return c.budgetCount(ctx, budget, query, yearFrom, yearTo)
 	}
 
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, c.cfg.Keywords, countFunc)
+	pl := c.planKeywords(ctx, conf)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, pl, live, c.cfg.MaxKeywords)
 	if err != nil {
 		return 0, err
 	}
 
-	keepKeys := make([]string, 0, len(leaves))
-	needsSplit := 0
+	// Resolve any single-year over-cap leaf into finer pending tasks. The probe
+	// budget is shared so no single year can consume the conference's whole
+	// CAPTCHA allowance.
+	var resolved []split.Leaf
 	for _, l := range leaves {
+		if !l.NeedsSplit || l.YearFrom != l.YearTo {
+			resolved = append(resolved, l)
+			continue
+		}
+		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, live, budget)
+		if ok {
+			resolved = append(resolved, sub...)
+		} else {
+			resolved = append(resolved, l)
+		}
+	}
+
+	return c.emitTasks(ctx, conf, resolved)
+}
+
+// emitTasks upserts every leaf as a task (pending, or needs_split with a reason)
+// and prunes obsolete tasks, returning how many leaves remained needs_split.
+func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []split.Leaf) (int, error) {
+	keepKeys := make([]string, 0, len(resolved))
+	needsSplit := 0
+	for _, l := range resolved {
+		// An over-cap leaf is a re-split TODO, not crawlable work: mark it
+		// needs_split at plan time so the crawler skips it (UpsertTask would
+		// otherwise create it 'pending' and the crawl would burn its page budget
+		// discovering it exceeds max_results).
 		t := &db.Task{
 			ConferenceID:  conf.ID,
 			Query:         l.Query,
@@ -88,8 +146,20 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 			Keywords:      l.Keywords,
 			TotalEstimate: l.Count,
 		}
-		if _, err := c.db.UpsertTask(ctx, t); err != nil {
+		if l.NeedsSplit {
+			t.Status = db.StatusNeedsSplit
+		} else {
+			t.Status = db.StatusPending
+		}
+		id, err := c.db.UpsertTask(ctx, t)
+		if err != nil {
 			return 0, err
+		}
+		if l.NeedsSplit {
+			// Record why this leaf is a TODO (over max_results), self-documenting
+			// the flag the same way the crawl-time page-cap backstop does.
+			_ = c.db.SetTaskNeedsSplit(ctx, id,
+				fmt.Sprintf("estimate %d exceeds the %d-result cap", l.Count, c.cfg.MaxResults))
 		}
 		keepKeys = append(keepKeys, t.Key())
 		if l.NeedsSplit {
@@ -100,15 +170,191 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	if err := c.db.ReplaceConferencePlan(ctx, conf.ID, keepKeys); err != nil {
 		return 0, err
 	}
-	c.log.Printf("planned %s: %d tasks (%d need re-split)", conf.Name, len(leaves), needsSplit)
+	c.log.Printf("planned %s: %d tasks (%d need re-split)", conf.Name, len(resolved), needsSplit)
 	return needsSplit, nil
 }
 
-// countForPlan is the CountFunc split.Plan uses. It checks the DB count cache
-// first, then drives a browser search, records the count and pauses like a
-// human between planning queries. A CAPTCHA mid-plan is resolved and the
-// throttle bumped before retrying.
-func (c *Crawler) countForPlan(ctx context.Context, query string, yearFrom, yearTo int) (int, bool) {
+// planKeywords returns the keyword candidates fed to the planner: the
+// conference's mined splitter words merged with the configured defaults, minus
+// degenerate terms that are substrings of the venue query. Mined keywords come
+// first (higher Balance first) so the partition and the count chain see the
+// best splitters first.
+func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
+	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
+	if err != nil {
+		c.log.Printf("load papers for %s keyword mining: %v", conf.Name, err)
+		papers = nil
+	}
+	opts := mine.DefaultOptions()
+	opts.MinBalance = c.cfg.MinBalance
+	opts.Bigrams = c.cfg.MineBigrams
+	opts.MaxCandidates = c.cfg.MaxMinedKeywords
+	mp := make([]mine.Paper, 0, len(papers))
+	for _, p := range papers {
+		mp = append(mp, mine.Paper{Hash: p.Hash, Title: p.Title, Snippet: p.Snippet, Year: p.Year})
+	}
+	cands := mine.Mine(mp, opts)
+
+	mined := make([]string, 0, len(cands))
+	for _, cd := range cands {
+		mined = append(mined, cd.Keyword)
+	}
+	seen := map[string]bool{}
+	var kws []string
+	for _, w := range append(mined, c.cfg.Keywords...) {
+		if seen[w] || w == "" {
+			continue
+		}
+		seen[w] = true
+		kws = append(kws, w)
+	}
+	return split.DropDegenerateKeywords(conf.Query, kws)
+}
+
+// resolveYear brings a single over-cap year under the cap using offline
+// partitioning of the conference's known papers, verified with one count probe
+// per bucket and re-split online where the estimate under-counts. It returns
+// pending leaves on success and ok=false when the corpus is too thin, too
+// under-covered, the shared budget is exhausted, or some atom cannot be brought
+// under the cap (caller keeps the year's needs_split TODO untouched).
+//
+// trueCount is the year's verified total (the over-cap leaf's Count). The
+// coverage gate is the paper's Feasibility guard in operational form: offline
+// partitioning is only as good as the corpus it saw. If the known papers are a
+// small fraction of the true total, every bucket over-verifies and the probes
+// explode (each count() is an expensive Scholar search), so instead of trusting
+// a biased sample we bail to the bounded count-probe chain.
+func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, trueCount int, keywords []string, count split.CountFunc, budget *probeBudget) ([]split.Leaf, bool) {
+	papers, err := c.db.PapersForConference(ctx, conf.ID, year, year)
+	if err != nil {
+		return nil, false
+	}
+	coverage := 1.0
+	if trueCount > len(papers) {
+		coverage = float64(len(papers)) / float64(trueCount)
+	}
+	// A thin or under-covered corpus cannot yield a trustworthy offline split:
+	// fall back to the online count-probe chain rather than over-verifying every
+	// bucket against a much larger real population. budget.exhausted() also short
+	// circuits before we spend the conference's allowance here.
+	if len(papers) < c.cfg.MinPapersToTrust || coverage < c.cfg.MinCoverage || budget.exhausted() {
+		return nil, false
+	}
+
+	byHash := make(map[string]db.Paper, len(papers))
+	docs := make([]partition.Doc, 0, len(papers))
+	for _, p := range papers {
+		byHash[p.Hash] = p
+		docs = append(docs, partition.Doc{Hash: p.Hash, Year: p.Year})
+	}
+	text := func(d partition.Doc) string {
+		p := byHash[d.Hash]
+		return p.Title + " " + p.Snippet
+	}
+	limit := int(float64(c.cfg.MaxResults) * c.cfg.Headroom)
+	if limit < 1 {
+		limit = 1
+	}
+
+	out := partition.Partition(docs, keywords, text, limit)
+	var sub []split.Leaf
+	for _, b := range out.Buckets {
+		q := b.Query(conf.Query)
+		n, okC := count(q, year, year)
+		if !okC || budget.exhausted() {
+			return nil, false
+		}
+		leaf := split.Leaf{Query: q, YearFrom: year, YearTo: year, Keywords: append(append([]string{}, b.Includes...), b.Excludes...), Count: n, HasCount: true}
+		if n <= c.cfg.MaxResults {
+			leaf.NeedsSplit = false
+			sub = append(sub, leaf)
+			continue
+		}
+		// Offline underestimate (a bucket that "fit" offline is really bigger):
+		// re-split it online, still under the shared probe budget.
+		leaf.NeedsSplit = true
+		rs, ok := split.ResolveOverCap(leaf, keywords, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+		if !ok || budget.exhausted() {
+			return nil, false
+		}
+		sub = append(sub, rs...)
+	}
+	// An unresolved atom floor (a bucket no keyword divides) is a feasibility
+	// ceiling: keep the year needs_split rather than emit an over-cap task.
+	if len(out.Unresolved) > 0 {
+		return nil, false
+	}
+	return sub, true
+}
+
+// liveOnly wraps count so that once the shared budget is spent the wrapper
+// reports ok=false, halting ResolveOverCap's recursion instead of probing more.
+func liveOnly(count split.CountFunc, budget *probeBudget) split.CountFunc {
+	return func(q string, yFrom, yTo int) (int, bool) {
+		if budget.exhausted() {
+			return 0, false
+		}
+		return count(q, yFrom, yTo)
+	}
+}
+
+// OfflineGenTasks builds a conference's leaf plan purely from what is already
+// in the DB — count_cache (no browser, no CAPTCHA) plus the mined keywords —
+// and upserts the resulting tasks exactly like a live PlanConference. It is the
+// "generate tasks with what is available" command: a cache miss reports ok=false,
+// so that window/year falls back to a needs_split TODO rather than driving the
+// browser. Use it to materialize a crawl plan from previously-seen counts and
+// papers without spending any search budget.
+func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int, error) {
+	cacheOnly := func(query string, yearFrom, yearTo int) (int, bool) {
+		n, ok, err := c.db.GetCachedCount(ctx, query, yearFrom, yearTo)
+		if err != nil {
+			return 0, false
+		}
+		return n, ok
+	}
+	pl := c.planKeywords(ctx, conf)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, pl, cacheOnly, c.cfg.MaxKeywords)
+	if err != nil {
+		return 0, err
+	}
+	// The offline budget is effectively unlimited: cache hits are free and
+	// resolveYear's verify/re-split probes also read count_cache only.
+	budget := &probeBudget{confID: conf.ID, left: int(^uint(0) >> 1)} // max int
+
+	var resolved []split.Leaf
+	for _, l := range leaves {
+		if !l.NeedsSplit || l.YearFrom != l.YearTo {
+			resolved = append(resolved, l)
+			continue
+		}
+		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, cacheOnly, budget)
+		if ok {
+			resolved = append(resolved, sub...)
+		} else {
+			resolved = append(resolved, l)
+		}
+	}
+	return c.emitTasks(ctx, conf, resolved)
+}
+
+// budgetCount checks the cache and, only on a miss, spends one unit of the
+// shared probe budget before driving an actual browser search. When the budget
+// is spent it reports ok=false (no search) so planning can end gracefully.
+func (c *Crawler) budgetCount(ctx context.Context, budget *probeBudget, query string, yearFrom, yearTo int) (int, bool) {
+	if budget.exhausted() {
+		return 0, false
+	}
+	if n, ok, err := c.db.GetCachedCount(ctx, query, yearFrom, yearTo); err == nil && ok {
+		return n, true
+	}
+	if budget.exhausted() {
+		return 0, false
+	}
+	budget.left--
+	return c.countForPlan(ctx, budget.confID, query, yearFrom, yearTo)
+}
+func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, yearFrom, yearTo int) (int, bool) {
 	if n, ok, err := c.db.GetCachedCount(ctx, query, yearFrom, yearTo); err == nil && ok {
 		return n, true
 	}
@@ -132,25 +378,49 @@ func (c *Crawler) countForPlan(ctx context.Context, query string, yearFrom, year
 		break
 	}
 
-	html, err := c.br.Content()
-	if err != nil {
-		return 0, false
-	}
-	p, err := parse.Parse(html)
-	if err != nil {
-		return 0, false
-	}
-	if p.Blocked {
-		if werr := c.br.WaitForCaptchaResolved(); werr != nil {
+	// Scholar streams a results page: the result rows can appear a moment before
+	// the "About N results" header is populated. Reading the page in that window
+	// loses the count, and since only readable counts are cached, the query would
+	// be re-searched on every future plan run. Re-read the page while rows exist
+	// before giving up (a settled empty page — NoResults — already reports
+	// count 0, and a page with no rows and no header won't improve on re-reads).
+	var p parse.Page
+	for read := 0; ; read++ {
+		html, err := c.br.Content()
+		if err != nil {
 			return 0, false
 		}
-		c.br.IncreaseThrottle()
-		return 0, false
+		p, err = parse.Parse(html)
+		if err != nil {
+			return 0, false
+		}
+		if p.Blocked {
+			if werr := c.br.WaitForCaptchaResolved(); werr != nil {
+				return 0, false
+			}
+			c.br.IncreaseThrottle()
+			return 0, false
+		}
+		if p.HasCount || len(p.Items) == 0 || read >= 2 {
+			break
+		}
+		// Rows present but the count header is still streaming in.
+		time.Sleep(1500 * time.Millisecond)
 	}
 
 	n, ok = p.Count, p.HasCount
 	if ok {
 		_ = c.db.SetCachedCount(ctx, query, yearFrom, yearTo, n)
+	}
+	// Harvest the result rows immediately rather than discarding them: each
+	// planning search that lands a page is a round-trip, so the papers it
+	// returns (conference-linked, sourced_from='plan', no task yet) feed the
+	// next round's keyword mining. A failure here must not fail the count (the
+	// count is what drives the plan); it only skips that harvest.
+	if len(p.Items) > 0 {
+		if _, herr := c.db.SavePapers(ctx, papersFromItemsForPlan(p.Items, confID)); herr != nil {
+			c.log.Printf("plan harvest (%q %d-%d): %v", query, yearFrom, yearTo, herr)
+		}
 	}
 	c.br.PausePlanning()
 	return n, ok
@@ -223,8 +493,14 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		c.br.PauseBetweenPages()
 	}
 
-	maxPages := (c.cfg.MaxResults + 9) / 10 // 10 results per Scholar page
+	// maxPages bounds how many pages a task may consume before it is flagged for
+	// re-split. Scholar currently serves 20 results per page, so derive the bound
+	// from that and max_results with a little slack: a task right at its cap
+	// finishes naturally, a runaway task is stopped.
+	const scholarPageSize = 20
+	maxPages := (c.cfg.MaxResults + scholarPageSize - 1) / scholarPageSize + 2
 	emptyRuns := 0
+	prevKey := "" // fingerprint of the previous page's results, for stall detection
 
 	for {
 		if c.br.IsBlocked() {
@@ -246,6 +522,20 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
 			return err
 		}
+
+		// Stall guard: if two consecutive pages parse to the same result set, the
+		// pagination is not advancing (the old off-viewport Next click silently
+		// re-committed the same page until the cap flagged the task — the crawl
+		// looked "stuck"). Flag it instead of committing a duplicate. Empty pages
+		// return "" from itemsKey, so the sparse/end handlers below own those.
+		curKey := itemsKey(p.Items)
+		if curKey != "" && curKey == prevKey {
+			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError,
+				"pagination stalled: identical results on consecutive pages")
+			c.log.Printf("task %d: STALL at page %d (same %d results as previous page) -> error", task.ID, page, len(p.Items))
+			return nil
+		}
+		prevKey = curKey
 
 		pc := db.PageCommit{
 			TaskID:     task.ID,
@@ -288,6 +578,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 				return err
 			}
 			emptyRuns = 0
+			c.log.Printf("task %d: page %d committed (%d papers)", task.ID, page, len(p.Items))
 			if !p.HasNext {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
 				c.log.Printf("task %d: completed (no next page) at page %d", task.ID, page)
@@ -331,6 +622,21 @@ func (c *Crawler) issueSearch(ctx context.Context, task db.Task) error {
 	}
 }
 
+// itemsKey fingerprints a page's parsed results so the crawl loop can detect a
+// pagination stall (identical results on consecutive pages). Empty pages return
+// "", which deliberately never matches, leaving the zero-results cases to the
+// sparse/end-of-results handlers.
+func itemsKey(items []model.ResultItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+	h := fnv.New64a()
+	for _, it := range items {
+		fmt.Fprintf(h, "%x,", hash.PaperHash(it.Title, it.Year, it.Authors))
+	}
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
 // papersFromItems converts parsed results into db.Paper rows keyed by the
 // content hash (normalized title + year + first-author last name).
 func papersFromItems(items []model.ResultItem, taskID int64) []db.Paper {
@@ -348,6 +654,32 @@ func papersFromItems(items []model.ResultItem, taskID int64) []db.Paper {
 			ScholarID:    it.ScholarID,
 			RawHTML:      it.RawHTML,
 			TaskID:       taskID,
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// papersFromItemsForPlan converts parsed results harvested during planning into
+// db.Paper rows carrying the conference association but no task (a planning
+// search is not a crawl). Such rows are sourced_from='plan' and later healed to
+// 'crawl' when a real crawl saves the same hash.
+func papersFromItemsForPlan(items []model.ResultItem, confID int64) []db.Paper {
+	out := make([]db.Paper, 0, len(items))
+	for _, it := range items {
+		p := db.Paper{
+			Hash:         hash.PaperHash(it.Title, it.Year, it.Authors),
+			Title:        it.Title,
+			Authors:      it.Authors,
+			Year:         it.Year,
+			Snippet:      it.Snippet,
+			Citations:    it.Citations,
+			HasCitations: it.HasCitations,
+			SourceURL:    it.URL,
+			ScholarID:    it.ScholarID,
+			RawHTML:      it.RawHTML,
+			ConferenceID: confID,
+			SourcedFrom:  "plan",
 		}
 		out = append(out, p)
 	}

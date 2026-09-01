@@ -4,6 +4,7 @@
 package browser
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,11 +62,14 @@ func (b *Browser) Connect() error {
 	}
 
 	// 1. Try to attach to an instance already listening on the debug port.
-	ctrl := fmt.Sprintf("http://127.0.0.1:%d", port)
 	if b.portOpen(port) {
-		browser := rod.New().ControlURL(ctrl)
+		wsURL, err := browserWebSocketURL(port)
+		if err != nil {
+			return fmt.Errorf("resolve running browser endpoint on port %d: %w", port, err)
+		}
+		browser := rod.New().ControlURL(wsURL)
 		if err := browser.Connect(); err != nil {
-			return fmt.Errorf("connect to running browser on %s: %w", ctrl, err)
+			return fmt.Errorf("connect to running browser on %s: %w", wsURL, err)
 		}
 		b.browser = browser
 		return b.newPage()
@@ -126,6 +130,31 @@ func (b *Browser) portOpen(port int) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// browserWebSocketURL resolves the CDP browser endpoint of an already-running
+// browser on port. rod's Connect with a plain "http://host:port" control URL
+// dials the websocket at that URL's root path, which Chrome answers with a 404;
+// the real endpoint is ws://host:port/devtools/browser/<id>, advertised in
+// /json/version. Resolving it lets the scraper attach to a browser the user
+// left open (the scraper keeps the window alive by design) instead of forcing a
+// relaunch and its "close your browser first" dance.
+func browserWebSocketURL(port int) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var v struct {
+		WS string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.WS == "" {
+		return "", fmt.Errorf("no webSocketDebuggerUrl in /json/version")
+	}
+	return v.WS, nil
 }
 
 // resolveExecutable returns the browser binary to drive.

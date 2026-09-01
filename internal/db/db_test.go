@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -105,6 +107,85 @@ func TestTaskUpsertAndDedup(t *testing.T) {
 	if pending[0].TotalEstimate != 700 {
 		t.Errorf("estimate not updated: %d", pending[0].TotalEstimate)
 	}
+}
+
+// TestUpsertTaskFollowsPlanStatus pins the planner-status contract: the caller
+// decides 'pending' vs 'needs_split'; a stale 'needs_split' whose leaf now fits
+// is downgraded to 'pending' and its runaway page pointer reset to 1; completed
+// and error outcomes are never reset by re-planning.
+func TestUpsertTaskFollowsPlanStatus(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "ICML", `"ICML"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mk := func(est int, status string) *Task {
+		return &Task{
+			ConferenceID:  confID,
+			Query:         `"ICML" AND "neural"`,
+			YearFrom:      2005,
+			YearTo:        2005,
+			Keywords:      []string{"neural"},
+			TotalEstimate: est,
+			Status:        status,
+		}
+	}
+
+	// 1. An over-cap leaf is created as a needs_split TODO, not crawlable.
+	id, err := d.UpsertTask(ctx, mk(545, StatusNeedsSplit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.taskStatus(ctx, id); err != nil {
+		t.Fatal(err)
+	} else if got != StatusNeedsSplit {
+		t.Fatalf("over-cap leaf status = %q, want needs_split", got)
+	}
+	if p, _ := d.PendingTasks(ctx, confID); len(p) != 0 {
+		t.Fatalf("over-cap leaf must not be pending, got %d", len(p))
+	}
+
+	// 2. The same leaf, now under the cap: downgraded to pending and its page
+	// pointer reset, so the crawl restarts from page 1 instead of resuming at a
+	// pointer a stalled run ran up to the cap.
+	if err := d.AdvanceTaskPage(ctx, id, 31); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.UpsertTask(ctx, mk(251, StatusPending)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.taskStatus(ctx, id); got != StatusPending {
+		t.Fatalf("under-cap leaf status = %q, want pending", got)
+	}
+	pending, err := d.PendingTasks(ctx, confID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("want 1 pending task, got %d", len(pending))
+	}
+	if pending[0].Page != 1 {
+		t.Errorf("page pointer not reset on needs_split->pending: %d", pending[0].Page)
+	}
+
+	// 3. A completed task is preserved no matter what the planner now says.
+	if err := d.SetTaskStatus(ctx, id, StatusCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.UpsertTask(ctx, mk(999, StatusNeedsSplit)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.taskStatus(ctx, id); got != StatusCompleted {
+		t.Fatalf("completed task clobbered by replan: %q", got)
+	}
+}
+
+func (d *DB) taskStatus(ctx context.Context, id int64) (string, error) {
+	var s string
+	err := d.db.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, id).Scan(&s)
+	return s, err
 }
 
 func TestPaperDedup(t *testing.T) {
@@ -225,4 +306,217 @@ func TestCountCache(t *testing.T) {
 	if _, ok, _ := d.GetCachedCount(ctx, `"ICML"`, 2001, 2020); ok {
 		t.Error("expected cache miss")
 	}
+}
+
+// TestSavePapersPlanThenCrawlHeal: a paper harvested during planning (task_id
+// NULL, conference known, sourced_from='plan') gains its task_id and conference
+// association when a crawl later saves the same hash.
+func TestSavePapersPlanThenCrawlHeal(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "ICML", `"ICML"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := d.UpsertTask(ctx, &Task{ConferenceID: confID, Query: `"ICML"`, YearFrom: 2020, YearTo: 2020})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Plan harvest: conference known, no task yet.
+	planPaper := Paper{
+		Hash: "abc", Title: "A Paper", Authors: "Jane Doe", Year: 2020,
+		ConferenceID: confID, SourcedFrom: "plan",
+	}
+	ins, err := d.SavePapers(ctx, []Paper{planPaper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ins != 1 {
+		t.Errorf("inserted %d, want 1", ins)
+	}
+
+	// 2. Crawl saves the same hash with a task id.
+	crawlPaper := Paper{
+		Hash: "abc", Title: "A Paper", Authors: "Jane Doe", Year: 2020,
+		TaskID: taskID, SourcedFrom: "crawl",
+	}
+	ins, err = d.SavePapers(ctx, []Paper{crawlPaper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An UPSERT conflict-UPDATE reports one affected row; the meaningful checks
+	// are the healed column values below, not this counter.
+	if ins != 1 {
+		t.Errorf("conflict-update affected %d rows, want 1", ins)
+	}
+
+	// 3. The row now points at the task and the conference is still known.
+	var gotTask, gotConf *int64
+	var gotSrc string
+	err = d.db.QueryRow(`SELECT task_id, conference_id, sourced_from FROM papers WHERE hash='abc'`).
+		Scan(&gotTask, &gotConf, &gotSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTask == nil || *gotTask != taskID {
+		t.Errorf("task_id = %v, want %d", gotTask, taskID)
+	}
+	if gotConf == nil || *gotConf != confID {
+		t.Errorf("conference_id = %v, want %d", gotConf, confID)
+	}
+	if gotSrc != "crawl" {
+		t.Errorf("sourced_from = %q, want 'crawl'", gotSrc)
+	}
+}
+
+// TestSavePapersDerivesConferenceFromTask: a crawled paper carries no explicit
+// conference; the upsert derives it from the task.
+func TestSavePapersDerivesConferenceFromTask(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "ICML", `"ICML"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := d.UpsertTask(ctx, &Task{ConferenceID: confID, Query: `"ICML"`, YearFrom: 2020, YearTo: 2020})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SavePapers(ctx, []Paper{{Hash: "x", Title: "X", Year: 2020, TaskID: taskID, SourcedFrom: "crawl"}}); err != nil {
+		t.Fatal(err)
+	}
+	var gotConf *int64
+	err = d.db.QueryRow(`SELECT conference_id FROM papers WHERE hash='x'`).Scan(&gotConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotConf == nil || *gotConf != confID {
+		t.Errorf("conference_id = %v, want %d", gotConf, confID)
+	}
+}
+
+// TestPapersForConference: returns only the papers associated to a conference,
+// honoring the year range.
+func TestPapersForConference(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "ICML", `"ICML"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := d.UpsertConference(ctx, "NeurIPS", `"NeurIPS"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SavePapers(ctx, []Paper{
+		{Hash: "a", Title: "A", Year: 2020, ConferenceID: confID, SourcedFrom: "plan"},
+		{Hash: "b", Title: "B", Year: 2021, ConferenceID: confID, SourcedFrom: "plan"},
+		{Hash: "c", Title: "C", Year: 2022, ConferenceID: confID, SourcedFrom: "plan"},
+		{Hash: "d", Title: "D", Year: 2020, ConferenceID: otherID, SourcedFrom: "plan"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := d.PapersForConference(ctx, confID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("got %d papers for conference, want 3", len(all))
+	}
+	window, err := d.PapersForConference(ctx, confID, 2020, 2021)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(window) != 2 {
+		t.Errorf("got %d papers in 2020-2021 window, want 2", len(window))
+	}
+	for _, p := range window {
+		if p.Year < 2020 || p.Year > 2021 {
+			t.Errorf("paper %q year %d outside window", p.Hash, p.Year)
+		}
+	}
+	empty, err := d.PapersForConference(ctx, confID, 2030, 2031)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("got %d papers in empty window, want 0", len(empty))
+	}
+}
+
+// TestMigrationOnPreExistingDB: a database with the OLD papers schema (no
+// conference_id / sourced_from columns) gains them on Open, and existing papers
+// are backfilled to their conference via the tasks table.
+func TestMigrationOnPreExistingDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	// 1. Create a legacy DB with the OLD papers schema so Open() has not
+	//    migrated it yet; it carries one paper 'z' at task 1 / conference 5.
+	if err := OpenLegacySQLite(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Reopen through the app's Open(), which must run the migration.
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	// The column must now exist and the legacy paper 'z' (task 1 -> conference 5)
+	// must have been backfilled to conference 5.
+	var conf *int64
+	if err := d.db.QueryRow(`SELECT conference_id FROM papers WHERE hash='z'`).Scan(&conf); err != nil {
+		t.Fatal(err)
+	}
+	if conf == nil {
+		t.Error("migrated paper has NULL conference_id")
+	} else if *conf != 5 {
+		t.Errorf("backfilled conference_id = %d, want 5", *conf)
+	}
+
+	// The backfilled conference is visible through the repository query.
+	ps, err := d.PapersForConference(context.Background(), 5, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 || ps[0].Hash != "z" {
+		t.Errorf("PapersForConference(5) = %+v, want the backfilled paper 'z'", ps)
+	}
+}
+
+// OpenLegacySQLite builds a legacy-schema (pre-column) database at path so the
+// app's migration can be tested against a real old file. It closes the scratch
+// connection before returning so the app's Open() may take over the file.
+func OpenLegacySQLite(path string) error {
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+CREATE TABLE conferences (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, query TEXT NOT NULL);
+CREATE TABLE tasks (
+	id INTEGER PRIMARY KEY, conference_id INTEGER NOT NULL REFERENCES conferences(id),
+	query TEXT NOT NULL, year_from INTEGER NOT NULL DEFAULT 0, year_to INTEGER NOT NULL DEFAULT 0,
+	keywords TEXT NOT NULL DEFAULT '[]', page INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
+	total_results_estimate INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+	UNIQUE(conference_id, query, year_from, year_to, keywords));
+CREATE TABLE papers (
+	hash TEXT PRIMARY KEY, title TEXT NOT NULL, authors TEXT NOT NULL DEFAULT '',
+	year INTEGER NOT NULL DEFAULT 0, snippet TEXT NOT NULL DEFAULT '',
+	citations INTEGER, source_url TEXT NOT NULL DEFAULT '', scholar_id TEXT NOT NULL DEFAULT '',
+	raw_html TEXT NOT NULL DEFAULT '', task_id INTEGER REFERENCES tasks(id),
+	scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+INSERT INTO conferences (id, name, query) VALUES (5, 'ICML', '"ICML"');
+INSERT INTO tasks (id, conference_id, query, year_from, year_to) VALUES (1, 5, '"ICML"', 2020, 2020);
+INSERT INTO papers (hash, title, year, task_id) VALUES ('z', 'Z', 2020, 1);`)
+	closeErr := db.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }

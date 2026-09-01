@@ -8,10 +8,13 @@
 //	gscolar -config config.json -crawl           # crawl pending tasks
 //	gscolar -config config.json -crawl -conference ICML
 //	gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
+//	gscolar -config config.json -gen-tasks       # build tasks from the DB only (no browser)
 //
 // -plan and -crawl both drive the real browser and are resumable: re-running
 // them continues from the database's checkpoints (every page is committed
-// atomically with the task's page pointer).
+// atomically with the task's page pointer). -gen-tasks performs no searches at
+// all — it materializes a plan purely from the papers and count cache already
+// in the DB, so you can generate crawl tasks with what's available.
 package main
 
 import (
@@ -32,8 +35,9 @@ func main() {
 	dbPath := flag.String("db", "", "SQLite database path (overrides config.database)")
 	doPlan := flag.Bool("plan", false, "compute/sync the task plan (drives the browser)")
 	doCrawl := flag.Bool("crawl", false, "crawl pending tasks (drives the browser)")
+	doGen := flag.Bool("gen-tasks", false, "build tasks from the DB only (no browser)")
 	doStatus := flag.Bool("status", false, "print progress statistics and exit")
-	confName := flag.String("conference", "", "restrict -plan/-crawl to one conference by name")
+	confName := flag.String("conference", "", "restrict -plan/-crawl/-gen-tasks to one conference by name")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -61,13 +65,13 @@ func main() {
 
 	if *doStatus {
 		printStatus(ctx, d)
-		if !*doPlan && !*doCrawl {
+		if !*doPlan && !*doCrawl && !*doGen {
 			return
 		}
 		fmt.Println()
 	}
 
-	if !*doPlan && !*doCrawl {
+	if !*doPlan && !*doCrawl && !*doGen {
 		flag.Usage()
 		return
 	}
@@ -77,15 +81,27 @@ func main() {
 		logger.Fatalf("%v", err)
 	}
 
+	// -gen-tasks builds the plan offline from the DB (count_cache + papers) and
+	// never touches the browser; only -plan/-crawl launch it. browser.New(cfg)
+	// merely constructs the client — Connect() is what spawns/attaches Chrome.
 	br := browser.New(cfg)
-	if err := br.Connect(); err != nil {
-		logger.Fatalf("browser: %v", err)
+	if (*doPlan || *doCrawl) {
+		if err := br.Connect(); err != nil {
+			logger.Fatalf("browser: %v", err)
+		}
+		defer br.Close()
 	}
-	defer br.Close()
-
 	c := crawl.New(cfg, d, br, logger)
 
 	for _, conf := range confs {
+		if *doGen {
+			need, err := c.OfflineGenTasks(ctx, conf)
+			if err != nil {
+				logger.Printf("gen-tasks %s: %v", conf.Name, err)
+				continue
+			}
+			logger.Printf("%s tasks generated from DB: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need)
+		}
 		if *doPlan {
 			need, err := c.PlanConference(ctx, conf)
 			if err != nil {
@@ -168,7 +184,8 @@ Flags:
   -db path         SQLite database path (overrides config.database)
   -plan            compute/sync the task plan for each conference
   -crawl           crawl pending tasks (resumable from checkpoints)
-  -conference name restrict -plan/-crawl to one conference (e.g. ICML)
+  -gen-tasks       build tasks from the DB only (count_cache + papers, no browser)
+  -conference name restrict -plan/-crawl/-gen-tasks to one conference (e.g. ICML)
   -status          print progress statistics
 
 The crawler drives your real Chrome/Edge on its normal profile. Before the

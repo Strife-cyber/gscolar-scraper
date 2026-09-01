@@ -1,9 +1,10 @@
 package browser
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-	"bufio"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,119 +16,295 @@ import (
 )
 
 // Scholar element selectors. The search box, results and pagination selectors
-// are stable Scholar IDs/classes; the custom-year-range selectors depend on
-// the sidebar markup and are checked/refined during the live-crawl milestone.
+// are stable Scholar IDs/classes. The advanced-search dialog is opened from the
+// hamburger menu; its drawer link id differs between the homepage (gs_hp_drw_adv)
+// and the results page (gs_res_drw_adv), so both are handled.
 const (
-	selScholarPage  = "https://scholar.google.com/"
-	selSearchInput  = `#gs_hdr_tsi`
-	selSearchButton = `#gs_hdr_tsb`
-	selResults      = `.gs_r.gs_or`
-	selNext         = `#gs_n a[href*="start="] span.gs_ico_nav_next`
+	selScholarPage = "https://scholar.google.com/"
+	selSearchInput = `#gs_hdr_tsi`
+	selResults     = `.gs_r.gs_or`
+	selNext        = `#gs_n a[href*="start="] span.gs_ico_nav_next`
 
-	// Custom year range (sidebar): trigger link and From/To inputs. There is no
-	// reliable apply-button selector across Scholar versions; pressing Enter in
-	// the "To" field is Scholar's accepted shortcut and is used as the apply.
-	selYearTrigger = `#gs_asd_tsb`
-	selYearFrom    = `#gs_asd_ylo`
-	selYearTo      = `#gs_asd_yhi`
+	// Advanced search dialog (hamburger menu → "Advanced search" → #gs_asd).
+	// "Return articles published in" is Scholar's source: operator, which is
+	// what the conference queries want. The year fields live in the same dialog.
+	selMenuBtn        = `#gs_hdr_mnu`
+	selMenuDrawer     = `#gs_hdr_drw`
+	selAdvLinkHome    = `#gs_hp_drw_adv`  // homepage drawer
+	selAdvLinkResults = `#gs_res_drw_adv` // results-page drawer
+	selAdvDialog      = `#gs_asd`
+	selAdvQuery       = `#gs_asd_q`   // "with all the words"
+	selAdvWithout     = `#gs_asd_eq`  // "without the words"
+	selAdvPublication = `#gs_asd_pub` // "Return articles published in"
+	selAdvYearFrom    = `#gs_asd_ylo`
+	selAdvYearTo      = `#gs_asd_yhi`
+	selAdvSubmit      = `#gs_asd_psb`
 )
 
-// Search runs the full navigation recipe for one task: open Scholar, type the
-// query in the search box, optionally restrict to a year range via the
-// sidebar's "Custom range" fields, and wait for results.
+// The splitter emits main-box style queries such as
+//
+//	"International Conference on Machine Learning" AND "learning" -"neural"
+//
+// but the advanced-search form has no single field that accepts that syntax.
+// decomposeAdvancedQuery translates such a query into the equivalent form
+// fields:
+//
+//	source:"Venue" (or a bare quoted phrase) → "published in" (as_publication)
+//	AND "word"                                → "with all the words" (as_q)
+//	-"word"                                   → "without the words" (as_eq)
+var (
+	advSourceRe = regexp.MustCompile(`source:"([^"]*)"`)
+	advAndRe    = regexp.MustCompile(`\bAND\s+"([^"]*)"`)
+	advNotRe    = regexp.MustCompile(`-"([^"]*)"`)
+)
+
+// decomposeAdvancedQuery returns the venue, all-words and without-words parts
+// of a main-box query. ok is false when nothing could be placed in any field.
+func decomposeAdvancedQuery(q string) (venue, allWords, withoutWords string, ok bool) {
+	if m := advSourceRe.FindStringSubmatch(q); m != nil {
+		venue = m[1]
+	}
+	for _, m := range advAndRe.FindAllStringSubmatch(q, -1) {
+		if allWords != "" {
+			allWords += " "
+		}
+		allWords += m[1]
+	}
+	for _, m := range advNotRe.FindAllStringSubmatch(q, -1) {
+		if withoutWords != "" {
+			withoutWords += " "
+		}
+		withoutWords += m[1]
+	}
+
+	// Whatever is left after stripping source:/AND/-NOT is the base phrase.
+	rest := advSourceRe.ReplaceAllString(q, " ")
+	rest = advAndRe.ReplaceAllString(rest, " ")
+	rest = advNotRe.ReplaceAllString(rest, " ")
+	rest = strings.TrimSpace(rest)
+	if venue == "" && rest != "" {
+		// A quoted base phrase (the conference config style) is treated as the
+		// publication to honor the source: search the config expects. Bare text
+		// falls back to the "with all the words" field.
+		if len(rest) >= 2 && strings.HasPrefix(rest, `"`) && strings.HasSuffix(rest, `"`) {
+			venue = rest[1 : len(rest)-1]
+		} else if allWords == "" {
+			allWords = rest
+		}
+	}
+
+	return venue, allWords, withoutWords, venue != "" || allWords != "" || withoutWords != ""
+}
+
+// Search runs the full navigation recipe for one task: open Scholar, open the
+// advanced-search dialog from the hamburger menu, fill the equivalent form
+// fields for the query (venue → "published in", keywords → "with/without the
+// words") and the year range, then submit and wait for results.
 func (b *Browser) Search(query string, yearFrom, yearTo int) error {
 	if err := b.page.Navigate(selScholarPage); err != nil {
 		return err
 	}
 	// The Scholar homepage has no results to wait for — wait for the search box
 	// (present on both the homepage and the results pages) instead.
+	//
+	// There is deliberately no wait on document.readyState: Scholar serves this
+	// page as a stream that never finishes parsing (readyState stays 'loading'
+	// even on a fully rendered, interactive page), so any readyState-based gate
+	// times out. Scholar's click/typing bindings are attached synchronously as
+	// the head script parses, i.e. before the search box even exists, so by the
+	// time waitForSearchBox returns they are live. Real readiness is enforced by
+	// the element waits below and typeInto's verify-and-retype.
 	if err := b.waitForSearchBox(60 * time.Second); err != nil {
 		return err
 	}
 
-	searchInput, err := b.page.Element(selSearchInput)
+	if err := b.openAdvancedSearch(); err != nil {
+		return err
+	}
+	if err := b.fillAdvancedSearch(query, yearFrom, yearTo); err != nil {
+		return err
+	}
+	return b.submitAdvancedSearch()
+}
+
+// openAdvancedSearch opens the hamburger menu and clicks the "Advanced search"
+// drawer link, then waits for the dialog. The drawer link id differs between
+// the homepage and the results page, so both are tried.
+func (b *Browser) openAdvancedSearch() error {
+	menu, err := b.page.Element(selMenuBtn)
 	if err != nil {
-		return fmt.Errorf("search input not found: %w", err)
+		return fmt.Errorf("hamburger menu not found: %w", err)
 	}
-	if err := searchInput.SelectAllText(); err != nil {
+	if err := b.humanClick(menu); err != nil {
 		return err
 	}
-	if err := b.humanType(searchInput, query); err != nil {
+	// The drawer content is in the DOM from page load but hidden (visibility/
+	// transform); wait until it actually slides in (.gs_vis) before clicking a
+	// link inside it, otherwise the click lands on the page behind it. Scholar
+	// also records the open drawer in the URL hash (#d=gs_hdr_drw), which is an
+	// independent signal that does not depend on Runtime.evaluate.
+	if err := b.waitForCondition(10*time.Second, "menu drawer not visible", func() bool {
+		return b.elementExists(selMenuDrawer+`.gs_vis`) || b.hasHashAnchor("gs_hdr_drw")
+	}); err != nil {
 		return err
 	}
-	// Click the search button (not just Enter) for a more natural interaction.
-	btn, err := b.page.Element(selSearchButton)
-	if err == nil {
-		_ = b.humanClick(btn)
-	} else {
-		_ = b.page.Keyboard.Press(input.Enter)
-	}
-	if err := b.WaitForResults(60 * time.Second); err != nil {
+	// The .gs_vis class is applied at the start of the slide-in transition; the
+	// drawer needs ~150-300ms to reach translate(0,0). Clicking the link before
+	// that would read its quad mid-transition (still near translate(-100%),
+	// centre off-screen at x≈-114) and the click would land nowhere.
+	if err := b.waitForSettled(selMenuDrawer, 5*time.Second, "menu drawer did not finish opening"); err != nil {
 		return err
 	}
 
-	if yearFrom > 0 || yearTo > 0 {
-		if err := b.setYearRange(yearFrom, yearTo); err != nil {
+	sel := selAdvLinkHome
+	if !b.elementExists(sel) {
+		sel = selAdvLinkResults
+	}
+	link, err := b.page.Element(sel)
+	if err != nil {
+		return fmt.Errorf("advanced-search link not found: %w", err)
+	}
+	if err := b.humanClick(link); err != nil {
+		return err
+	}
+
+	if err := b.waitForCondition(10*time.Second, "advanced-search dialog not visible", func() bool {
+		return b.elementExists(selAdvDialog+`.gs_vis`) || b.hasHashAnchor("gs_asd")
+	}); err != nil {
+		return err
+	}
+	// The dialog appears instantly on desktop but scales in over ~218ms on
+	// touch; wait for it to settle so the Search button is clickable at its
+	// final position later.
+	if err := b.waitForSettled(selAdvDialog, 5*time.Second, "advanced-search dialog did not finish opening"); err != nil {
+		return err
+	}
+	b.sleepRange(600, 1200) // let the dialog settle before typing
+	return nil
+}
+
+// fillAdvancedSearch decomposes the task query into the advanced form's fields
+// and types each one in with per-character delays, then sets the year range.
+func (b *Browser) fillAdvancedSearch(query string, yearFrom, yearTo int) error {
+	venue, allWords, withoutWords, ok := decomposeAdvancedQuery(query)
+	if !ok {
+		return fmt.Errorf("cannot translate query %q into advanced-search fields", query)
+	}
+	if venue != "" {
+		if err := b.typeInto(selAdvPublication, venue); err != nil {
+			return err
+		}
+	}
+	if allWords != "" {
+		if err := b.typeInto(selAdvQuery, allWords); err != nil {
+			return err
+		}
+	}
+	if withoutWords != "" {
+		if err := b.typeInto(selAdvWithout, withoutWords); err != nil {
+			return err
+		}
+	}
+	if yearFrom > 0 {
+		if err := b.typeInto(selAdvYearFrom, strconv.Itoa(yearFrom)); err != nil {
+			return err
+		}
+	}
+	if yearTo > 0 {
+		if err := b.typeInto(selAdvYearTo, strconv.Itoa(yearTo)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// setYearRange opens the sidebar "Custom range" fields and applies a year
-// window. It tolerates the markup varying by Scholar version by trying a few
-// selectors; failures here should be surfaced as a selector that needs
-// updating, not silently swallowed.
-func (b *Browser) setYearRange(yearFrom, yearTo int) error {
-	trigger, err := b.page.Element(selYearTrigger)
-	if err != nil {
-		// Some Scholar versions only show the year fields after a click on a
-		// sidebar link with a "Custom" label; try a broader search.
-		trigger, err = b.page.Element(`a[onclick*="gs_asd"], a#gs_asd_tsb`)
-		if err != nil {
-			return fmt.Errorf("custom-range trigger not found (check selector): %w", err)
+// submitAdvancedSearch presses the dialog's Search button (or presses Enter as
+// a fallback on Scholar versions that changed the button id) and waits for the
+// results page.
+func (b *Browser) submitAdvancedSearch() error {
+	btn, err := b.page.Element(selAdvSubmit)
+	if err == nil {
+		if err := b.humanClick(btn); err != nil {
+			return err
+		}
+	} else {
+		// Scholar honors Enter in a form field as the accept action.
+		if err := b.page.Keyboard.Press(input.Enter); err != nil {
+			return err
 		}
 	}
-	if err := b.humanClick(trigger); err != nil {
-		return err
-	}
-	b.sleepRange(600, 1500)
+	return b.WaitForResults(60 * time.Second)
+}
 
-	from, err := b.page.Element(selYearFrom)
+// typeInto selects and types text into a form field, then reads the field's
+// value back and retypes on a mismatch. Scholar's inputs are re-initialized by
+// its JS shortly after they appear, which can swallow the first keystrokes of
+// a fast typer; the verification makes the interaction self-healing.
+func (b *Browser) typeInto(sel, text string) error {
+	el, err := b.page.Element(sel)
 	if err != nil {
-		return fmt.Errorf("year-from field not found (check selector): %w", err)
+		return fmt.Errorf("field %s not found: %w", sel, err)
 	}
-	to, err := b.page.Element(selYearTo)
-	if err != nil {
-		return fmt.Errorf("year-to field not found (check selector): %w", err)
+	var got string
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := el.SelectAllText(); err != nil {
+			return err
+		}
+		if err := b.humanType(el, text); err != nil {
+			return err
+		}
+		ro, err := el.Eval(`() => this.value`)
+		if err != nil {
+			return err
+		}
+		got = ro.Value.String()
+		if got == text {
+			return nil
+		}
+		fmt.Printf("field %s: expected %q got %q, retyping (%d/3)\n", sel, text, got, attempt+1)
 	}
+	return fmt.Errorf("field %s verification failed: expected %q got %q", sel, text, got)
+}
 
-	if err := from.SelectAllText(); err != nil {
-		return err
-	}
-	if err := b.humanType(from, strconv.Itoa(yearFrom)); err != nil {
-		return err
-	}
-	if err := to.SelectAllText(); err != nil {
-		return err
-	}
-	if err := b.humanType(to, strconv.Itoa(yearTo)); err != nil {
-		return err
-	}
+// elementExists reports whether a selector currently matches in the page.
+// The JS must be an arrow function, not a bare expression: go-rod's Eval wraps
+// the code as `(expr).apply(this, arguments)`, so an expression throws a
+// TypeError ("... .apply is not a function") and Eval always returns an error.
+// page.Element is not used here because it retries until its sleeper gives up
+// when the element is absent, which would block the 400ms poll loop in
+// waitForCondition.
+func (b *Browser) elementExists(sel string) bool {
+	ro, err := b.page.Eval(fmt.Sprintf(`() => document.querySelector(%q) !== null`, sel))
+	return err == nil && ro.Value.Bool()
+}
 
-	// Apply the range by pressing Enter in the "To" field, which Scholar honors
-	// as the accept action for the custom-range form.
-	if err := b.page.Keyboard.Press(input.Enter); err != nil {
-		return err
+// hasHashAnchor reports whether Scholar's dialog-state hash currently names id,
+// i.e. the URL is of the form ...#d=<id>&t=<timestamp>. Scholar updates this
+// fragment via history.pushState when it opens a drawer or dialog, so it is an
+// independent open-state signal that does not depend on Runtime.evaluate (see
+// elementExists) — it is read from the page info via b.URL().
+func (b *Browser) hasHashAnchor(id string) bool {
+	u := b.URL()
+	i := strings.Index(u, "#d=")
+	if i < 0 {
+		return false
 	}
-	if err := b.WaitForResults(60 * time.Second); err != nil {
-		return err
+	rest := u[i+3:]
+	if j := strings.IndexByte(rest, '&'); j >= 0 {
+		rest = rest[:j]
 	}
-	return nil
+	return rest == id
 }
 
 // ClickNext follows the results pagination "Next" link (clicked via the icon,
 // not by URL editing).
+//
+// The click is self-verifying: the Next link's href carries a start=N offset,
+// so a successful click must change the URL. If the click misses (humanClick
+// scrolls the link into view first, but a transiently wrong quad or a mid-layout
+// shift can still let one through), the URL stays put and the click is retried —
+// a stalled pagination surfaces as an error rather than the crawl silently
+// re-committing the same page until the page-cap backstop flags it.
 func (b *Browser) ClickNext() error {
 	icon, err := b.page.Element(selNext)
 	if err != nil {
@@ -137,10 +314,19 @@ func (b *Browser) ClickNext() error {
 	if err != nil {
 		return err
 	}
-	if err := b.humanClick(link); err != nil {
-		return err
+	before := b.URL()
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := b.humanClick(link); err != nil {
+			return err
+		}
+		for i := 0; i < 20; i++ { // up to ~5s for the navigation to register
+			if u := b.URL(); u != "" && u != before {
+				return b.WaitForResults(60 * time.Second)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
-	return b.WaitForResults(60 * time.Second)
+	return fmt.Errorf("next click did not advance the page (URL stayed %q)", before)
 }
 
 // Reload reloads the current page (used after a CAPTCHA is solved).
@@ -179,13 +365,42 @@ func (b *Browser) IsBlocked() bool {
 	return strings.Contains(u, "/sorry/") || strings.Contains(u, "captcha")
 }
 
-// WaitForResults waits until Scholar shows either result rows or the results
-// header (#gs_ab_md), resolving CAPTCHAs and Google sign-in walls as they
-// appear (each manual resolution restarts the deadline).
+// WaitForResults waits until Scholar reaches a terminal state — either result
+// rows are present or the page is genuinely empty — resolving CAPTCHAs and
+// Google sign-in walls as they appear (each manual resolution restarts the
+// deadline).
+//
+// The empty state must be stable across several polls before it is accepted.
+// Scholar streams the page, so a results page passes through a brief "header
+// shell present, rows not yet streamed" state that is indistinguishable from a
+// zero-result page; requiring the state to persist (~1.6s) keeps a slow-loading
+// results page from being mistaken for "did not match any articles".
 func (b *Browser) WaitForResults(timeout time.Duration) error {
+	emptyObs := 0
 	return b.waitForCondition(timeout, "no Scholar results", func() bool {
-		n, err := b.page.Eval(`document.querySelectorAll('.gs_r.gs_or, #gs_ab_md').length`)
-		return err == nil && n.Value.Int() > 0
+		// 1 = result rows present, 2 = results-header shell present but no rows
+		// and no pagination (candidate no-results page), 0 = still loading.
+		ro, err := b.page.Eval(`() => {
+			if (document.querySelectorAll('.gs_r.gs_or').length > 0) return 1;
+			const md = document.querySelector('#gs_ab_md');
+			const next = document.querySelector('#gs_n a[href*="start="]');
+			return (md && !next) ? 2 : 0;
+		}`)
+		if err != nil {
+			emptyObs = 0
+			return false
+		}
+		switch ro.Value.Int() {
+		case 1:
+			emptyObs = 0
+			return true
+		case 2:
+			emptyObs++
+			return emptyObs >= 4
+		default:
+			emptyObs = 0
+			return false
+		}
 	})
 }
 
@@ -195,6 +410,25 @@ func (b *Browser) waitForSearchBox(timeout time.Duration) error {
 	return b.waitForCondition(timeout, "Scholar search box not found", func() bool {
 		_, err := b.page.Element(selSearchInput)
 		return err == nil
+	})
+}
+
+// waitForSettled waits until an element has finished its CSS transition, i.e.
+// its computed transform is the identity matrix (or 'none'). Clicks on a
+// mid-transition element are unreliable: el.Shape() (DOM.getContentQuads)
+// returns the interpolated quad, so e.g. the hamburger drawer still translating
+// in from translate(-100%,0) reports its content's centre at x≈-114 — off the
+// left edge — and the mouse click lands on nothing. The arrow-function form is
+// required, see elementExists.
+func (b *Browser) waitForSettled(sel string, timeout time.Duration, what string) error {
+	return b.waitForCondition(timeout, what, func() bool {
+		ro, err := b.page.Eval(fmt.Sprintf(`() => {
+			const el = document.querySelector(%q);
+			if (!el) return false;
+			const tr = getComputedStyle(el).transform;
+			return tr === 'none' || tr === 'matrix(1, 0, 0, 1, 0, 0)';
+		}`, sel))
+		return err == nil && ro.Value.Bool()
 	})
 }
 

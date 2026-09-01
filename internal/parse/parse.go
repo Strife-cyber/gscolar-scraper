@@ -21,11 +21,12 @@ import (
 
 // Page is the parsed view of one results page.
 type Page struct {
-	Items    []model.ResultItem
-	HasNext  bool
-	Blocked  bool
-	Count    int
-	HasCount bool
+	Items     []model.ResultItem
+	HasNext   bool
+	Blocked   bool
+	NoResults bool // Scholar's "did not match any articles" empty state
+	Count     int
+	HasCount  bool
 }
 
 // Parse inspects a full results-page HTML string (as produced by
@@ -39,6 +40,13 @@ func Parse(htmlStr string) (Page, error) {
 	p.Blocked = isBlockedDoc(doc)
 	p.Count, p.HasCount = resultsCount(doc)
 	p.HasNext = hasNext(doc)
+	p.NoResults = noResults(doc)
+	if p.NoResults {
+		// A settled zero-result page carries no count text at all ("did not
+		// match any articles"), so report an exact 0 instead of "unknown". This
+		// lets the planner cache the count and stop re-searching empty buckets.
+		p.Count, p.HasCount = 0, true
+	}
 
 	doc.Find(".gs_r.gs_or").Each(func(_ int, block *goquery.Selection) {
 		if item, ok := parseItem(block); ok {
@@ -83,6 +91,22 @@ func HasNext(htmlStr string) bool {
 
 func hasNext(doc *goquery.Document) bool {
 	return doc.Find(`#gs_n a[href*="start="] span.gs_ico_nav_next`).Length() > 0
+}
+
+// noResults reports whether the page is Scholar's zero-result state: the
+// results-header shell (#gs_ab_md) has been rendered but no result rows and no
+// pagination exist. Scholar renders that header empty on a "did not match any
+// articles" page instead of showing a count. A page still streaming its first
+// rows is deliberately NOT distinguished here — the caller is expected to have
+// waited for the page to settle (see browser.WaitForResults).
+func noResults(doc *goquery.Document) bool {
+	if doc.Find(".gs_r.gs_or").Length() > 0 {
+		return false
+	}
+	if doc.Find(`#gs_n a[href*="start="]`).Length() > 0 {
+		return false
+	}
+	return doc.Find("#gs_ab_md").Length() > 0
 }
 
 // ---------------------------------------------------------------------------

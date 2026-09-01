@@ -1,0 +1,174 @@
+package mine
+
+import "testing"
+
+// TestBalanceFormula: a 50/50 split scores ~1.0, a 95/5 split approaches 0.
+func TestBalanceFormula(t *testing.T) {
+	if b := balanceOf(50, 50); b < 0.99 {
+		t.Errorf("balanceOf(50,50) = %v, want ~1.0", b)
+	}
+	if b := balanceOf(95, 5); b < 0.05 || b > 0.15 {
+		t.Errorf("balanceOf(95,5) = %v, want ~0.1", b)
+	}
+	if b := balanceOf(100, 0); b != 0 {
+		t.Errorf("balanceOf(100,0) = %v, want 0", b)
+	}
+	if b := balanceOf(0, 100); b != 0 {
+		t.Errorf("balanceOf(0,100) = %v, want 0", b)
+	}
+}
+
+// TestMineRanksBalancedSplitterFirst: given a corpus where one word splits the
+// papers most evenly, it must be the top candidate.
+func TestMineRanksBalancedSplitterFirst(t *testing.T) {
+	// 8 papers. "reinforcement" is on exactly 4 (balanced). "attention" is on 7
+	// (lopsided). The balanced word should rank above the lopsided one.
+	papers := []Paper{
+		{Hash: "a", Title: "reinforcement learning for policy gradient control", Snippet: "reinforcement improves sample efficiency"},
+		{Hash: "b", Title: "deep reinforcement for continuous control", Snippet: "attention is not involved"},
+		{Hash: "c", Title: "reinforcement and reward shaping in games", Snippet: "multiplies the gradient"},
+		{Hash: "d", Title: "policy gradient with reinforcement signal", Snippet: "convergence guarantees"},
+		{Hash: "e", Title: "attention networks for sequence alignment", Snippet: "attention weights are learned"},
+		{Hash: "f", Title: "self attention in transformer models", Snippet: "attention improves translation"},
+		{Hash: "g", Title: "multi head attention for vision", Snippet: "patch attention works well"},
+		{Hash: "h", Title: "attention over graph structures", Snippet: "correlates strongly"},
+	}
+	cands := Mine(papers, DefaultOptions())
+	byName := map[string]Candidate{}
+	for _, c := range cands {
+		byName[c.Keyword] = c
+	}
+	rein, ok := byName["reinforcement"]
+	if !ok {
+		t.Fatalf("expected 'reinforcement' candidate, got %v", cands)
+	}
+	attn, ok := byName["attention"]
+	if !ok {
+		t.Fatalf("expected 'attention' candidate, got %v", cands)
+	}
+	// reinforcement: 4/8 -> balance 1.0; attention: 7/8 -> balance 0.25.
+	if rein.Balance < attn.Balance {
+		t.Errorf("reinforcement balance %.2f should rank above attention %.2f", rein.Balance, attn.Balance)
+	}
+	// 'learning' is a stopword? No — it is NOT in stopWords, but it appears in
+	// exactly one title here (paper a) => dropped by MinFreq. Keep assertions
+	// to the two words with reliable frequency.
+}
+
+// TestMineDropsDominantWord: a word on ~all papers is pruned by
+// MaxFreqFraction (it cannot split the corpus).
+func TestMineDropsDominantWord(t *testing.T) {
+	var papers []Paper
+	for i := 0; i < 20; i++ {
+		prefix := "convolutional model"
+		if i%2 == 1 {
+			prefix = "recurrent model"
+		}
+		papers = append(papers, Paper{
+			Hash:  "h" + string(rune('a'+i)),
+			Title: prefix + " over a benchmark" + " model variants",
+		})
+	}
+	// "model" appears in every title -> balance 0 and freq 100% -> pruned.
+	cands := Mine(papers, DefaultOptions())
+	for _, c := range cands {
+		if c.Keyword == "model" {
+			t.Errorf("dominant word 'model' should be pruned: %+v", c)
+		}
+	}
+}
+
+// TestMineFiltersbyMinFreq: a word on a single paper is too rare to trust.
+func TestMineFiltersByMinFreq(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "quantum error correction with surface codes"},
+		{Hash: "b", Title: "classical error correction over noisy channels"},
+		{Hash: "c", Title: "linear error correction decoding"},
+	}
+	cands := Mine(papers, DefaultOptions())
+	// "quantum" appears in a single paper (a) -> below MinFreq 3 -> pruned if
+	// it has no snippet match. Others survive.
+	for _, c := range cands {
+		if c.Keyword == "quantum" {
+			t.Errorf("single-doc word 'quantum' should be pruned by MinFreq: %+v", c)
+		}
+	}
+}
+
+// TestMineDeterministic: two runs over the same corpus order identically.
+func TestMineDeterministic(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "graph neural networks for molecular property prediction"},
+		{Hash: "b", Title: "graph convolutional networks for node classification"},
+		{Hash: "c", Title: "temporal graph networks for traffic forecasting"},
+		{Hash: "d", Title: "heterogeneous graphs in recommendation"},
+	}
+	o := DefaultOptions()
+	o.MinFreq = 1
+	o.MinBalance = 0
+	o.MaxFreqFraction = 1
+	c1 := Mine(papers, o)
+	c2 := Mine(papers, o)
+	if len(c1) != len(c2) {
+		t.Fatalf("run lengths differ: %d vs %d", len(c1), len(c2))
+	}
+	for i := range c1 {
+		if c1[i] != c2[i] {
+			t.Errorf("candidate %d differs: %+v vs %+v", i, c1[i], c2[i])
+		}
+	}
+}
+
+// TestTokenizeHandlesVenuePhraseWord: the venue-substring word stays a token
+// (the caller, split.DropDegenerateKeywords, handles venue degeneracy).
+func TestTokenizeKeepsDomainWords(t *testing.T) {
+	// "learning" must survive tokenization so the caller can decide to drop it.
+	toks := Tokenize("International Conference on Machine Learning")
+	found := false
+	for _, w := range toks {
+		if w == "learning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("'learning' must remain a token (venue degeneracy is the caller's job)")
+	}
+}
+
+// TestDedupSubstringsKeepsMostSpecific: of two candidates where one is a strict
+// substring of the other ("model" / "models"), only the higher-ranked one wins —
+// the redundant substring is dropped so a split slot isn't wasted on a
+// near-identical term. "model" (substring of "models") is dropped when
+// "models" ranks equal or better.
+func TestDedupSubstringsKeepsMostSpecific(t *testing.T) {
+	cands := []Candidate{
+		{Keyword: "model", Balance: 0.6, With: 60, Without: 60},
+		{Keyword: "models", Balance: 0.5, With: 50, Without: 70},
+		{Keyword: "large", Balance: 0.7, With: 70, Without: 50},
+		{Keyword: "large language", Balance: 0.8, With: 80, Without: 40},
+		{Keyword: "transformer", Balance: 0.4, With: 40, Without: 80},
+	}
+	out := dedupSubstrings(cands)
+	got := map[string]bool{}
+	for _, c := range out {
+		got[c.Keyword] = true
+	}
+	if got["model"] {
+		t.Error("'model' must be dropped (strict substring of 'models')")
+	}
+	if !got["models"] {
+		t.Error("'models' must survive")
+	}
+	if !got["transformer"] {
+		t.Error("'transformer' must survive (no containing keyword)")
+	}
+	// "large" is a substring of "large language" (higher ranked) -> dropped;
+	// "large language" survives.
+	if got["large"] {
+		t.Error("'large' must be dropped (substring of 'large language')")
+	}
+	if !got["large language"] {
+		t.Error("'large language' must survive")
+	}
+}
+

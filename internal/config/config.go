@@ -10,20 +10,29 @@ import (
 // Config is the top-level configuration. All timing values are [min,max]
 // millisecond ranges used to draw uniform-random delays (with jitter).
 type Config struct {
-	Browser          BrowserConfig    `json:"browser"`
-	Conferences      []ConferenceCfg  `json:"conferences"`
-	Timing           TimingConfig     `json:"timing"`
-	AdaptiveThrottle ThrottleConfig   `json:"adaptive_throttle"`
-	Keywords         []string         `json:"keywords"`
-	Database         string           `json:"database"` // SQLite file path (default "scholar.db")
-	StartYear        int              `json:"start_year"` // lower bound for "2000 to present" (default 2000)
-	MaxResults       int              `json:"max_results"` // Scholar's cap (default 1000)
+	Browser          BrowserConfig   `json:"browser"`
+	Conferences      []ConferenceCfg `json:"conferences"`
+	Timing           TimingConfig    `json:"timing"`
+	AdaptiveThrottle ThrottleConfig  `json:"adaptive_throttle"`
+	Keywords         []string        `json:"keywords"`
+	MaxKeywords      int             `json:"max_keywords"` // max keywords the split chain may use per query (default 5)
+	Database         string          `json:"database"`          // SQLite file path (default "scholar.db")
+	StartYear        int             `json:"start_year"`        // lower bound for "2000 to present" (default 2000)
+	MaxResults       int             `json:"max_results"`       // Scholar's cap (default 1000)
+	MinBalance       float64         `json:"min_balance"`       // splitter: min balance score for a keyword to be used (default 0.15)
+	MaxProbes        int             `json:"max_probes"`        // splitter: max count() probes per node (default 8)
+	Headroom         float64         `json:"headroom"`          // target bucket capacity as a fraction of MaxResults (default 0.8)
+	MinPapersToTrust int             `json:"min_papers_to_trust"` // if a year's known-paper corpus is smaller than this, fall back to the count-probe chain (default 10)
+	MinCoverage      float64         `json:"min_coverage"`        // known/true fraction required before offline partitioning is trusted (default 0.5)
+	MaxProbesPerConf int             `json:"max_probes_per_conf"` // hard cap on real count searches (browser round-trips) per conference plan (default 60)
+	MineBigrams      bool            `json:"mine_bigrams"`      // mine two-word keyword candidates too (default false)
+	MaxMinedKeywords int             `json:"max_mined_keywords"` // cap on mined keyword candidates fed to the planner (default 200)
 }
 
 // BrowserConfig describes which browser to drive and where its profile lives.
 type BrowserConfig struct {
-	Kind       string `json:"kind"`       // "chrome" | "edge" | "" (auto-detect)
-	Executable string `json:"executable"` // optional absolute path override
+	Kind       string `json:"kind"`        // "chrome" | "edge" | "" (auto-detect)
+	Executable string `json:"executable"`  // optional absolute path override
 	ProfileDir string `json:"profile_dir"` // user data dir override; empty = auto-seeded copy of the real profile
 	DebugPort  int    `json:"debug_port"`  // CDP port (default 9222)
 	Headless   bool   `json:"headless"`
@@ -37,14 +46,14 @@ type ConferenceCfg struct {
 
 // TimingConfig holds the [min,max] delay ranges in milliseconds.
 type TimingConfig struct {
-	BetweenPagesMS       []int `json:"between_pages_ms"`         // pause after each results page
-	BetweenSearchesMS    []int `json:"between_searches_ms"`      // pause after each distinct search
-	PlanBetweenSearchesMS []int `json:"plan_between_searches_ms"` // pause during the --plan phase
-	TypingCharMS         []int `json:"typing_char_ms"`           // per-character typing delay
-	AfterCaptchaMS       []int `json:"after_captcha_ms"`         // "human returning from break"
-	ClickMoveStepMS      []int `json:"click_move_step_ms"`       // per mouse-move waypoint delay
-	ScrollStepMS         []int `json:"scroll_step_ms"`           // per wheel-event delay
-	ReadScrollProb       float64 `json:"read_scroll_prob"`       // chance of a "reading" scroll per page
+	BetweenPagesMS        []int   `json:"between_pages_ms"`         // pause after each results page
+	BetweenSearchesMS     []int   `json:"between_searches_ms"`      // pause after each distinct search
+	PlanBetweenSearchesMS []int   `json:"plan_between_searches_ms"` // pause during the --plan phase
+	TypingCharMS          []int   `json:"typing_char_ms"`           // per-character typing delay
+	AfterCaptchaMS        []int   `json:"after_captcha_ms"`         // "human returning from break"
+	ClickMoveStepMS       []int   `json:"click_move_step_ms"`       // per mouse-move waypoint delay
+	ScrollStepMS          []int   `json:"scroll_step_ms"`           // per wheel-event delay
+	ReadScrollProb        float64 `json:"read_scroll_prob"`         // chance of a "reading" scroll per page
 }
 
 // ThrottleConfig implements the adaptive throttle: after every CAPTCHA the
@@ -86,6 +95,30 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxResults == 0 {
 		c.MaxResults = 1000
+	}
+	if c.MaxKeywords == 0 {
+		c.MaxKeywords = 5
+	}
+	if c.MinBalance == 0 {
+		c.MinBalance = 0.15
+	}
+	if c.MaxProbes == 0 {
+		c.MaxProbes = 8
+	}
+	if c.Headroom == 0 {
+		c.Headroom = 0.8
+	}
+	if c.MinPapersToTrust == 0 {
+		c.MinPapersToTrust = 10
+	}
+	if c.MinCoverage == 0 {
+		c.MinCoverage = 0.5
+	}
+	if c.MaxProbesPerConf == 0 {
+		c.MaxProbesPerConf = 60
+	}
+	if c.MaxMinedKeywords == 0 {
+		c.MaxMinedKeywords = 200
 	}
 	if c.Browser.DebugPort == 0 {
 		c.Browser.DebugPort = 9222
@@ -162,6 +195,30 @@ func (c *Config) validate() error {
 	}
 	if c.StartYear < 0 || c.StartYear > 2100 {
 		return fmt.Errorf("config: start_year out of range")
+	}
+	if c.MaxKeywords < 0 {
+		return fmt.Errorf("config: max_keywords must be >= 0")
+	}
+	if c.MinBalance < 0 || c.MinBalance > 1 {
+		return fmt.Errorf("config: min_balance must be in [0,1]")
+	}
+	if c.MaxProbes < 1 {
+		return fmt.Errorf("config: max_probes must be >= 1")
+	}
+	if c.Headroom <= 0 || c.Headroom > 1 {
+		return fmt.Errorf("config: headroom must be in (0,1]")
+	}
+	if c.MinPapersToTrust < 0 {
+		return fmt.Errorf("config: min_papers_to_trust must be >= 0")
+	}
+	if c.MinCoverage <= 0 || c.MinCoverage > 1 {
+		return fmt.Errorf("config: min_coverage must be in (0,1]")
+	}
+	if c.MaxProbesPerConf < 1 {
+		return fmt.Errorf("config: max_probes_per_conf must be >= 1")
+	}
+	if c.MaxMinedKeywords < 0 {
+		return fmt.Errorf("config: max_mined_keywords must be >= 0")
 	}
 	return nil
 }

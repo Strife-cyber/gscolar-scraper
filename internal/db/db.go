@@ -79,17 +79,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_conf   ON tasks(conference_id);
 
 CREATE TABLE IF NOT EXISTS papers (
-    hash       TEXT PRIMARY KEY,                -- dedup key: sha256(title|year|first-author)
-    title      TEXT NOT NULL,
-    authors    TEXT NOT NULL DEFAULT '',
-    year       INTEGER NOT NULL DEFAULT 0,
-    snippet    TEXT NOT NULL DEFAULT '',
-    citations  INTEGER,                         -- NULL when Scholar shows no count
-    source_url TEXT NOT NULL DEFAULT '',
-    scholar_id TEXT NOT NULL DEFAULT '',        -- Scholar result cluster id (data-cid)
-    raw_html   TEXT NOT NULL DEFAULT '',        -- the parsed <div class="gs_r"> block
-    task_id    INTEGER REFERENCES tasks(id),
-    scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    hash          TEXT PRIMARY KEY,             -- dedup key: sha256(title|year|first-author)
+    title         TEXT NOT NULL,
+    authors       TEXT NOT NULL DEFAULT '',
+    year          INTEGER NOT NULL DEFAULT 0,
+    snippet       TEXT NOT NULL DEFAULT '',
+    citations     INTEGER,                      -- NULL when Scholar shows no count
+    source_url    TEXT NOT NULL DEFAULT '',
+    scholar_id    TEXT NOT NULL DEFAULT '',     -- Scholar result cluster id (data-cid)
+    raw_html      TEXT NOT NULL DEFAULT '',     -- the parsed <div class="gs_r"> block
+    task_id       INTEGER REFERENCES tasks(id),
+    conference_id INTEGER REFERENCES conferences(id), -- how paper↔venue is known
+    sourced_from  TEXT NOT NULL DEFAULT 'crawl',       -- 'crawl' or 'plan' (harvested)
+    scraped_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_papers_task ON papers(task_id);
 
@@ -112,6 +114,64 @@ CREATE TABLE IF NOT EXISTS count_cache (
 );
 `
 	_, err := d.db.Exec(schema)
+	if err != nil {
+		return err
+	}
+	// Fresh DBs have the columns; pre-existing DBs need them added and the
+	// papers backfilled with their paper→task→conference association.
+	if err := d.ensurePapersColumns(); err != nil {
+		return err
+	}
+	return d.backfillPaperConferences()
+}
+
+// ensurePapersColumns adds papers.conference_id and papers.sourced_from to a
+// pre-existing database that predates them. Column existence is probed with a
+// pragma; only missing ones are added.
+func (d *DB) ensurePapersColumns() error {
+	rows, err := d.db.Query(`PRAGMA table_info(papers)`)
+	if err != nil {
+		return err
+	}
+	cols := map[string]bool{}
+	var cid int
+	var name, ctype string
+	var notnull, pk int
+	var dflt any
+	for rows.Next() {
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		cols[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !cols["conference_id"] {
+		if _, err := d.db.Exec(`ALTER TABLE papers ADD COLUMN conference_id INTEGER REFERENCES conferences(id)`); err != nil {
+			return err
+		}
+	}
+	if !cols["sourced_from"] {
+		if _, err := d.db.Exec(`ALTER TABLE papers ADD COLUMN sourced_from TEXT NOT NULL DEFAULT 'crawl'`); err != nil {
+			return err
+		}
+	}
+	// idx_papers_conf depends on conference_id, so it is made here (after the
+	// column is guaranteed) rather than in the one-shot schema batch.
+	_, err = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_papers_conf ON papers(conference_id)`)
+	return err
+}
+
+// backfillPaperConferences points every paper to its conference via its task's
+// conference_id, filling the new column for records that predate it.
+func (d *DB) backfillPaperConferences() error {
+	_, err := d.db.Exec(`
+		UPDATE papers
+		SET conference_id = (SELECT conference_id FROM tasks WHERE tasks.id = papers.task_id)
+		WHERE conference_id IS NULL AND task_id IS NOT NULL`)
 	return err
 }
 
@@ -174,24 +234,37 @@ type Task struct {
 }
 
 // UpsertTask stores a task, updating it if the same (conference, query, year
-// range, keywords) already exists. An existing task's page pointer and status
-// are preserved (a 'running' task re-enqueued becomes 'pending' again), so
-// re-running the planner never resets in-progress work.
+// range, keywords) already exists. The planner decides the intended status
+// (t.Status: 'pending' for a crawlable leaf, 'needs_split' for an over-cap
+// TODO), and that status wins whenever the task is not already finished — only
+// 'completed' and 'error' outcomes are preserved across re-planning. A stale
+// 'needs_split' whose leaf now fits under the cap is thereby downgraded to
+// 'pending' again, and a freshly over-cap leaf is never inserted crawlable.
 func (d *DB) UpsertTask(ctx context.Context, t *Task) (int64, error) {
+	if t.Status == "" {
+		t.Status = StatusPending
+	}
 	const q = `
 INSERT INTO tasks (conference_id, query, year_from, year_to, keywords, page, status, total_results_estimate, error)
-VALUES (?, ?, ?, ?, ?, 1, 'pending', ?, '')
+VALUES (?, ?, ?, ?, ?, 1, ?, ?, '')
 ON CONFLICT(conference_id, query, year_from, year_to, keywords) DO UPDATE SET
     total_results_estimate = excluded.total_results_estimate,
+    -- A task abandoned as needs_split is re-adopted by the planner only when its
+    -- leaf now fits under the cap; its page pointer may have been run up to the
+    -- cap by a stalled crawl, so reset it to 1 (papers re-collect via hash dedup).
+    page = CASE
+        WHEN tasks.status = 'needs_split' AND excluded.status = 'pending' THEN 1
+        ELSE tasks.page
+    END,
     status = CASE
-        WHEN tasks.status IN ('pending','running') THEN 'pending'
-        ELSE tasks.status
+        WHEN tasks.status IN ('completed','error') THEN tasks.status
+        ELSE excluded.status
     END
 RETURNING id`
 	var id int64
 	err := d.db.QueryRowContext(ctx, q,
 		t.ConferenceID, t.Query, t.YearFrom, t.YearTo,
-		jsonKeywords(t.Keywords), t.TotalEstimate,
+		jsonKeywords(t.Keywords), t.Status, t.TotalEstimate,
 	).Scan(&id)
 	return id, err
 }
@@ -328,6 +401,8 @@ type Paper struct {
 	ScholarID    string
 	RawHTML      string
 	TaskID       int64
+	ConferenceID int64 // how paper↔venue is known (crawled or plan-harvested)
+	SourcedFrom  string // "crawl" from a task's page, "plan" harvested during planning
 }
 
 // SavePaper inserts a paper unless its hash already exists. Returns true if
@@ -347,6 +422,114 @@ func (d *DB) SavePaper(ctx context.Context, p *Paper) (inserted bool, err error)
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// SavePapers upserts a batch of papers in one transaction, healing associations
+// on conflict: a paper first harvested during planning (task_id NULL,
+// sourced_from='plan') acquires its task_id and conference once a crawl saves
+// it, and conference_id is derived from the task when not supplied. Returns the
+// number of rows affected (inserts plus conflict-updates).
+func (d *DB) SavePapers(ctx context.Context, papers []Paper) (int, error) {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n, err := savePapersTx(ctx, tx, papers)
+	if err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+// savePapersTx upserts a batch of papers within the caller's transaction,
+// returning the number of rows affected.
+func savePapersTx(ctx context.Context, tx *sql.Tx, papers []Paper) (int, error) {
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO papers
+			(hash, title, authors, year, snippet, citations, source_url, scholar_id, raw_html,
+			 task_id, conference_id, sourced_from)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		        COALESCE(?, (SELECT conference_id FROM tasks WHERE id = ?)), ?)
+		ON CONFLICT(hash) DO UPDATE SET
+			task_id       = COALESCE(excluded.task_id, papers.task_id),
+			conference_id = COALESCE(excluded.conference_id, papers.conference_id),
+			sourced_from  = CASE WHEN excluded.task_id IS NOT NULL THEN 'crawl' ELSE papers.sourced_from END`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	affected := 0
+	for i := range papers {
+		p := &papers[i]
+		res, err := stmt.ExecContext(ctx,
+			p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationsOrNull(p),
+			p.SourceURL, p.ScholarID, p.RawHTML, taskIDOrNull(p.TaskID),
+			conferenceOrNull(p), taskIDOrNull(p.TaskID), sourcedFromOf(p))
+		if err != nil {
+			return affected, err
+		}
+		n, _ := res.RowsAffected()
+		affected += int(n)
+	}
+	return affected, nil
+}
+
+func conferenceOrNull(p *Paper) any {
+	if p.ConferenceID != 0 {
+		return p.ConferenceID
+	}
+	return nil
+}
+
+func sourcedFromOf(p *Paper) string {
+	if p.SourcedFrom != "" {
+		return p.SourcedFrom
+	}
+	if p.TaskID != 0 {
+		return "crawl"
+	}
+	return "plan"
+}
+
+// PapersForConference returns the known papers for a conference, optionally
+// restricted to a year range (0 bounds mean unbounded). Both crawled and
+// plan-harvested papers are covered via the conference association.
+func (d *DB) PapersForConference(ctx context.Context, conferenceID int64, yearFrom, yearTo int) ([]Paper, error) {
+	var rows *sql.Rows
+	var err error
+	if yearFrom > 0 && yearTo >= yearFrom {
+		rows, err = d.db.QueryContext(ctx, `
+			SELECT hash, title, snippet, year, authors, raw_html, task_id, conference_id, sourced_from
+			FROM papers WHERE conference_id = ? AND year BETWEEN ? AND ? ORDER BY year, hash`,
+			conferenceID, yearFrom, yearTo)
+	} else {
+		rows, err = d.db.QueryContext(ctx, `
+			SELECT hash, title, snippet, year, authors, raw_html, task_id, conference_id, sourced_from
+			FROM papers WHERE conference_id = ? ORDER BY year, hash`, conferenceID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Paper
+	for rows.Next() {
+		var p Paper
+		var taskID, confID *int64
+		if err := rows.Scan(&p.Hash, &p.Title, &p.Snippet, &p.Year, &p.Authors,
+			&p.RawHTML, &taskID, &confID, &p.SourcedFrom); err != nil {
+			return nil, err
+		}
+		if taskID != nil {
+			p.TaskID = *taskID
+		}
+		if confID != nil {
+			p.ConferenceID = *confID
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // PaperCount reports how many unique papers are stored.
@@ -388,15 +571,8 @@ func (d *DB) CommitPage(ctx context.Context, pc PageCommit) error {
 		return err
 	}
 
-	for _, p := range pc.Papers {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO papers
-				(hash, title, authors, year, snippet, citations, source_url, scholar_id, raw_html, task_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationsOrNull(&p),
-			p.SourceURL, p.ScholarID, p.RawHTML, taskIDOrNull(p.TaskID)); err != nil {
-			return err
-		}
+	if _, err := savePapersTx(ctx, tx, pc.Papers); err != nil {
+		return err
 	}
 
 	if _, err := tx.ExecContext(ctx,
@@ -434,10 +610,15 @@ func taskIDOrNull(id int64) any {
 	return id
 }
 
-// ReplaceConferencePlan removes 'needs_split' tasks of a conference that are
-// no longer part of the freshly computed plan, detaching their papers first.
-// This is the "tackle the TODO later" step: re-running --plan with better
-// keywords replaces the obsolete oversized leaves with new, finer ones.
+// ReplaceConferencePlan removes stale tasks of a conference that are no longer
+// part of the freshly computed plan, detaching their papers first. A task is
+// stale when it is either an obsolete 'needs_split' TODO (the "tackle it
+// later" step: re-running --plan with better keywords replaces the oversized
+// leaves with new, finer ones) or a 'pending' task left over from a previous,
+// differently-shaped plan (a whole-range task superseded by 2-year windows, a
+// chain leaf that the empty-bucket optimization no longer emits, …). The plan
+// is authoritative: anything not in keepKeys and not yet completed/errored is
+// removed so the crawl never re-runs an obsolete query.
 func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keepKeys []string) error {
 	keep := map[string]bool{}
 	for _, k := range keepKeys {
@@ -445,11 +626,14 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 	}
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT id, query, year_from, year_to, keywords FROM tasks
-		 WHERE conference_id = ? AND status = 'needs_split'`, conferenceID)
+		 WHERE conference_id = ? AND status IN ('needs_split', 'pending')`, conferenceID)
 	if err != nil {
 		return err
 	}
-	type stale struct{ id int64; key string }
+	type stale struct {
+		id  int64
+		key string
+	}
 	var stales []stale
 	for rows.Next() {
 		var id int64
