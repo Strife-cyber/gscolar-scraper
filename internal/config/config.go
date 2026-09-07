@@ -41,8 +41,9 @@ type BrowserConfig struct {
 
 // ConferenceCfg is one line of the conference list.
 type ConferenceCfg struct {
-	Name  string `json:"name"`  // display label, e.g. "ICML"
-	Query string `json:"query"` // search-box phrase, e.g. "\"International Conference on Machine Learning\""
+	Name         string `json:"name"`           // display label, e.g. "ICML"
+	Query        string `json:"query"`          // search-box phrase, e.g. "\"International Conference on Machine Learning\""
+	UseShortName bool   `json:"use_short_name"` // when true, the conference name is used as the query instead of query
 }
 
 // TimingConfig holds the [min,max] delay ranges in milliseconds.
@@ -126,6 +127,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MinCompletionRatio == 0 {
 		c.MinCompletionRatio = 0.5
+	}
+	for i := range c.Conferences {
+		if c.Conferences[i].UseShortName {
+			c.Conferences[i].Query = fmt.Sprintf("\"%s\"", c.Conferences[i].Name)
+		}
 	}
 	if c.Browser.DebugPort == 0 {
 		c.Browser.DebugPort = 9222

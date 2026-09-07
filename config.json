@@ -40,7 +40,7 @@
   "conferences": [
     { "name": "ICML",       "query": "\"International Conference on Machine Learning\"" },
     { "name": "ICLR",       "query": "\"International Conference on Learning Representations\"" },
-    { "name": "AAAI",       "query": "\"AAAI Conference on Artificial Intelligence\"" },
+    { "name": "AAAI",       "query": "\"AAAI Conference on Artificial Intelligence\"", "use_short_name": true },
     { "name": "IJCAI",      "query": "\"International Joint Conference on Artificial Intelligence\"" },
     { "name": "CVPR",       "query": "\"IEEE/CVF Conference on Computer Vision and Pattern Recognition\"" },
     { "name": "ICCV",       "query": "\"International Conference on Computer Vision\"" },

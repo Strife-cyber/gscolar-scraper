@@ -82,3 +82,16 @@ func TestTuningValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestUseShortName verifies that use_short_name replaces the full query with
+// the conference's short name, quoted so it is routed to the publication field.
+func TestUseShortName(t *testing.T) {
+	raw := []byte(`{"conferences":[{"name":"AAAI","query":"\"AAAI Conference on Artificial Intelligence\"","use_short_name":true}]}`)
+	c, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Conferences[0].Query != `"AAAI"` {
+		t.Errorf("use_short_name query = %q, want %q", c.Conferences[0].Query, `"AAAI"`)
+	}
+}

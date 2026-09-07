@@ -80,7 +80,7 @@ Edit `config.json`:
 | `timing.*` | all `[min,max]` millisecond ranges for human delays |
 | `adaptive_throttle` | delay multiplier growth per CAPTCHA |
 | `keywords` | ordered subtraction chain (order matters, see above) |
-| `conferences` | name + quoted-phrase query per venue |
+| `conferences` | `name` + `query` per venue; `use_short_name` uses `name` as the query |
 
 The shipped `config.example.json` already lists all 20 conferences.
 
