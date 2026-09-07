@@ -19,16 +19,37 @@ import (
 //     papers; the first author's last name additionally separates the rare
 //     same-title-same-year collisions.
 //
-// When no author can be parsed the last-name component degrades to the empty
-// string rather than failing, so papers still get a usable key.
+// When no author can be parsed the third component falls back, in order, to:
+//  1. the normalized full authors string (if any), or
+//  2. a prefix of the normalized title itself,
+// so that author-less entries (e.g. "[CITATION]" records) still get a stable,
+// useful key. Fallback values carry a "s:"/"t:" marker so they cannot collide
+// with a real surname.
 func PaperHash(title string, year int, authors string) string {
+	normTitle := NormalizeTitle(title)
 	h := sha256.New()
-	h.Write([]byte(NormalizeTitle(title)))
+	h.Write([]byte(normTitle))
 	h.Write([]byte{0})
 	h.Write([]byte(strconv.Itoa(year)))
 	h.Write([]byte{0})
-	h.Write([]byte(NormalizeAuthorLast(FirstAuthorLast(authors))))
+	h.Write([]byte(thirdComponent(authors, normTitle)))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// thirdComponent picks the best stable disambiguating signal after title+year.
+func thirdComponent(authors, normTitle string) string {
+	if last := NormalizeAuthorLast(FirstAuthorLast(authors)); last != "" {
+		return last
+	}
+	if s := NormalizeTitle(authors); s != "" {
+		return "s:" + s
+	}
+	const prefixLen = 40
+	runes := []rune(normTitle)
+	if len(runes) > prefixLen {
+		runes = runes[:prefixLen]
+	}
+	return "t:" + string(runes)
 }
 
 // NormalizeTitle lowercases, collapses whitespace and turns punctuation into

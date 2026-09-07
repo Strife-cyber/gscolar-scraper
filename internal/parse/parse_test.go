@@ -257,3 +257,70 @@ func TestParseMetaLine(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockedPhrases verifies text/element-based block detection heuristics.
+func TestBlockedPhrases(t *testing.T) {
+	blocked := []string{
+		`<html><body><div>Our systems have detected unusual traffic from your computer network.</div></body></html>`,
+		`<html><body><h1>We're sorry...</h1><p>... but your computer or network may be sending automated queries.</p></body></html>`,
+		`<html><body>Please show you're not a robot</body></html>`,
+		`<html><body>Please show you’re not a robot</body></html>`,
+		`<html><body><p>Please try again later.</p></body></html>`,
+		`<html><body><div id="captcha"></div></body></html>`,
+	}
+	for i, html := range blocked {
+		if !IsBlocked(html) {
+			t.Errorf("blocked case %d was not detected: %q", i, html)
+		}
+	}
+
+	// A normal results page that merely contains the words must not be flagged.
+	notBlocked := `<html><body>
+<div id="gs_res_ccl_mid">
+  <div class="gs_r gs_or"><div class="gs_ri">
+    <h3 class="gs_rt"><a href="https://x.org">unusual traffic patterns</a></h3>
+    <div class="gs_a">A B - Venue, 2010</div>
+  </div></div>
+</div></body></html>`
+	if IsBlocked(notBlocked) {
+		t.Error("results page containing the phrase must not be flagged as blocked")
+	}
+}
+
+// TestParseFallbackItem covers result blocks whose title is not in h3.gs_rt.
+func TestParseFallbackItem(t *testing.T) {
+	const html = `<html><body>
+<div class="gs_r gs_or" data-cid="fb1">
+  <div class="gs_ri">
+    <div class="gs_rt"><a href="https://x.org/p1">Fallback Title Via Div</a></div>
+    <div class="gs_a">X Y - Conf, 2015</div>
+  </div>
+</div>
+<div class="gs_r gs_or" data-cid="fb2">
+  <div class="gs_ri">
+    <h3><a href="https://x.org/p2">Fallback Title Via Bare H3</a></h3>
+    <div class="gs_a">Z W - Conf, 2018</div>
+    <div class="gs_fl"><a href="/scholar?cites=1">Cited by 7</a></div>
+  </div>
+</div>
+<div class="gs_r gs_or" data-cid="fb3">
+  <div class="gs_ri">
+    <div class="gs_ri_inner">no title at all here</div>
+  </div>
+</div>
+</body></html>`
+
+	p, err := Parse(html)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Items) != 2 {
+		t.Fatalf("expected 2 items (block with no title must be skipped), got %d", len(p.Items))
+	}
+	if p.Items[0].Title != "Fallback Title Via Div" || p.Items[0].URL != "https://x.org/p1" {
+		t.Errorf("item 0 = %+v", p.Items[0])
+	}
+	if p.Items[1].Title != "Fallback Title Via Bare H3" || p.Items[1].URL != "https://x.org/p2" {
+		t.Errorf("item 1 = %+v", p.Items[1])
+	}
+}

@@ -235,57 +235,134 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		coverage = float64(len(papers)) / float64(trueCount)
 	}
 	// A thin or under-covered corpus cannot yield a trustworthy offline split:
-	// fall back to the online count-probe chain rather than over-verifying every
-	// bucket against a much larger real population. budget.exhausted() also short
-	// circuits before we spend the conference's allowance here.
-	if len(papers) < c.cfg.MinPapersToTrust || coverage < c.cfg.MinCoverage || budget.exhausted() {
+	// fall back to an online probe of the year's real results. budget.exhausted()
+	// is checked before any spending.
+	if budget.exhausted() {
 		return nil, false
 	}
+	trust := len(papers) >= c.cfg.MinPapersToTrust && coverage >= c.cfg.MinCoverage
 
-	byHash := make(map[string]db.Paper, len(papers))
-	docs := make([]partition.Doc, 0, len(papers))
-	for _, p := range papers {
-		byHash[p.Hash] = p
-		docs = append(docs, partition.Doc{Hash: p.Hash, Year: p.Year})
-	}
-	text := func(d partition.Doc) string {
-		p := byHash[d.Hash]
-		return p.Title + " " + p.Snippet
-	}
-	limit := int(float64(c.cfg.MaxResults) * c.cfg.Headroom)
-	if limit < 1 {
-		limit = 1
-	}
-
-	out := partition.Partition(docs, keywords, text, limit)
-	var sub []split.Leaf
-	for _, b := range out.Buckets {
-		q := b.Query(conf.Query)
-		n, okC := count(q, year, year)
-		if !okC || budget.exhausted() {
-			return nil, false
+	if trust {
+		byHash := make(map[string]db.Paper, len(papers))
+		docs := make([]partition.Doc, 0, len(papers))
+		for _, p := range papers {
+			byHash[p.Hash] = p
+			docs = append(docs, partition.Doc{Hash: p.Hash, Year: p.Year})
 		}
-		leaf := split.Leaf{Query: q, YearFrom: year, YearTo: year, Keywords: append(append([]string{}, b.Includes...), b.Excludes...), Count: n, HasCount: true}
-		if n <= c.cfg.MaxResults {
-			leaf.NeedsSplit = false
-			sub = append(sub, leaf)
+		text := func(d partition.Doc) string {
+			p := byHash[d.Hash]
+			return p.Title + " " + p.Snippet
+		}
+		limit := int(float64(c.cfg.MaxResults) * c.cfg.Headroom)
+		if limit < 1 {
+			limit = 1
+		}
+
+		out := partition.Partition(docs, keywords, text, limit)
+		var sub []split.Leaf
+		offlineOK := true
+		for _, b := range out.Buckets {
+			if budget.exhausted() {
+				offlineOK = false
+				break
+			}
+			q := b.Query(conf.Query)
+			n, okC := count(q, year, year)
+			if !okC || budget.exhausted() {
+				offlineOK = false
+				break
+			}
+			leaf := split.Leaf{Query: q, YearFrom: year, YearTo: year, Keywords: append(append([]string{}, b.Includes...), b.Excludes...), Count: n, HasCount: true}
+			if n <= c.cfg.MaxResults {
+				leaf.NeedsSplit = false
+				sub = append(sub, leaf)
+				continue
+			}
+			// Offline underestimate (a bucket that "fit" offline is really bigger):
+			// re-split it online, still under the shared probe budget.
+			leaf.NeedsSplit = true
+			rs, ok := split.ResolveOverCap(leaf, keywords, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+			if !ok || budget.exhausted() {
+				offlineOK = false
+				break
+			}
+			sub = append(sub, rs...)
+		}
+		// An unresolved atom floor is a feasibility ceiling: if the offline pass
+		// fully resolves the year, return it. Otherwise try an online probe.
+		if offlineOK && len(out.Unresolved) == 0 {
+			return sub, true
+		}
+	}
+
+	// Online probe: search the bare year query, parse the results, mine fresh
+	// keyword candidates from that year, and try to split with those candidates.
+	if budget.exhausted() {
+		return nil, false
+	}
+	budget.left--
+
+	query := conf.Query
+	for {
+		err := c.br.Search(query, year, year)
+		if errors.Is(err, browser.ErrBlocked) {
+			if werr := c.br.WaitForCaptchaResolved(); werr != nil {
+				return nil, false
+			}
+			c.br.IncreaseThrottle()
 			continue
 		}
-		// Offline underestimate (a bucket that "fit" offline is really bigger):
-		// re-split it online, still under the shared probe budget.
-		leaf.NeedsSplit = true
-		rs, ok := split.ResolveOverCap(leaf, keywords, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
-		if !ok || budget.exhausted() {
+		if err != nil {
 			return nil, false
 		}
-		sub = append(sub, rs...)
+		break
 	}
-	// An unresolved atom floor (a bucket no keyword divides) is a feasibility
-	// ceiling: keep the year needs_split rather than emit an over-cap task.
-	if len(out.Unresolved) > 0 {
+
+	html, err := c.br.Content()
+	if err != nil {
 		return nil, false
 	}
-	return sub, true
+	p, err := parse.Parse(html)
+	if err != nil {
+		return nil, false
+	}
+	if p.Blocked {
+		return nil, false
+	}
+
+	mp := make([]mine.Paper, 0, len(p.Items))
+	for _, it := range p.Items {
+		mp = append(mp, mine.Paper{
+			Hash:    hash.PaperHash(it.Title, it.Year, it.Authors),
+			Title:   it.Title,
+			Snippet: it.Snippet,
+			Year:    it.Year,
+		})
+	}
+	if len(mp) == 0 {
+		return nil, false
+	}
+	opts := mine.DefaultOptions()
+	opts.MinBalance = c.cfg.MinBalance
+	opts.Bigrams = c.cfg.MineBigrams
+	opts.MaxCandidates = c.cfg.MaxMinedKeywords
+	cands := mine.Mine(mp, opts)
+	fresh := make([]string, 0, len(cands))
+	for _, cd := range cands {
+		fresh = append(fresh, cd.Keyword)
+	}
+	fresh = split.DropDegenerateKeywords(conf.Query, fresh)
+	if len(fresh) == 0 {
+		return nil, false
+	}
+	merged := split.DropDegenerateKeywords(conf.Query, append(append([]string{}, keywords...), fresh...))
+	return split.ResolveOverCap(split.Leaf{
+		Query:    query,
+		YearFrom: year,
+		YearTo:   year,
+		Count:    trueCount,
+		HasCount: true,
+	}, merged, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
 }
 
 // liveOnly wraps count so that once the shared budget is spent the wrapper
@@ -386,8 +463,10 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 	// before giving up (a settled empty page — NoResults — already reports
 	// count 0, and a page with no rows and no header won't improve on re-reads).
 	var p parse.Page
+	var html string
+	var err error
 	for read := 0; ; read++ {
-		html, err := c.br.Content()
+		html, err = c.br.Content()
 		if err != nil {
 			return 0, false
 		}
@@ -412,6 +491,7 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 	n, ok = p.Count, p.HasCount
 	if ok {
 		_ = c.db.SetCachedCount(ctx, query, yearFrom, yearTo, n)
+		_ = c.db.SavePlanHarvestPage(ctx, query, yearFrom, yearTo, html)
 	}
 	// Harvest the result rows immediately rather than discarding them: each
 	// planning search that lands a page is a round-trip, so the papers it
@@ -448,9 +528,25 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 		c.log.Printf("conference %d: no pending tasks", confID)
 		return nil
 	}
-	for _, t := range tasks {
+	// Reconcile each pending task's page pointer against the pages actually
+	// committed in page_html, so a stale pointer is corrected before resuming.
+	for i := range tasks {
+		t := &tasks[i]
+		committedNext, rerr := c.db.ReconcileTaskPage(ctx, t.ID)
+		if rerr != nil {
+			c.log.Printf("task %d page reconciliation failed: %v", t.ID, rerr)
+			continue
+		}
+		if committedNext > t.Page {
+			if uerr := c.db.UpdateTaskPage(ctx, t.ID, committedNext); uerr != nil {
+				c.log.Printf("task %d update page failed: %v", t.ID, uerr)
+				continue
+			}
+			t.Page = committedNext
+			c.log.Printf("task %d: reconciled resume page to %d", t.ID, committedNext)
+		}
 		c.br.PauseBetweenSearches()
-		if err := c.crawlTask(ctx, t); err != nil {
+		if err := c.crawlTask(ctx, *t); err != nil {
 			c.log.Printf("task %d failed: %v", t.ID, err)
 		}
 	}

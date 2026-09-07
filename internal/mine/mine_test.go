@@ -172,3 +172,62 @@ func TestDedupSubstringsKeepsMostSpecific(t *testing.T) {
 	}
 }
 
+// TestMineSnippetBigrams: when Bigrams is enabled, adjacent token pairs from
+// the snippet are mined and scored in addition to title bigrams.
+func TestMineSnippetBigrams(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "foo", Snippet: "deep learning approach"},
+		{Hash: "b", Title: "bar", Snippet: "we apply deep learning here"},
+		{Hash: "c", Title: "baz", Snippet: "shallow model only"},
+		{Hash: "d", Title: "qux", Snippet: "simple baseline results"},
+	}
+	o := DefaultOptions()
+	o.Bigrams = true
+	o.BigramSep = 2
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+	cands := Mine(papers, o)
+	byName := map[string]Candidate{}
+	for _, c := range cands {
+		byName[c.Keyword] = c
+	}
+	dl, ok := byName["deep learning"]
+	if !ok {
+		t.Fatalf("expected 'deep learning' snippet bigram, got %v", cands)
+	}
+	if dl.With != 2 || dl.Without != 2 {
+		t.Errorf("deep learning With/Without = %d/%d, want 2/2", dl.With, dl.Without)
+	}
+}
+
+// TestMineCoverageTieBreaker: when two candidates have the same Balance, the
+// one covering more papers (higher With) is ranked first.
+func TestMineCoverageTieBreaker(t *testing.T) {
+	// 6 papers: 5 titled "zebra", 1 titled "alpha". Both words have the same
+	// Balance, but "zebra" appears in far more papers and must come first.
+	papers := []Paper{
+		{Hash: "a", Title: "zebra"},
+		{Hash: "b", Title: "zebra"},
+		{Hash: "c", Title: "zebra"},
+		{Hash: "d", Title: "zebra"},
+		{Hash: "e", Title: "zebra"},
+		{Hash: "f", Title: "alpha"},
+	}
+	o := DefaultOptions()
+	o.Bigrams = false
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+	cands := Mine(papers, o)
+	if len(cands) != 2 {
+		t.Fatalf("expected 2 candidates, got %d: %v", len(cands), cands)
+	}
+	if cands[0].Keyword != "zebra" {
+		t.Errorf("expected 'zebra' first, got %s", cands[0].Keyword)
+	}
+	if cands[1].Keyword != "alpha" {
+		t.Errorf("expected 'alpha' second, got %s", cands[1].Keyword)
+	}
+}
+

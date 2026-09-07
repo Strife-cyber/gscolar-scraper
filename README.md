@@ -30,9 +30,12 @@ technical implementation only.
    where it stopped.
 
 3. **CAPTCHA / blocks** — when a block page appears you get a desktop
-   notification, solve it in the browser, press Enter in the terminal, and the
-   scraper waits a "human returning from a break" delay before resuming. Each
-   CAPTCHA also raises an adaptive throttle that slows the crawl.
+   notification, solve it in the browser, and the scraper resumes automatically
+   once the page is unblocked. It then waits a "human returning from a break"
+   delay before reloading. New `timing` options (`CaptchaPollIntervalMS`,
+   `CaptchaTimeoutMS`, `LoginTimeoutMS`) will be added by another subagent to
+   control CAPTCHA and sign-in polling and timeouts. Each CAPTCHA also raises
+   an adaptive throttle that slows the crawl.
 
 ### Deduplication
 
@@ -149,12 +152,13 @@ GROUP BY c.name ORDER BY COUNT(p.hash) DESC;
 
 - **"No browser found on the debug port …"** — close all browser windows and
   retry.
-- **`custom-range trigger not found`** — Scholar changed its sidebar markup;
-  update `selYearTrigger` / `selYearFrom` / `selYearTo` in
-  `internal/browser/scholar.go` (these are the two selectors most likely to
-  drift).
-- **CAPTCHA loop** — each detection pauses for you to solve it; if blocks are
-  frequent, raise `between_pages_ms` / `between_searches_ms` in the config.
+- **`custom-range trigger not found`** — Scholar changed its hamburger-menu or
+  advanced-search markup; update `selMenuBtn`, `selAdvYearFrom`, and
+  `selAdvYearTo` in `internal/browser/scholar.go` (these are the selectors most
+  likely to drift).
+- **CAPTCHA loop** — the scraper auto-resumes once the page is unblocked; if
+  blocks are frequent, raise `timing.CaptchaPollIntervalMS` and/or
+  `between_pages_ms` / `between_searches_ms` in the config.
 - **`needs_split` never clears** — a single year for that venue genuinely
   exceeds 1000 even after subtraction; add venue-specific keywords to `keywords`
   (earlier in the list wins) and re-run `-plan`.

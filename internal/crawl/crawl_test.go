@@ -27,11 +27,13 @@ type fakeBrowser struct {
 	contents []string // page HTML in the order ClickNext would reach them
 	idx      int
 
-	searchErr    error // returned by Search, once, then cleared
-	contentErr   error // returned by Content on every call
-	clickNextErr error // returned by ClickNext instead of the normal advance/end behavior
-	blocked      bool  // IsBlocked() return value
-	captchaErr   error // returned by WaitForCaptchaResolved
+	searchErr      error // returned by Search, once, then cleared
+	contentErr     error // returned by Content on every call
+	clickNextErr   error // returned by ClickNext instead of the normal advance/end behavior
+	clickBlockOnce bool  // first ClickNext lands on a CAPTCHA: returns ErrBlocked and blocks
+	blocked        bool  // IsBlocked() return value (cleared by a successful CAPTCHA wait)
+	captchaErr     error // returned by WaitForCaptchaResolved
+	captchaWaits   int   // how many times WaitForCaptchaResolved was called
 }
 
 func (f *fakeBrowser) Search(_ string, _, _ int) error {
@@ -59,10 +61,25 @@ func (f *fakeBrowser) ClickNext() error {
 		return &rod.ElementNotFoundError{}
 	}
 	f.idx++
+	if f.clickBlockOnce {
+		// The click did navigate to the next page, but that page is a CAPTCHA:
+		// the click itself succeeds while IsBlocked() reports the block until
+		// WaitForCaptchaResolved clears it, then Content() serves the page the
+		// click reached.
+		f.clickBlockOnce = false
+		f.blocked = true
+	}
 	return nil
 }
-func (f *fakeBrowser) IsBlocked() bool               { return f.blocked }
-func (f *fakeBrowser) WaitForCaptchaResolved() error { return f.captchaErr }
+func (f *fakeBrowser) IsBlocked() bool { return f.blocked }
+func (f *fakeBrowser) WaitForCaptchaResolved() error {
+	f.captchaWaits++
+	if f.captchaErr != nil {
+		return f.captchaErr
+	}
+	f.blocked = false // a solved CAPTCHA unblocks the crawl
+	return nil
+}
 func (f *fakeBrowser) IncreaseThrottle()             {}
 func (f *fakeBrowser) PauseBetweenPages()            {}
 func (f *fakeBrowser) PauseBetweenSearches()         {}
@@ -108,8 +125,15 @@ func setup(t *testing.T, page int, fb *fakeBrowser) (*db.DB, *Crawler) {
 		if err != nil {
 			t.Fatalf("pending tasks: %v", err)
 		}
-		if err := d.AdvanceTaskPage(ctx, tasks[0].ID, page); err != nil {
-			t.Fatalf("advance page: %v", err)
+		// Seed page_html for the pages the resume pointer skips: CrawlConference
+		// reconciles tasks.page against MAX(page_number)+1, so a bare pointer
+		// without committed pages would be reset to 1 before the task runs.
+		for p := 1; p < page; p++ {
+			if err := d.CommitPage(ctx, db.PageCommit{
+				TaskID: tasks[0].ID, PageNumber: p, HTML: "seed", NextPage: p + 1,
+			}); err != nil {
+				t.Fatalf("seed page %d: %v", p, err)
+			}
 		}
 	}
 
@@ -163,6 +187,89 @@ func TestCrawlTaskCompletes(t *testing.T) {
 	}
 }
 
+// TestCrawlTaskTwoPageNextThenEnd: a first page with a live Next link followed
+// by a second page whose results have no Next — the crawl commits both pages
+// and completes via the "no next page" branch.
+func TestCrawlTaskTwoPageNextThenEnd(t *testing.T) {
+	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, true)
+	pageB := mkScholarPage([]string{"DDD", "EEE", "FFF"}, false) // ends here
+	fb := &fakeBrowser{contents: []string{pageA, pageB}}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+
+	s := statusCounts(t, d)
+	if s.Completed != 1 {
+		t.Fatalf("expected completed task, got %+v", s)
+	}
+	if s.Pages != 2 {
+		t.Fatalf("expected 2 pages committed, got %d", s.Pages)
+	}
+	if s.Papers != 6 {
+		t.Fatalf("expected 6 unique papers across the two pages, got %d", s.Papers)
+	}
+	if task := firstTask(t, d); task.Page != 3 {
+		t.Fatalf("expected resume pointer page 3, got %d", task.Page)
+	}
+}
+
+// TestCrawlTaskCaptchaResolvedMidCrawl: clicking Next onto page 2 hits a
+// CAPTCHA (ClickNext returns ErrBlocked, IsBlocked reports true). The crawl
+// waits, the block clears, and pagination resumes on the page the click
+// actually reached — the task completes with both pages committed.
+func TestCrawlTaskCaptchaResolvedMidCrawl(t *testing.T) {
+	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, true)
+	pageB := mkScholarPage([]string{"DDD", "EEE", "FFF"}, false)
+	fb := &fakeBrowser{contents: []string{pageA, pageB}, clickBlockOnce: true}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+
+	if fb.captchaWaits != 1 {
+		t.Fatalf("expected exactly 1 CAPTCHA wait, got %d", fb.captchaWaits)
+	}
+	s := statusCounts(t, d)
+	if s.Completed != 1 {
+		t.Fatalf("expected completed task after unblock, got %+v", s)
+	}
+	if s.Pages != 2 {
+		t.Fatalf("expected 2 pages committed after resume, got %d", s.Pages)
+	}
+	if s.Papers != 6 {
+		t.Fatalf("expected 6 unique papers after resume, got %d", s.Papers)
+	}
+}
+
+// TestCrawlTaskCaptchaMidCrawlUnresolvable: the same mid-crawl CAPTCHA, but the
+// wait fails — the task is flagged error with the first page still committed.
+func TestCrawlTaskCaptchaMidCrawlUnresolvable(t *testing.T) {
+	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, true)
+	pageB := mkScholarPage([]string{"DDD", "EEE", "FFF"}, false)
+	fb := &fakeBrowser{
+		contents:       []string{pageA, pageB},
+		clickBlockOnce: true,
+		captchaErr:     fmt.Errorf("captcha timed out"),
+	}
+	d, c := setup(t, 1, fb)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+
+	task := firstTask(t, d)
+	if task.Status != db.StatusError {
+		t.Fatalf("expected status error on unresolved mid-crawl captcha, got %+v", task)
+	}
+	s := statusCounts(t, d)
+	if s.Pages != 1 || s.Papers != 3 {
+		t.Fatalf("expected only page 1 committed before the block, got %+v", s)
+	}
+}
+
 // mkScholarPage renders a minimal results page with the given titles. Items are
 // keyed by (title, year, author), so pages sharing titles share papers.
 func mkScholarPage(items []string, withNext bool) string {
@@ -213,7 +320,9 @@ func TestCrawlTaskStallDetected(t *testing.T) {
 // genuinely different pages must both be committed.
 func TestCrawlTaskDedupsOverlapAcrossPages(t *testing.T) {
 	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, true)
-	pageB := mkScholarPage([]string{"BBB", "CCC", "DDD"}, true)
+	// BBB/CCC must sit at the same positions so they carry the same author line
+	// and dedup to the same papers.
+	pageB := mkScholarPage([]string{"XXX", "BBB", "CCC"}, true)
 	fb := &fakeBrowser{contents: []string{pageA, pageB, readSample(t, "empty")}}
 	d, c := setup(t, 1, fb)
 
@@ -228,7 +337,7 @@ func TestCrawlTaskDedupsOverlapAcrossPages(t *testing.T) {
 	if s.Pages != 3 { // page 1, page 2, end-of-results page
 		t.Fatalf("expected 3 pages crawled, got %d", s.Pages)
 	}
-	if s.Papers != 4 { // AAA BBB CCC + DDD, with BBB/CCC dedup'd
+	if s.Papers != 4 { // AAA BBB CCC + XXX, with BBB/CCC dedup'd
 		t.Fatalf("expected 4 unique papers despite overlap, got %d", s.Papers)
 	}
 }
@@ -256,8 +365,10 @@ func TestCrawlTaskSparseFlagsNeedsSplit(t *testing.T) {
 	}
 }
 
-// TestCrawlTaskResumeAtPage: a task whose pointer is page 3 must skip straight
-// to page 3 after a fresh search and only store pages 3+.
+// TestCrawlTaskResumeAtPage: a task whose pointer is page 3 (with pages 1-2
+// already committed, which is what keeps the pointer there under page
+// reconciliation) must skip straight to page 3 after a fresh search and only
+// add pages 3+.
 func TestCrawlTaskResumeAtPage(t *testing.T) {
 	normal := readSample(t, "normal")
 	fb := &fakeBrowser{contents: []string{normal, normal, normal, readSample(t, "empty")}}
@@ -271,8 +382,8 @@ func TestCrawlTaskResumeAtPage(t *testing.T) {
 	if s.Completed != 1 {
 		t.Fatalf("expected completed task, got %+v", s)
 	}
-	if s.Pages != 2 { // only pages 3 and 4 (the end page) are stored
-		t.Fatalf("expected 2 pages stored after resume, got %d", s.Pages)
+	if s.Pages != 4 { // 2 seeded + pages 3 and 4 (the end page)
+		t.Fatalf("expected 4 pages stored after resume, got %d", s.Pages)
 	}
 	if s.Papers != 20 {
 		t.Fatalf("expected 20 unique papers, got %d", s.Papers)

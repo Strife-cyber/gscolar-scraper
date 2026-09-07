@@ -9,6 +9,7 @@
 package parse
 
 import (
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -74,6 +75,40 @@ func isBlockedDoc(doc *goquery.Document) bool {
 	}
 	if doc.Find("#g-recaptcha-response").Length() > 0 {
 		return true
+	}
+	if doc.Find("#captcha, div#sorry").Length() > 0 {
+		return true
+	}
+	return hasBlockedText(doc)
+}
+
+// blockedPhrases are literal text fragments Google shows on its "unusual
+// traffic" / sorry pages. Matching is case-insensitive and applied to the
+// document's full text content.
+var blockedPhrases = []string{
+	"unusual traffic",
+	"our systems have detected",
+	"please show you're not a robot",
+	"please show you’re not a robot", // curly apostrophe variant
+	"please try again later",
+	"sorry",
+	"/sorry/",
+	"detected unusual traffic",
+}
+
+// hasBlockedText reports whether the page body contains a known Google block
+// phrase. To limit false positives (e.g., a Scholar snippet mentioning the
+// words), a phrase only counts when the page carries no Scholar result
+// structure.
+func hasBlockedText(doc *goquery.Document) bool {
+	if doc.Find(".gs_r.gs_or, #gs_res_ccl").Length() > 0 {
+		return false
+	}
+	text := strings.ToLower(doc.Text())
+	for _, phrase := range blockedPhrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
 	}
 	return false
 }
@@ -159,8 +194,18 @@ func stripToInt(s string) (int, bool) {
 // ---------------------------------------------------------------------------
 
 func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
-	h3 := block.Find("h3.gs_rt")
+	// Title container: normally h3.gs_rt, but Scholar occasionally emits
+	// variant markup — try a fallback chain before giving up.
+	h3 := block.Find("h3.gs_rt").First()
 	if h3.Length() == 0 {
+		h3 = block.Find(".gs_rt").First()
+	}
+	if h3.Length() == 0 {
+		// Last resort: any heading inside the result body.
+		h3 = block.Find(".gs_ri h3").First()
+	}
+	if h3.Length() == 0 {
+		log.Printf("parse: no title element in result block: %.500s", ItemHTML(block))
 		return model.ResultItem{}, false
 	}
 
@@ -168,14 +213,29 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 	it.ScholarID = block.AttrOr("data-cid", "")
 	it.RawHTML = ItemHTML(block)
 
-	// Title: either a linked heading or a [CITATION] entry.
-	if a := h3.Find("a").First(); a.Length() > 0 {
+	// Title: either a linked heading or a [CITATION] entry. The link may live
+	// directly inside the heading or in a nested span, so search the whole
+	// container before falling back to its raw text.
+	var a *goquery.Selection
+	h3.Find("a").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		// Skip footer links (Cited by / Save / Related) that can appear first
+		// when the fallback container is the whole .gs_ri body.
+		if s.ParentsFiltered(".gs_fl").Length() > 0 {
+			return true
+		}
+		a = s
+		return false
+	})
+	if a != nil {
 		it.Title = normSpace(a.Text())
 		it.URL = a.AttrOr("href", "")
-	} else {
+	}
+	if it.Title == "" {
 		h3.Find(".gs_ctu").Remove()
 		it.Title = normSpace(h3.Text())
-		it.CitationOnly = true
+		if it.URL == "" {
+			it.CitationOnly = true
+		}
 	}
 
 	// Authors / venue / year line.
@@ -193,6 +253,7 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 	}
 
 	if it.Title == "" {
+		log.Printf("parse: empty title in result block: %.500s", it.RawHTML)
 		return model.ResultItem{}, false
 	}
 	return it, true

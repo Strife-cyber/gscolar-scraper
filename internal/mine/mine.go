@@ -111,6 +111,7 @@ type doc struct {
 	snip  map[string]bool
 	// titleList and snipList keep order so bigram adjacency is testable.
 	titleList []string
+	snipList  []string
 }
 
 // Mine scores every candidate keyword that appears in the corpus and returns
@@ -118,8 +119,9 @@ type doc struct {
 // token match against a paper's title or snippet token sets; a bigram candidate
 // matches when its two words appear adjacently (within BigramSep positions).
 //
-// Candidates are ranked by Balance descending, then alphabetically, for
-// determinism.
+// Candidates are ranked by Balance descending, then by With+Without
+// (total coverage) descending, then by With descending, then alphabetically,
+// for determinism.
 func Mine(papers []Paper, o Options) []Candidate {
 	if o.MinBalance <= 0 {
 		o = DefaultOptions()
@@ -140,10 +142,12 @@ func Mine(papers []Paper, o Options) []Candidate {
 			continue
 		}
 		title := Tokenize(p.Title)
+		snip := Tokenize(p.Snippet)
 		d := doc{
 			title:     toSet(title),
-			snip:      toSet(Tokenize(p.Snippet)),
+			snip:      toSet(snip),
 			titleList: title,
+			snipList:  snip,
 		}
 		docs = append(docs, d)
 	}
@@ -153,6 +157,9 @@ func Mine(papers []Paper, o Options) []Candidate {
 	if o.Bigrams {
 		for _, d := range docs {
 			for _, b := range adjacentBigrams(d.titleList, o.BigramSep) {
+				words[b] = true
+			}
+			for _, b := range adjacentBigrams(d.snipList, o.BigramSep) {
 				words[b] = true
 			}
 		}
@@ -197,6 +204,12 @@ func Mine(papers []Paper, o Options) []Candidate {
 		if cands[i].Balance != cands[j].Balance {
 			return cands[i].Balance > cands[j].Balance
 		}
+		if cands[i].With+cands[i].Without != cands[j].With+cands[j].Without {
+			return cands[i].With+cands[i].Without > cands[j].With+cands[j].Without
+		}
+		if cands[i].With != cands[j].With {
+			return cands[i].With > cands[j].With
+		}
 		return cands[i].Keyword < cands[j].Keyword
 	})
 	cands = dedupSubstrings(cands)
@@ -237,7 +250,8 @@ func dedupSubstrings(cands []Candidate) []Candidate {
 // tokens joined by a space ("neural network"); anything else is a single word.
 func inDoc(d doc, kw string, o Options) bool {
 	if strings.Contains(kw, " ") {
-		return hasAdjacentPair(d.titleList, strings.Split(kw, " "), o.BigramSep)
+		pair := strings.Split(kw, " ")
+		return hasAdjacentPair(d.titleList, pair, o.BigramSep) || hasAdjacentPair(d.snipList, pair, o.BigramSep)
 	}
 	return d.title[kw] || d.snip[kw]
 }

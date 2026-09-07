@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"gscolar-scraper/internal/browser"
 	"gscolar-scraper/internal/config"
@@ -108,7 +110,46 @@ func main() {
 	}
 	c := crawl.New(cfg, d, br, logger)
 
+	// Catch Ctrl+C / SIGTERM so a mid-crawl shutdown can flip any tasks left
+	// in 'running' back to 'pending' instead of leaving them stale until the
+	// next CrawlConference call.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// A signal caught while a conference is mid-flight is only seen by the
+	// loop's select after the current conference finishes, so also watch on a
+	// second channel: reset any 'running' tasks left stale by the in-flight
+	// conference, close the DB, and exit promptly.
+	sigForce := make(chan os.Signal, 1)
+	signal.Notify(sigForce, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigForce)
+	go func() {
+		sig := <-sigForce
+		logger.Printf("received %v: resetting stale 'running' tasks to pending", sig)
+		for _, conf := range confs {
+			if err := d.ResetStaleRunning(context.Background(), conf.ID); err != nil {
+				logger.Printf("reset running tasks %s: %v", conf.Name, err)
+			}
+		}
+		if err := d.Close(); err != nil {
+			logger.Printf("db close: %v", err)
+		}
+		os.Exit(130)
+	}()
+
+	shutdown := false
 	for _, conf := range confs {
+		select {
+		case sig := <-sigCh:
+			logger.Printf("received %v, shutting down", sig)
+			shutdown = true
+		default:
+		}
+		if shutdown {
+			break
+		}
+
 		if *doRerunShortfall {
 			n, err := c.RerunShortfall(ctx, conf.ID)
 			if err != nil {

@@ -119,6 +119,15 @@ CREATE TABLE IF NOT EXISTS count_cache (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (query, year_from, year_to)
 );
+
+CREATE TABLE IF NOT EXISTS plan_harvest_pages (
+    query     TEXT NOT NULL,
+    year_from INTEGER NOT NULL,
+    year_to   INTEGER NOT NULL,
+    html      TEXT NOT NULL,
+    scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (query, year_from, year_to)
+);
 `
 	_, err := d.db.Exec(schema)
 	if err != nil {
@@ -388,6 +397,25 @@ func (d *DB) MarkTaskRunning(ctx context.Context, id int64) error {
 func (d *DB) AdvanceTaskPage(ctx context.Context, id int64, nextPage int) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE tasks SET page = ? WHERE id = ?`, nextPage, id)
+	return err
+}
+
+// ReconcileTaskPage returns the next page number a task should resume from
+// based on the pages already committed to page_html. If no pages have been
+// saved it returns 1, so resuming always starts at the actually committed
+// next page rather than a stale task pointer.
+func (d *DB) ReconcileTaskPage(ctx context.Context, taskID int64) (int, error) {
+	var n int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(page_number), 0) + 1 FROM page_html WHERE task_id = ?`,
+		taskID).Scan(&n)
+	return n, err
+}
+
+// UpdateTaskPage overwrites a task's page pointer.
+func (d *DB) UpdateTaskPage(ctx context.Context, id int64, page int) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE tasks SET page = ? WHERE id = ?`, page, id)
 	return err
 }
 
@@ -752,6 +780,17 @@ func (d *DB) SetCachedCount(ctx context.Context, query string, yearFrom, yearTo,
 		ON CONFLICT(query, year_from, year_to) DO UPDATE SET count = excluded.count,
 			updated_at = CURRENT_TIMESTAMP`,
 		query, yearFrom, yearTo, count)
+	return err
+}
+
+// SavePlanHarvestPage stores the raw HTML from a planning count probe so it
+// can be re-mined later without re-querying Scholar.
+func (d *DB) SavePlanHarvestPage(ctx context.Context, query string, yearFrom, yearTo int, html string) error {
+	_, err := d.db.ExecContext(ctx, `
+		INSERT INTO plan_harvest_pages (query, year_from, year_to, html) VALUES (?, ?, ?, ?)
+		ON CONFLICT(query, year_from, year_to) DO UPDATE SET html = excluded.html,
+			scraped_at = CURRENT_TIMESTAMP`,
+		query, yearFrom, yearTo, html)
 	return err
 }
 

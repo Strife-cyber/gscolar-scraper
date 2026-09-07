@@ -1,9 +1,7 @@
 package browser
 
 import (
-	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -471,40 +469,86 @@ func (b *Browser) isLoginWall() bool {
 		strings.Contains(u, "consent.google.com")
 }
 
-// WaitForLoginResolved blocks until the user signs in to Google in the browser
-// window, then waits like a human returning from a break and reloads the page
-// to resume. It mirrors WaitForCaptchaResolved.
+// hasVisibleScholarContent reports whether the current page is a real Scholar
+// page with at least one result row, a settled empty results header, or the
+// search box.
+func (b *Browser) hasVisibleScholarContent() bool {
+	ro, err := b.page.Eval(`() => {
+		if (document.querySelectorAll('.gs_r.gs_or').length > 0) return true;
+		if (document.querySelector('#gs_hdr_tsi') !== null) return true;
+		const md = document.querySelector('#gs_ab_md');
+		if (md) {
+			return document.querySelectorAll('.gs_r.gs_or').length === 0;
+		}
+		return false;
+	}`)
+	return err == nil && ro.Value.Bool()
+}
+
+// WaitForLoginResolved polls the live page until the user has signed in and a
+// real Scholar page is visible, then waits like a human returning from a break
+// and reloads the page to resume.
 func (b *Browser) WaitForLoginResolved() error {
 	msg := "Google is showing a sign-in page. Sign in to your Google account " +
-		"in the browser window, then return here and press Enter to continue."
+		"in the browser window. The scraper will resume automatically once " +
+		"Scholar is reachable again."
 	_ = notify.Captcha("Scholar Scraper", msg)
 	fmt.Println("\n" + msg)
 
-	bufio.NewReader(os.Stdin).ReadString('\n')
+	poll := time.Duration(b.cfg.Timing.CaptchaPollIntervalMS) * time.Millisecond
+	if poll <= 0 {
+		poll = 10 * time.Second
+	}
+	timeout := b.cfg.Timing.LoginTimeoutMS
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	}
+	for {
+		if !b.isLoginWall() && !b.IsBlocked() && b.hasVisibleScholarContent() {
+			fmt.Println("Sign-in resolved; resuming...")
+			break
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return fmt.Errorf("login wall not resolved within %d ms", timeout)
+		}
+		fmt.Println("Still on sign-in/block page, waiting...")
+		time.Sleep(poll)
+	}
 
-	// Simulate a human returning from a break, then reload and re-check.
+	// Simulate a human returning from a break, then reload.
 	b.sleepRange(b.cfg.Timing.AfterCaptchaMS[0], b.cfg.Timing.AfterCaptchaMS[1])
 	return b.page.Reload()
 }
 
-// WaitForCaptchaResolved blocks until the CAPTCHA is cleared in the browser.
-// It polls the live page and resumes automatically once Scholar data (or any
-// non-blocked Scholar page) appears, then waits like a human returning from a
-// break before reloading to continue.
+// WaitForCaptchaResolved polls the live page until the CAPTCHA is gone and a
+// real Scholar page is visible, then waits like a human returning from a break
+// before reloading to continue.
 func (b *Browser) WaitForCaptchaResolved() error {
 	msg := "CAPTCHA or block page detected. Solve it in the browser window. " +
-		"The scraper will resume automatically once the page is unblocked."
+		"The scraper will resume automatically once Scholar is reachable again."
 	_ = notify.Captcha("Scholar Scraper", msg)
 	fmt.Println("\n" + msg)
 
-	// Poll the live page until the block is gone.
+	poll := time.Duration(b.cfg.Timing.CaptchaPollIntervalMS) * time.Millisecond
+	if poll <= 0 {
+		poll = 10 * time.Second
+	}
+	timeout := b.cfg.Timing.CaptchaTimeoutMS
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	}
 	for {
-		if !b.IsBlocked() {
+		if !b.IsBlocked() && b.hasVisibleScholarContent() {
 			fmt.Println("Page unblocked; resuming...")
 			break
 		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return fmt.Errorf("CAPTCHA not resolved within %d ms", timeout)
+		}
 		fmt.Println("Still blocked, waiting...")
-		time.Sleep(10 * time.Second)
+		time.Sleep(poll)
 	}
 
 	// Simulate a human returning from a break, then reload and wait.

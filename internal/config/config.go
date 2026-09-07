@@ -55,6 +55,9 @@ type TimingConfig struct {
 	ClickMoveStepMS       []int   `json:"click_move_step_ms"`       // per mouse-move waypoint delay
 	ScrollStepMS          []int   `json:"scroll_step_ms"`           // per wheel-event delay
 	ReadScrollProb        float64 `json:"read_scroll_prob"`         // chance of a "reading" scroll per page
+	CaptchaPollIntervalMS int     `json:"captcha_poll_interval_ms"` // polling interval while waiting for a CAPTCHA to clear (ms, default 10000)
+	CaptchaTimeoutMS      int     `json:"captcha_timeout_ms"`       // max time to wait for CAPTCHA resolution; 0 = forever
+	LoginTimeoutMS        int     `json:"login_timeout_ms"`         // max time to wait for login resolution; 0 = forever
 }
 
 // ThrottleConfig implements the adaptive throttle: after every CAPTCHA the
@@ -151,6 +154,15 @@ func (c *Config) applyDefaults() {
 	if c.Timing.ReadScrollProb == 0 {
 		c.Timing.ReadScrollProb = 0.5
 	}
+	if c.Timing.CaptchaPollIntervalMS == 0 {
+		c.Timing.CaptchaPollIntervalMS = 10000
+	}
+	if c.Timing.CaptchaTimeoutMS == 0 {
+		c.Timing.CaptchaTimeoutMS = 0
+	}
+	if c.Timing.LoginTimeoutMS == 0 {
+		c.Timing.LoginTimeoutMS = 0
+	}
 	if c.AdaptiveThrottle.Step == 0 {
 		c.AdaptiveThrottle.Step = 0.2
 	}
@@ -196,6 +208,15 @@ func (c *Config) validate() error {
 		if len(rng) != 2 || rng[0] <= 0 || rng[1] < rng[0] {
 			return fmt.Errorf("config: each timing range must be [min,max] with min>0")
 		}
+	}
+	if c.Timing.CaptchaPollIntervalMS < 0 {
+		return fmt.Errorf("config: captcha_poll_interval_ms must be >= 0")
+	}
+	if c.Timing.CaptchaTimeoutMS < 0 {
+		return fmt.Errorf("config: captcha_timeout_ms must be >= 0")
+	}
+	if c.Timing.LoginTimeoutMS < 0 {
+		return fmt.Errorf("config: login_timeout_ms must be >= 0")
 	}
 	if c.StartYear < 0 || c.StartYear > 2100 {
 		return fmt.Errorf("config: start_year out of range")
