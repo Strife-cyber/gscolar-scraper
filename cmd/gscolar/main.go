@@ -9,12 +9,16 @@
 //	gscolar -config config.json -crawl -conference ICML
 //	gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
 //	gscolar -config config.json -gen-tasks       # build tasks from the DB only (no browser)
+//	gscolar -config config.json -rerun-shortfall -crawl -conference ICML  # retry under-delivered tasks
 //
 // -plan and -crawl both drive the real browser and are resumable: re-running
 // them continues from the database's checkpoints (every page is committed
 // atomically with the task's page pointer). -gen-tasks performs no searches at
 // all — it materializes a plan purely from the papers and count cache already
 // in the DB, so you can generate crawl tasks with what's available.
+// -rerun-shortfall re-queues 'incomplete' and 'error' tasks to 'pending'
+// (no browser) so a following -crawl retries them from their checkpoint;
+// a 'needs_split' task is instead retried by re-running -plan.
 package main
 
 import (
@@ -36,8 +40,9 @@ func main() {
 	doPlan := flag.Bool("plan", false, "compute/sync the task plan (drives the browser)")
 	doCrawl := flag.Bool("crawl", false, "crawl pending tasks (drives the browser)")
 	doGen := flag.Bool("gen-tasks", false, "build tasks from the DB only (no browser)")
+	doRerunShortfall := flag.Bool("rerun-shortfall", false, "re-queue incomplete/error tasks to pending (no browser)")
 	doStatus := flag.Bool("status", false, "print progress statistics and exit")
-	confName := flag.String("conference", "", "restrict -plan/-crawl/-gen-tasks to one conference by name")
+	confName := flag.String("conference", "", "restrict -plan/-crawl/-gen-tasks/-rerun-shortfall to one conference by name")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -70,13 +75,13 @@ func main() {
 
 	if *doStatus {
 		printStatus(ctx, d)
-		if !*doPlan && !*doCrawl && !*doGen {
+		if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
 			return
 		}
 		fmt.Println()
 	}
 
-	if !*doPlan && !*doCrawl && !*doGen {
+	if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
 		flag.Usage()
 		return
 	}
@@ -104,6 +109,14 @@ func main() {
 	c := crawl.New(cfg, d, br, logger)
 
 	for _, conf := range confs {
+		if *doRerunShortfall {
+			n, err := c.RerunShortfall(ctx, conf.ID)
+			if err != nil {
+				logger.Printf("rerun-shortfall %s: %v", conf.Name, err)
+				continue
+			}
+			logger.Printf("%s: %d incomplete/error tasks re-queued to pending", conf.Name, n)
+		}
 		if *doGen {
 			need, err := c.OfflineGenTasks(ctx, conf)
 			if err != nil {
@@ -179,8 +192,8 @@ func printStatus(ctx context.Context, d *db.DB) {
 	fmt.Printf("conferences:  %d\n", s.Conferences)
 	fmt.Printf("papers:       %d unique\n", s.Papers)
 	fmt.Printf("pages:        %d raw pages stored\n", s.Pages)
-	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split\n",
-		s.Pending, s.Running, s.Completed, s.NeedsSplit)
+	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split, %d incomplete\n",
+		s.Pending, s.Running, s.Completed, s.NeedsSplit, s.Incomplete)
 }
 
 func usage() {
@@ -192,11 +205,24 @@ Usage:
 Flags:
   -config path     JSON config file (default "config.json")
   -db path         SQLite database path (overrides config.database)
-  -plan            compute/sync the task plan for each conference
+  -plan            compute/sync the task plan for each conference (also
+                    retries any needs_split leaf from scratch)
   -crawl           crawl pending tasks (resumable from checkpoints)
   -gen-tasks       build tasks from the DB only (count_cache + papers, no browser)
-  -conference name restrict -plan/-crawl/-gen-tasks to one conference (e.g. ICML)
+  -rerun-shortfall re-queue incomplete/error tasks to pending (no browser);
+                    combine with -crawl to retry them in the same run
+  -conference name restrict -plan/-crawl/-gen-tasks/-rerun-shortfall to one
+                    conference (e.g. ICML)
   -status          print progress statistics
+
+A task is marked 'incomplete' when Scholar's own pagination ends a crawl (no
+next page) far short of the task's planned result estimate — Scholar
+under-delivering relative to its own "About N results" count, not a crawl
+failure. -rerun-shortfall re-queues it (and any 'error' task) to pending
+without resetting its page pointer, so the retry resumes and paginates
+forward to wherever the previous run stopped instead of re-scraping from page
+1. A 'needs_split' task (over the cap, never resolved) is instead retried by
+re-running -plan, which re-attempts the recursive keyword split from scratch.
 
 The crawler drives your real Chrome/Edge on its normal profile. Before the
 first run, close your browser so the scraper can relaunch it with remote

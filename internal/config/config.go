@@ -10,23 +10,24 @@ import (
 // Config is the top-level configuration. All timing values are [min,max]
 // millisecond ranges used to draw uniform-random delays (with jitter).
 type Config struct {
-	Browser          BrowserConfig   `json:"browser"`
-	Conferences      []ConferenceCfg `json:"conferences"`
-	Timing           TimingConfig    `json:"timing"`
-	AdaptiveThrottle ThrottleConfig  `json:"adaptive_throttle"`
-	Keywords         []string        `json:"keywords"`
-	MaxKeywords      int             `json:"max_keywords"` // max keywords the split chain may use per query (default 5)
-	Database         string          `json:"database"`          // SQLite file path (default "scholar.db")
-	StartYear        int             `json:"start_year"`        // lower bound for "2000 to present" (default 2000)
-	MaxResults       int             `json:"max_results"`       // Scholar's cap (default 1000)
-	MinBalance       float64         `json:"min_balance"`       // splitter: min balance score for a keyword to be used (default 0.15)
-	MaxProbes        int             `json:"max_probes"`        // splitter: max count() probes per node (default 8)
-	Headroom         float64         `json:"headroom"`          // target bucket capacity as a fraction of MaxResults (default 0.8)
-	MinPapersToTrust int             `json:"min_papers_to_trust"` // if a year's known-paper corpus is smaller than this, fall back to the count-probe chain (default 10)
-	MinCoverage      float64         `json:"min_coverage"`        // known/true fraction required before offline partitioning is trusted (default 0.5)
-	MaxProbesPerConf int             `json:"max_probes_per_conf"` // hard cap on real count searches (browser round-trips) per conference plan (default 60)
-	MineBigrams      bool            `json:"mine_bigrams"`      // mine two-word keyword candidates too (default false)
-	MaxMinedKeywords int             `json:"max_mined_keywords"` // cap on mined keyword candidates fed to the planner (default 200)
+	Browser            BrowserConfig   `json:"browser"`
+	Conferences        []ConferenceCfg `json:"conferences"`
+	Timing             TimingConfig    `json:"timing"`
+	AdaptiveThrottle   ThrottleConfig  `json:"adaptive_throttle"`
+	Keywords           []string        `json:"keywords"`
+	MaxKeywords        int             `json:"max_keywords"`         // max keywords the split chain may use per query (default 5)
+	Database           string          `json:"database"`             // SQLite file path (default "scholar.db")
+	StartYear          int             `json:"start_year"`           // lower bound for "2000 to present" (default 2000)
+	MaxResults         int             `json:"max_results"`          // Scholar's cap (default 1000)
+	MinBalance         float64         `json:"min_balance"`          // splitter: min balance score for a keyword to be used (default 0.15)
+	MaxProbes          int             `json:"max_probes"`           // splitter: max count() probes per node (default 8)
+	Headroom           float64         `json:"headroom"`             // target bucket capacity as a fraction of MaxResults (default 0.8)
+	MinPapersToTrust   int             `json:"min_papers_to_trust"`  // if a year's known-paper corpus is smaller than this, fall back to the count-probe chain (default 10)
+	MinCoverage        float64         `json:"min_coverage"`         // known/true fraction required before offline partitioning is trusted (default 0.5)
+	MaxProbesPerConf   int             `json:"max_probes_per_conf"`  // hard cap on real count searches (browser round-trips) per conference plan (default 60)
+	MineBigrams        bool            `json:"mine_bigrams"`         // mine two-word keyword candidates too (default false)
+	MaxMinedKeywords   int             `json:"max_mined_keywords"`   // cap on mined keyword candidates fed to the planner (default 200)
+	MinCompletionRatio float64         `json:"min_completion_ratio"` // a task reaching the natural end of results with fewer than this fraction of TotalEstimate papers is flagged incomplete instead of completed (default 0.5)
 }
 
 // BrowserConfig describes which browser to drive and where its profile lives.
@@ -119,6 +120,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxMinedKeywords == 0 {
 		c.MaxMinedKeywords = 200
+	}
+	if c.MinCompletionRatio == 0 {
+		c.MinCompletionRatio = 0.5
 	}
 	if c.Browser.DebugPort == 0 {
 		c.Browser.DebugPort = 9222
@@ -219,6 +223,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxMinedKeywords < 0 {
 		return fmt.Errorf("config: max_mined_keywords must be >= 0")
+	}
+	if c.MinCompletionRatio <= 0 || c.MinCompletionRatio > 1 {
+		return fmt.Errorf("config: min_completion_ratio must be in (0,1]")
 	}
 	return nil
 }

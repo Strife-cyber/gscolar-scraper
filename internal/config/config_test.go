@@ -34,6 +34,9 @@ func TestDefaults(t *testing.T) {
 	if c.MaxMinedKeywords != 200 {
 		t.Errorf("max_mined_keywords default = %d, want 200", c.MaxMinedKeywords)
 	}
+	if c.MinCompletionRatio != 0.5 {
+		t.Errorf("min_completion_ratio default = %v, want 0.5", c.MinCompletionRatio)
+	}
 }
 
 // TestExplicitTuningValues: values supplied in JSON must survive Parse.
@@ -42,7 +45,7 @@ func TestExplicitTuningValues(t *testing.T) {
 		"conferences":[{"name":"ICML","query":"\"ICML\""}],
 		"min_balance":0.4, "max_probes":3, "headroom":0.5,
 		"min_papers_to_trust":25, "min_coverage":0.7, "max_probes_per_conf":40,
-		"mine_bigrams":true, "max_mined_keywords":50
+		"mine_bigrams":true, "max_mined_keywords":50, "min_completion_ratio":0.3
 	}`)
 	c, err := Parse(raw)
 	if err != nil {
@@ -57,6 +60,9 @@ func TestExplicitTuningValues(t *testing.T) {
 	if c.MinCoverage != 0.7 || c.MaxProbesPerConf != 40 {
 		t.Errorf("tuning not honored: %+v", c)
 	}
+	if c.MinCompletionRatio != 0.3 {
+		t.Errorf("min_completion_ratio not honored: %+v", c)
+	}
 }
 
 // TestTuningValidation: out-of-range tuning values are rejected.
@@ -67,6 +73,8 @@ func TestTuningValidation(t *testing.T) {
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_papers_to_trust":-3}`,
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_coverage":1.1}`,
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"max_mined_keywords":-1}`,
+		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_completion_ratio":1.5}`,
+		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_completion_ratio":-0.1}`,
 	}
 	for _, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {

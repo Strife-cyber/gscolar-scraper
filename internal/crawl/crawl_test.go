@@ -408,6 +408,164 @@ func TestCrawlTaskResumePastEnd(t *testing.T) {
 	}
 }
 
+// setupWithRatio is setup plus an explicit MinCompletionRatio (setup's plain
+// config.Config{} zero-value leaves it at 0, which makes any got>=0 count
+// satisfy the shortfall check and never fire — tests exercising the shortfall
+// path need it set explicitly, the way config.Load's applyDefaults would).
+func setupWithRatio(t *testing.T, page int, fb *fakeBrowser, ratio float64) (*db.DB, *Crawler) {
+	t.Helper()
+	d, c := setup(t, page, fb)
+	c.cfg.MinCompletionRatio = ratio
+	return d, c
+}
+
+// TestCrawlTaskShortfallAtEmptyPage: a task that reaches the "no results, no
+// next" end of pagination with far fewer papers than TotalEstimate (1000, per
+// setup) is flagged incomplete instead of completed.
+func TestCrawlTaskShortfallAtEmptyPage(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{readSample(t, "empty")}}
+	d, c := setupWithRatio(t, 1, fb, 0.5)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusIncomplete {
+		t.Fatalf("expected status incomplete, got %+v", task)
+	}
+	if task.Error == "" {
+		t.Error("expected a shortfall reason to be recorded")
+	}
+}
+
+// TestCrawlTaskShortfallAtNoNextPage: a task that ends via "results but no
+// next page" (the default-branch completion) with far fewer papers than
+// TotalEstimate is flagged incomplete, reproducing the real IJCAI 2022-2023
+// case (About 371 results, 17 papers committed, no gs_n pagination at all).
+func TestCrawlTaskShortfallAtNoNextPage(t *testing.T) {
+	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, false) // no next link
+	fb := &fakeBrowser{contents: []string{pageA}}
+	d, c := setupWithRatio(t, 1, fb, 0.5) // 3 papers vs TotalEstimate 1000
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusIncomplete {
+		t.Fatalf("expected status incomplete, got %+v", task)
+	}
+}
+
+// TestCrawlTaskNoShortfallWhenClose: a task landing close enough to its
+// estimate (above MinCompletionRatio) stays completed, not incomplete.
+func TestCrawlTaskNoShortfallWhenClose(t *testing.T) {
+	normal := readSample(t, "normal") // 20 items
+	fb := &fakeBrowser{contents: []string{normal, readSample(t, "empty")}}
+	d, c := setup(t, 1, fb) // default zero-value ratio: shortfall never fires
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusCompleted {
+		t.Fatalf("expected status completed, got %+v", task)
+	}
+}
+
+// TestCrawlTaskNoShortfallWithoutEstimate: TotalEstimate <= 0 means there is
+// nothing to compare against, so the task is left completed regardless of how
+// few papers were found.
+func TestCrawlTaskNoShortfallWithoutEstimate(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	confID, err := d.UpsertConference(ctx, "TEST", `"test conf"`)
+	if err != nil {
+		t.Fatalf("upsert conference: %v", err)
+	}
+	if _, err := d.UpsertTask(ctx, &db.Task{
+		ConferenceID: confID,
+		Query:        `"test conf" AND "learning"`,
+		YearFrom:     2000,
+		YearTo:       2026,
+		// TotalEstimate left at 0: nothing to compare against.
+	}); err != nil {
+		t.Fatalf("upsert task: %v", err)
+	}
+
+	fb := &fakeBrowser{contents: []string{readSample(t, "empty")}}
+	cfg := &config.Config{MaxResults: 1000, StartYear: 2000, Keywords: []string{"learning"}, MinCompletionRatio: 0.9}
+	c := New(cfg, d, fb, log.New(io.Discard, "", 0))
+
+	if err := c.CrawlConference(ctx, confID); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusCompleted {
+		t.Fatalf("expected status completed (no estimate to compare), got %+v", task)
+	}
+}
+
+// TestRerunShortfall: incomplete and error tasks are re-queued to pending with
+// their page pointer untouched; completed/needs_split tasks are left alone.
+func TestRerunShortfall(t *testing.T) {
+	d, _ := setup(t, 1, &fakeBrowser{})
+	ctx := context.Background()
+	task := firstTask(t, d)
+
+	if err := d.AdvanceTaskPage(ctx, task.ID, 4); err != nil {
+		t.Fatalf("advance page: %v", err)
+	}
+	if err := d.SetTaskIncomplete(ctx, task.ID, "scholar under-delivered: got 17 of ~371 estimated results"); err != nil {
+		t.Fatalf("set incomplete: %v", err)
+	}
+
+	n, err := d.RerunShortfallTasks(ctx, task.ConferenceID)
+	if err != nil {
+		t.Fatalf("rerun shortfall: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 task re-queued, got %d", n)
+	}
+
+	got := firstTask(t, d)
+	if got.Status != db.StatusPending {
+		t.Fatalf("expected status pending after rerun, got %+v", got)
+	}
+	if got.Page != 4 {
+		t.Fatalf("expected page pointer untouched at 4, got %d", got.Page)
+	}
+	if got.Error != "" {
+		t.Errorf("expected error reason cleared, got %q", got.Error)
+	}
+}
+
+// TestRerunShortfallLeavesOtherStatusesAlone: completed and needs_split tasks
+// must not be touched by RerunShortfallTasks.
+func TestRerunShortfallLeavesOtherStatusesAlone(t *testing.T) {
+	d, _ := setup(t, 1, &fakeBrowser{})
+	ctx := context.Background()
+	task := firstTask(t, d)
+
+	if err := d.SetTaskStatus(ctx, task.ID, db.StatusCompleted, ""); err != nil {
+		t.Fatalf("set completed: %v", err)
+	}
+
+	n, err := d.RerunShortfallTasks(ctx, task.ConferenceID)
+	if err != nil {
+		t.Fatalf("rerun shortfall: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 tasks re-queued, got %d", n)
+	}
+	if got := firstTask(t, d); got.Status != db.StatusCompleted {
+		t.Fatalf("completed task must be untouched, got %+v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Planning: harvest + balanced re-split
 // ---------------------------------------------------------------------------

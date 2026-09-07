@@ -457,6 +457,16 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 	return nil
 }
 
+// RerunShortfall re-queues a conference's 'incomplete' and 'error' tasks back
+// to 'pending' so the next CrawlConference retries them. It does not reset the
+// page pointer: crawlTask's resume logic re-searches and clicks Next forward
+// to wherever the task previously stopped, so a shortfall retry picks up from
+// there rather than re-scraping pages already committed. Returns how many
+// tasks were re-queued.
+func (c *Crawler) RerunShortfall(ctx context.Context, confID int64) (int, error) {
+	return c.db.RerunShortfallTasks(ctx, confID)
+}
+
 // crawlTask runs one task to completion: repeated searches (resuming at the
 // task's page pointer), per-page atomic commits, CAPTCHA resolution, sparse
 // page retries and the page-cap needs_split backstop.
@@ -563,10 +573,15 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			// fall through to paginate and try the next page
 
 		case len(p.Items) == 0:
-			// No results and no Next: natural end of the result set.
+			// No results and no Next: natural end of the result set. Committed as
+			// 'completed' here so the shortfall check below has a settled status
+			// to override if Scholar under-delivered.
 			pc.NextPage = page
 			pc.Final = true
 			if err := c.db.CommitPage(ctx, pc); err != nil {
+				return err
+			}
+			if err := c.flagIfShortfall(ctx, task); err != nil {
 				return err
 			}
 			c.log.Printf("task %d: completed at page %d", task.ID, page)
@@ -581,6 +596,9 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			c.log.Printf("task %d: page %d committed (%d papers)", task.ID, page, len(p.Items))
 			if !p.HasNext {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
+				if err := c.flagIfShortfall(ctx, task); err != nil {
+					return err
+				}
 				c.log.Printf("task %d: completed (no next page) at page %d", task.ID, page)
 				return nil
 			}
@@ -605,6 +623,33 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		}
 		page++
 	}
+}
+
+// flagIfShortfall overrides a just-completed task's status to 'incomplete'
+// when Scholar's own pagination ended the crawl far short of TotalEstimate —
+// the "About N results" header count did not translate into N retrievable
+// results (see the IJCAI 2022-2023 case: About 371, page 1 had no next link
+// and only 17 papers). TotalEstimate <= 0 means there is nothing to compare
+// against, so the task is left completed. -rerun-shortfall re-queues an
+// incomplete task to pending; its page pointer is untouched so the resume
+// logic re-searches and clicks forward to right where the crawl stopped.
+func (c *Crawler) flagIfShortfall(ctx context.Context, task db.Task) error {
+	if task.TotalEstimate <= 0 {
+		return nil
+	}
+	got, err := c.db.CountPapersForTask(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if float64(got) >= float64(task.TotalEstimate)*c.cfg.MinCompletionRatio {
+		return nil
+	}
+	reason := fmt.Sprintf("scholar under-delivered: got %d of ~%d estimated results", got, task.TotalEstimate)
+	if err := c.db.SetTaskIncomplete(ctx, task.ID, reason); err != nil {
+		return err
+	}
+	c.log.Printf("task %d: %s -> incomplete", task.ID, reason)
+	return nil
 }
 
 // issueSearch runs a task's search, resolving CAPTCHAs as they appear.

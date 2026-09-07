@@ -22,6 +22,13 @@ const (
 	StatusCompleted  = "completed"
 	StatusNeedsSplit = "needs_split"
 	StatusError      = "error"
+	// StatusIncomplete marks a task that reached Scholar's natural end of
+	// results (no next page) but committed far fewer papers than its planned
+	// TotalEstimate — Scholar under-delivering relative to its own "About N
+	// results" count, not a crawl failure. Distinct from needs_split (which
+	// means "never even started, still over the cap") and from error (which
+	// means the crawl itself broke). -rerun-shortfall re-queues it to pending.
+	StatusIncomplete = "incomplete"
 )
 
 // Open opens (creating if needed) the SQLite database at path and runs
@@ -401,7 +408,7 @@ type Paper struct {
 	ScholarID    string
 	RawHTML      string
 	TaskID       int64
-	ConferenceID int64 // how paper↔venue is known (crawled or plan-harvested)
+	ConferenceID int64  // how paper↔venue is known (crawled or plan-harvested)
 	SourcedFrom  string // "crawl" from a task's page, "plan" harvested during planning
 }
 
@@ -536,6 +543,14 @@ func (d *DB) PapersForConference(ctx context.Context, conferenceID int64, yearFr
 func (d *DB) PaperCount(ctx context.Context) (int, error) {
 	var n int
 	err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM papers`).Scan(&n)
+	return n, err
+}
+
+// CountPapersForTask reports how many papers are currently attributed to one
+// task, used to detect Scholar under-delivering relative to TotalEstimate.
+func (d *DB) CountPapersForTask(ctx context.Context, taskID int64) (int, error) {
+	var n int
+	err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM papers WHERE task_id = ?`, taskID).Scan(&n)
 	return n, err
 }
 
@@ -682,6 +697,34 @@ func (d *DB) SetTaskNeedsSplit(ctx context.Context, id int64, reason string) err
 	return err
 }
 
+// SetTaskIncomplete flags a task as having reached the natural end of results
+// (no next page) while still far short of its TotalEstimate, with a reason.
+// Unlike SetTaskNeedsSplit (never even attempted — over the cap) this records
+// that the crawl ran to completion but Scholar itself under-delivered.
+func (d *DB) SetTaskIncomplete(ctx context.Context, id int64, reason string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'incomplete', error = ? WHERE id = ?`, reason, id)
+	return err
+}
+
+// RerunShortfallTasks re-queues 'incomplete' and 'error' tasks of a conference
+// back to 'pending' so the next -crawl retries them. The page pointer is left
+// untouched: crawlTask's existing resume logic re-searches and clicks Next
+// forward to that pointer, so a shortfall retry naturally picks up wherever
+// the previous run stopped rather than re-scraping from page 1. Returns how
+// many tasks were re-queued.
+func (d *DB) RerunShortfallTasks(ctx context.Context, conferenceID int64) (int, error) {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'pending', error = ''
+		 WHERE conference_id = ? AND status IN ('incomplete', 'error')`,
+		conferenceID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // ---------------------------------------------------------------------------
 // Count cache (split planning)
 // ---------------------------------------------------------------------------
@@ -723,6 +766,7 @@ type Stats struct {
 	Running     int
 	Completed   int
 	NeedsSplit  int
+	Incomplete  int
 	Papers      int
 	Pages       int
 }
@@ -746,6 +790,9 @@ func (d *DB) GetStats(ctx context.Context) (Stats, error) {
 		return s, err
 	}
 	if err := count(`SELECT COUNT(*) FROM tasks WHERE status='needs_split'`, &s.NeedsSplit); err != nil {
+		return s, err
+	}
+	if err := count(`SELECT COUNT(*) FROM tasks WHERE status='incomplete'`, &s.Incomplete); err != nil {
 		return s, err
 	}
 	if err := count(`SELECT COUNT(*) FROM papers`, &s.Papers); err != nil {
