@@ -487,17 +487,25 @@ func (b *Browser) WaitForLoginResolved() error {
 	return b.page.Reload()
 }
 
-// WaitForCaptchaResolved blocks until the user solves the CAPTCHA and presses
-// Enter in the terminal, then waits like a human returning from a break and
-// reloads the page to resume.
+// WaitForCaptchaResolved blocks until the CAPTCHA is cleared in the browser.
+// It polls the live page and resumes automatically once Scholar data (or any
+// non-blocked Scholar page) appears, then waits like a human returning from a
+// break before reloading to continue.
 func (b *Browser) WaitForCaptchaResolved() error {
-	msg := "CAPTCHA or block page detected. Solve it in the browser window, " +
-		"then return here and press Enter to continue."
+	msg := "CAPTCHA or block page detected. Solve it in the browser window. " +
+		"The scraper will resume automatically once the page is unblocked."
 	_ = notify.Captcha("Scholar Scraper", msg)
 	fmt.Println("\n" + msg)
 
-	// Spec §4.6: block until the user signals continuation.
-	bufio.NewReader(os.Stdin).ReadString('\n')
+	// Poll the live page until the block is gone.
+	for {
+		if !b.IsBlocked() {
+			fmt.Println("Page unblocked; resuming...")
+			break
+		}
+		fmt.Println("Still blocked, waiting...")
+		time.Sleep(10 * time.Second)
+	}
 
 	// Simulate a human returning from a break, then reload and wait.
 	b.sleepRange(b.cfg.Timing.AfterCaptchaMS[0], b.cfg.Timing.AfterCaptchaMS[1])
