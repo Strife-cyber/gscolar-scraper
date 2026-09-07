@@ -265,7 +265,6 @@ func TestBlockedPhrases(t *testing.T) {
 		`<html><body><h1>We're sorry...</h1><p>... but your computer or network may be sending automated queries.</p></body></html>`,
 		`<html><body>Please show you're not a robot</body></html>`,
 		`<html><body>Please show you’re not a robot</body></html>`,
-		`<html><body><p>Please try again later.</p></body></html>`,
 		`<html><body><div id="captcha"></div></body></html>`,
 	}
 	for i, html := range blocked {

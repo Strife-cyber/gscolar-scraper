@@ -85,24 +85,25 @@ func isBlockedDoc(doc *goquery.Document) bool {
 
 // blockedPhrases are literal text fragments Google shows on its "unusual
 // traffic" / sorry pages. Matching is case-insensitive and applied to the
-// document's full text content.
+// document's full text content. Only phrases that are essentially unique to
+// Google's block pages are listed; generic words ("sorry", "try again later")
+// appear in normal page chrome and caused false positives.
 var blockedPhrases = []string{
 	"unusual traffic",
 	"our systems have detected",
 	"please show you're not a robot",
 	"please show you’re not a robot", // curly apostrophe variant
-	"please try again later",
-	"sorry",
-	"/sorry/",
 	"detected unusual traffic",
+	"your computer or network may be sending automated queries",
 }
 
 // hasBlockedText reports whether the page body contains a known Google block
-// phrase. To limit false positives (e.g., a Scholar snippet mentioning the
-// words), a phrase only counts when the page carries no Scholar result
-// structure.
+// phrase. To limit false positives, a phrase only counts when the page carries
+// no Scholar UI at all — not just missing result rows, but also the search
+// box (#gs_hdr_tsi), the results container (#gs_res_ccl), the advanced-search
+// dialog (#gs_asd) or pagination (#gs_n).
 func hasBlockedText(doc *goquery.Document) bool {
-	if doc.Find(".gs_r.gs_or, #gs_res_ccl").Length() > 0 {
+	if doc.Find(".gs_r.gs_or, #gs_res_ccl, #gs_hdr_tsi, #gs_asd, #gs_n").Length() > 0 {
 		return false
 	}
 	text := strings.ToLower(doc.Text())
