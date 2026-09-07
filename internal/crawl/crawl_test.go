@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,7 +138,7 @@ func setup(t *testing.T, page int, fb *fakeBrowser) (*db.DB, *Crawler) {
 	}
 
 	cfg := &config.Config{MaxResults: 1000, StartYear: 2000, Keywords: []string{"learning"}}
-	c := New(cfg, d, fb, log.New(io.Discard, "", 0))
+	c := New(cfg, d, fb, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return d, c
 }
 
@@ -609,7 +609,7 @@ func TestCrawlTaskNoShortfallWithoutEstimate(t *testing.T) {
 
 	fb := &fakeBrowser{contents: []string{readSample(t, "empty")}}
 	cfg := &config.Config{MaxResults: 1000, StartYear: 2000, Keywords: []string{"learning"}, MinCompletionRatio: 0.9}
-	c := New(cfg, d, fb, log.New(io.Discard, "", 0))
+	c := New(cfg, d, fb, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if err := c.CrawlConference(ctx, confID); err != nil {
 		t.Fatalf("crawl: %v", err)
@@ -700,7 +700,7 @@ func planCrawler(t *testing.T) (*db.DB, *Crawler, db.Conference) {
 		MinBalance: 0.15, MaxProbes: 8, Headroom: 0.8,
 		MinPapersToTrust: 10, MinCoverage: 0.5, MaxMinedKeywords: 200,
 	}
-	c := New(cfg, d, &fakeBrowser{}, log.New(io.Discard, "", 0))
+	c := New(cfg, d, &fakeBrowser{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return d, c, db.Conference{ID: confID, Name: "CONF", Query: `"Conf"`}
 }
 

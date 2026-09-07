@@ -25,7 +25,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -48,11 +48,13 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "gscolar ", log.LstdFlags)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		logger.Fatalf("config: %v", err)
+		logger.Error("config", "err", err)
+		os.Exit(1)
 	}
 	if *dbPath != "" {
 		cfg.Database = *dbPath
@@ -61,7 +63,8 @@ func main() {
 	ctx := context.Background()
 	d, err := db.Open(cfg.Database)
 	if err != nil {
-		logger.Fatalf("db: %v", err)
+		logger.Error("db", "err", err)
+		os.Exit(1)
 	}
 	defer func(d *db.DB) {
 		err := d.Close()
@@ -72,7 +75,8 @@ func main() {
 
 	// Keep the conference table in sync with the config (upserts are idempotent).
 	if err := seedConferences(ctx, d, cfg.Conferences); err != nil {
-		logger.Fatalf("seed conferences: %v", err)
+		logger.Error("seed conferences", "err", err)
+		os.Exit(1)
 	}
 
 	if *doStatus {
@@ -90,7 +94,8 @@ func main() {
 
 	confs, err := selectConferences(ctx, d, *confName)
 	if err != nil {
-		logger.Fatalf("%v", err)
+		logger.Error("select conferences", "err", err)
+		os.Exit(1)
 	}
 
 	// -gen-tasks builds the plan offline from the DB (count_cache + papers) and
@@ -99,7 +104,8 @@ func main() {
 	br := browser.New(cfg)
 	if *doPlan || *doCrawl {
 		if err := br.Connect(); err != nil {
-			logger.Fatalf("browser: %v", err)
+			logger.Error("browser", "err", err)
+			os.Exit(1)
 		}
 		defer func(br *browser.Browser) {
 			err := br.Close()
@@ -126,14 +132,14 @@ func main() {
 	defer signal.Stop(sigForce)
 	go func() {
 		sig := <-sigForce
-		logger.Printf("received %v: resetting stale 'running' tasks to pending", sig)
+		logger.Info(fmt.Sprintf("received %v: resetting stale 'running' tasks to pending", sig))
 		for _, conf := range confs {
 			if err := d.ResetStaleRunning(context.Background(), conf.ID); err != nil {
-				logger.Printf("reset running tasks %s: %v", conf.Name, err)
+				logger.Info(fmt.Sprintf("reset running tasks %s: %v", conf.Name, err))
 			}
 		}
 		if err := d.Close(); err != nil {
-			logger.Printf("db close: %v", err)
+			logger.Info(fmt.Sprintf("db close: %v", err))
 		}
 		os.Exit(130)
 	}()
@@ -142,7 +148,7 @@ func main() {
 	for _, conf := range confs {
 		select {
 		case sig := <-sigCh:
-			logger.Printf("received %v, shutting down", sig)
+			logger.Info(fmt.Sprintf("received %v, shutting down", sig))
 			shutdown = true
 		default:
 		}
@@ -153,30 +159,30 @@ func main() {
 		if *doRerunShortfall {
 			n, err := c.RerunShortfall(ctx, conf.ID)
 			if err != nil {
-				logger.Printf("rerun-shortfall %s: %v", conf.Name, err)
+				logger.Info(fmt.Sprintf("rerun-shortfall %s: %v", conf.Name, err))
 				continue
 			}
-			logger.Printf("%s: %d incomplete/error tasks re-queued to pending", conf.Name, n)
+			logger.Info(fmt.Sprintf("%s: %d incomplete/error tasks re-queued to pending", conf.Name, n))
 		}
 		if *doGen {
 			need, err := c.OfflineGenTasks(ctx, conf)
 			if err != nil {
-				logger.Printf("gen-tasks %s: %v", conf.Name, err)
+				logger.Info(fmt.Sprintf("gen-tasks %s: %v", conf.Name, err))
 				continue
 			}
-			logger.Printf("%s tasks generated from DB: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need)
+			logger.Info(fmt.Sprintf("%s tasks generated from DB: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need))
 		}
 		if *doPlan {
 			need, err := c.PlanConference(ctx, conf)
 			if err != nil {
-				logger.Printf("plan %s: %v", conf.Name, err)
+				logger.Info(fmt.Sprintf("plan %s: %v", conf.Name, err))
 				continue
 			}
-			logger.Printf("%s planned: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need)
+			logger.Info(fmt.Sprintf("%s planned: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need))
 		}
 		if *doCrawl {
 			if err := c.CrawlConference(ctx, conf.ID); err != nil {
-				logger.Printf("crawl %s: %v", conf.Name, err)
+				logger.Info(fmt.Sprintf("crawl %s: %v", conf.Name, err))
 				continue
 			}
 		}
@@ -227,7 +233,7 @@ func countLeaves(ctx context.Context, d *db.DB, confID int64) int {
 func printStatus(ctx context.Context, d *db.DB) {
 	s, err := d.GetStats(ctx)
 	if err != nil {
-		log.Printf("status: %v", err)
+		slog.Error("status", "err", err)
 		return
 	}
 	fmt.Printf("conferences:  %d\n", s.Conferences)

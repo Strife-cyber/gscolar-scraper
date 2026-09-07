@@ -14,7 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -55,11 +55,11 @@ type Crawler struct {
 	cfg *config.Config
 	db  *db.DB
 	br  Browserer
-	log *log.Logger
+	log *slog.Logger
 }
 
 // New builds a Crawler. The browser must already be connected.
-func New(cfg *config.Config, d *db.DB, br Browserer, l *log.Logger) *Crawler {
+func New(cfg *config.Config, d *db.DB, br Browserer, l *slog.Logger) *Crawler {
 	return &Crawler{cfg: cfg, db: d, br: br, log: l}
 }
 
@@ -171,7 +171,7 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 	if err := c.db.ReplaceConferencePlan(ctx, conf.ID, keepKeys); err != nil {
 		return 0, err
 	}
-	c.log.Printf("planned %s: %d tasks (%d need re-split)", conf.Name, len(resolved), needsSplit)
+	c.log.Info(fmt.Sprintf("planned %s: %d tasks (%d need re-split)", conf.Name, len(resolved), needsSplit))
 	return needsSplit, nil
 }
 
@@ -183,7 +183,7 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
 	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
 	if err != nil {
-		c.log.Printf("load papers for %s keyword mining: %v", conf.Name, err)
+		c.log.Info(fmt.Sprintf("load papers for %s keyword mining: %v", conf.Name, err))
 		papers = nil
 	}
 	opts := mine.DefaultOptions()
@@ -443,14 +443,14 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 		err := c.br.Search(query, yearFrom, yearTo)
 		if errors.Is(err, browser.ErrBlocked) {
 			if werr := c.br.WaitForCaptchaResolved(); werr != nil {
-				c.log.Printf("plan count captcha not resolved: %v", werr)
+				c.log.Info(fmt.Sprintf("plan count captcha not resolved: %v", werr))
 				return 0, false
 			}
 			c.br.IncreaseThrottle()
 			continue
 		}
 		if err != nil {
-			c.log.Printf("plan count search failed (%q %d-%d): %v", query, yearFrom, yearTo, err)
+			c.log.Info(fmt.Sprintf("plan count search failed (%q %d-%d): %v", query, yearFrom, yearTo, err))
 			return 0, false
 		}
 		break
@@ -500,7 +500,7 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 	// count is what drives the plan); it only skips that harvest.
 	if len(p.Items) > 0 {
 		if _, herr := c.db.SavePapers(ctx, papersFromItemsForPlan(p.Items, confID)); herr != nil {
-			c.log.Printf("plan harvest (%q %d-%d): %v", query, yearFrom, yearTo, herr)
+			c.log.Info(fmt.Sprintf("plan harvest (%q %d-%d): %v", query, yearFrom, yearTo, herr))
 		}
 	}
 	c.br.PausePlanning()
@@ -525,7 +525,7 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 		return err
 	}
 	if len(tasks) == 0 {
-		c.log.Printf("conference %d: no pending tasks", confID)
+		c.log.Info(fmt.Sprintf("conference %d: no pending tasks", confID))
 		return nil
 	}
 	// Reconcile each pending task's page pointer against the pages actually
@@ -534,20 +534,20 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 		t := &tasks[i]
 		committedNext, rerr := c.db.ReconcileTaskPage(ctx, t.ID)
 		if rerr != nil {
-			c.log.Printf("task %d page reconciliation failed: %v", t.ID, rerr)
+			c.log.Info(fmt.Sprintf("task %d page reconciliation failed: %v", t.ID, rerr))
 			continue
 		}
 		if committedNext > t.Page {
 			if uerr := c.db.UpdateTaskPage(ctx, t.ID, committedNext); uerr != nil {
-				c.log.Printf("task %d update page failed: %v", t.ID, uerr)
+				c.log.Info(fmt.Sprintf("task %d update page failed: %v", t.ID, uerr))
 				continue
 			}
 			t.Page = committedNext
-			c.log.Printf("task %d: reconciled resume page to %d", t.ID, committedNext)
+			c.log.Info(fmt.Sprintf("task %d: reconciled resume page to %d", t.ID, committedNext))
 		}
 		c.br.PauseBetweenSearches()
 		if err := c.crawlTask(ctx, *t); err != nil {
-			c.log.Printf("task %d failed: %v", t.ID, err)
+			c.log.Info(fmt.Sprintf("task %d failed: %v", t.ID, err))
 		}
 	}
 	return nil
@@ -570,7 +570,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	if err := c.db.MarkTaskRunning(ctx, task.ID); err != nil {
 		return err
 	}
-	c.log.Printf("task %d: %q [%d-%d] from page %d", task.ID, task.Query, task.YearFrom, task.YearTo, task.Page)
+	c.log.Info(fmt.Sprintf("task %d: %q [%d-%d] from page %d", task.ID, task.Query, task.YearFrom, task.YearTo, task.Page))
 
 	page := task.Page
 	if page < 1 {
@@ -589,7 +589,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		if err != nil {
 			if _, ok := errors.AsType[*rod.ElementNotFoundError](err); ok {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
-				c.log.Printf("task %d: resume pointer %d past end -> completed", task.ID, page)
+				c.log.Info(fmt.Sprintf("task %d: resume pointer %d past end -> completed", task.ID, page))
 				return nil
 			}
 			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
@@ -638,7 +638,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		if curKey != "" && curKey == prevKey {
 			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError,
 				"pagination stalled: identical results on consecutive pages")
-			c.log.Printf("task %d: STALL at page %d (same %d results as previous page) -> error", task.ID, page, len(p.Items))
+			c.log.Info(fmt.Sprintf("task %d: STALL at page %d (same %d results as previous page) -> error", task.ID, page, len(p.Items)))
 			return nil
 		}
 		prevKey = curKey
@@ -659,11 +659,11 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 				return err
 			}
 			emptyRuns++
-			c.log.Printf("task %d: sparse page %d (%d/%d)", task.ID, page, emptyRuns, sparseRetries)
+			c.log.Info(fmt.Sprintf("task %d: sparse page %d (%d/%d)", task.ID, page, emptyRuns, sparseRetries))
 			if emptyRuns >= sparseRetries {
 				_ = c.db.SetTaskNeedsSplit(ctx, task.ID,
 					fmt.Sprintf("empty results for %d consecutive pages from page %d", emptyRuns, page))
-				c.log.Printf("task %d: sparse results -> needs_split", task.ID)
+				c.log.Info(fmt.Sprintf("task %d: sparse results -> needs_split", task.ID))
 				return nil
 			}
 			// fall through to paginate and try the next page
@@ -680,7 +680,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			if err := c.flagIfShortfall(ctx, task); err != nil {
 				return err
 			}
-			c.log.Printf("task %d: completed at page %d", task.ID, page)
+			c.log.Info(fmt.Sprintf("task %d: completed at page %d", task.ID, page))
 			return nil
 
 		default:
@@ -689,13 +689,13 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 				return err
 			}
 			emptyRuns = 0
-			c.log.Printf("task %d: page %d committed (%d papers)", task.ID, page, len(p.Items))
+			c.log.Info(fmt.Sprintf("task %d: page %d committed (%d papers)", task.ID, page, len(p.Items)))
 			if !p.HasNext {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
 				if err := c.flagIfShortfall(ctx, task); err != nil {
 					return err
 				}
-				c.log.Printf("task %d: completed (no next page) at page %d", task.ID, page)
+				c.log.Info(fmt.Sprintf("task %d: completed (no next page) at page %d", task.ID, page))
 				return nil
 			}
 		}
@@ -703,7 +703,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		if page >= maxPages {
 			_ = c.db.SetTaskNeedsSplit(ctx, task.ID,
 				fmt.Sprintf("hit %d-page cap (estimate %d)", maxPages, task.TotalEstimate))
-			c.log.Printf("task %d: page cap %d reached -> needs_split", task.ID, maxPages)
+			c.log.Info(fmt.Sprintf("task %d: page cap %d reached -> needs_split", task.ID, maxPages))
 			return nil
 		}
 
@@ -744,7 +744,7 @@ func (c *Crawler) flagIfShortfall(ctx context.Context, task db.Task) error {
 	if err := c.db.SetTaskIncomplete(ctx, task.ID, reason); err != nil {
 		return err
 	}
-	c.log.Printf("task %d: %s -> incomplete", task.ID, reason)
+	c.log.Info(fmt.Sprintf("task %d: %s -> incomplete", task.ID, reason))
 	return nil
 }
 

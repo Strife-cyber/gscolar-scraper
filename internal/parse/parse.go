@@ -9,7 +9,8 @@
 package parse
 
 import (
-	"log"
+	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -205,7 +206,7 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 		h3 = block.Find(".gs_ri h3").First()
 	}
 	if h3.Length() == 0 {
-		log.Printf("parse: no title element in result block: %.500s", ItemHTML(block))
+		slog.Error(fmt.Sprintf("parse: no title element in result block: %.500s", ItemHTML(block)))
 		return model.ResultItem{}, false
 	}
 
@@ -253,7 +254,7 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 	}
 
 	if it.Title == "" {
-		log.Printf("parse: empty title in result block: %.500s", it.RawHTML)
+		slog.Error(fmt.Sprintf("parse: empty title in result block: %.500s", it.RawHTML))
 		return model.ResultItem{}, false
 	}
 	return it, true
