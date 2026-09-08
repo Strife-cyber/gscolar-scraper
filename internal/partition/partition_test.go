@@ -129,6 +129,66 @@ func TestPartitionCapacity(t *testing.T) {
 	}
 }
 
+// TestPartitionPicksConditionallyBalancedChild: inside a node, a higher-ranked
+// keyword that divides the subset lopsidedly (9/1) must lose to a lower-ranked
+// one that splits it evenly (5/5) — the child competes on the parent's subset,
+// not on its global rank.
+func TestPartitionPicksConditionallyBalancedChild(t *testing.T) {
+	membership = map[string]string{}
+	var ds []Doc
+	n := 0
+	assign := func(s string) {
+		h := "h" + string(rune('a'+n)) + string(rune('0'+n))
+		ds = append(ds, Doc{Hash: h, Year: 2020})
+		membership[h] = s
+		n++
+	}
+	// 10 "alpha" docs: "loppy" is lopsided inside the subset (9/1) while "even"
+	// splits it exactly in half (5/5).
+	for i := 0; i < 5; i++ {
+		assign("alpha loppy even")
+	}
+	for i := 0; i < 4; i++ {
+		assign("alpha loppy")
+	}
+	assign("alpha")
+	// 10 docs with none of the keywords: an unresolved atom floor.
+	for i := 0; i < 10; i++ {
+		assign("plain")
+	}
+	out := Partition(ds, []string{"alpha", "loppy", "even"}, text, 5)
+
+	for _, b := range out.Buckets {
+		for _, kw := range b.Includes {
+			if kw == "loppy" {
+				t.Errorf("lopsided 'loppy' (9/1) must not be chosen over even 'even' (5/5): %+v", b)
+			}
+		}
+		for _, kw := range b.Excludes {
+			if kw == "loppy" {
+				t.Errorf("lopsided 'loppy' must not appear as an exclude either: %+v", b)
+			}
+		}
+	}
+	// Expect: root splits on alpha (10/10), the alpha side splits on "even"
+	// (5/5) into two buckets of 5, and the 10 plain docs are unresolved.
+	var alphaEven, alphaNotEven int
+	for _, b := range out.Buckets {
+		if eqStrings(b.Includes, []string{"alpha", "even"}) {
+			alphaEven = len(b.Papers)
+		}
+		if eqStrings(b.Includes, []string{"alpha"}) && eqStrings(b.Excludes, []string{"even"}) {
+			alphaNotEven = len(b.Papers)
+		}
+	}
+	if alphaEven != 5 || alphaNotEven != 5 {
+		t.Errorf("alpha branch = (%d, %d), want (5,5) via 'even': %+v", alphaEven, alphaNotEven, out.Buckets)
+	}
+	if len(out.Unresolved) != 1 || len(out.Unresolved[0].Papers) != 10 {
+		t.Errorf("expected one unresolved group of 10, got %+v", out.Unresolved)
+	}
+}
+
 // TestPartitionInfeasible: 10 keyword-identical documents under a cap of 5 — no
 // keyword divides them, so the group is Unresolved (the atom floor), never an
 // over-cap bucket and never an infinite loop.

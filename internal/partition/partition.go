@@ -2,18 +2,20 @@
 // splitting (its "Stage 2") over an already-scraped corpus of known documents.
 // Given a set of documents, an ordered list of candidate keywords (best
 // splitter first) and a function that returns each document's searchable text,
-// it recursively splits any oversized group on the first keyword that divides
-// it, producing buckets that fit under a capacity limit. Each bucket carries
-// the include/exclude keyword predicates that define it, so it can be rendered
-// into a Scholar query and crawled.
+// it recursively splits any oversized group on the keyword that most evenly
+// divides *that group*, producing buckets that fit under a capacity limit.
+// Each bucket carries the include/exclude keyword predicates that define it,
+// so it can be rendered into a Scholar query and crawled.
 //
-// The split is deterministic: documents are ordered by hash and keywords are
-// consumed in the exact order given, so identical inputs always produce the
-// same buckets. A group that is too large AND that no remaining keyword can
-// divide lands in Unresolved — the operational form of the paper's Feasibility
-// Theorem: documents that share every keyword are inseparable, and surfacing
-// them beats silently emitting an over-cap bucket or looping forever. Callers
-// decide how to handle Unresolved (e.g. flag needs_split).
+// The split is deterministic: documents are ordered by hash, every dividing
+// candidate is scored by its balance inside the current group (the child
+// competes on the parent's subset, so a keyword correlated with an ancestor
+// predicate is near-uniform there and loses), and ties break to the earlier
+// keyword in ranked order. A group that is too large AND that no remaining
+// keyword can divide lands in Unresolved — the operational form of the paper's
+// Feasibility Theorem: documents that share every keyword are inseparable, and
+// surfacing them beats silently emitting an over-cap bucket or looping
+// forever. Callers decide how to handle Unresolved (e.g. flag needs_split).
 package partition
 
 import (
@@ -64,9 +66,10 @@ type Outcome struct {
 type textOf func(d Doc) string
 
 // Partition splits docs into buckets of at most limit documents. keywords must
-// be pre-ranked best-splitter-first (e.g. descending mine.Candidate.Balance);
-// the first keyword that divides the current group is used, so ranking order is
-// the selection authority and the result is deterministic.
+// be pre-ranked best-splitter-first (e.g. descending mine.Candidate Balance×
+// IDF); within each group the candidate with the best conditional balance is
+// used — the keyword that most evenly splits *that subset* — with ties broken
+// by the ranked order, so the result is deterministic.
 //
 // Membership is a case-insensitive substring test against the document text,
 // matching Scholar's semantics.
@@ -105,23 +108,54 @@ func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords 
 		return
 	}
 
+	// Score every candidate on how evenly it divides THIS group — the child
+	// competes on the parent's subset, so a keyword correlated with an ancestor
+	// predicate is near-uniform inside it and loses to a conditionally
+	// independent one. Ties break to the earlier keyword in ranked order.
+	best := -1.0
+	bestK := -1
+	var bestWith, bestWithout *bitset
 	for k := range keywords {
 		with := set.and(kwBits[k])
 		without := set.andNot(kwBits[k])
-		if with.count() == 0 || without.count() == 0 {
+		wc, woc := with.count(), without.count()
+		if wc == 0 || woc == 0 {
 			continue // this keyword does not divide the group
 		}
-		split(out, with, appendPred(inc, keywords[k]), exc, sorted, keywords, kwBits, limit)
-		split(out, without, inc, appendPred(exc, keywords[k]), sorted, keywords, kwBits, limit)
+		if b := subsetBalance(wc, woc); b > best {
+			best, bestK, bestWith, bestWithout = b, k, with, without
+		}
+	}
+	if bestK < 0 {
+		// No remaining keyword divides this group: an atom floor.
+		out.Unresolved = append(out.Unresolved, Bucket{
+			Papers:   hashesOf(sorted, set),
+			Includes: inc,
+			Excludes: exc,
+		})
 		return
 	}
 
-	// No remaining keyword divides this group: an atom floor.
-	out.Unresolved = append(out.Unresolved, Bucket{
-		Papers:   hashesOf(sorted, set),
-		Includes: inc,
-		Excludes: exc,
-	})
+	split(out, bestWith, appendPred(inc, keywords[bestK]), exc, sorted, keywords, kwBits, limit)
+	split(out, bestWithout, inc, appendPred(exc, keywords[bestK]), sorted, keywords, kwBits, limit)
+}
+
+// subsetBalance is the paper's Balance restricted to the current group: 1.0
+// for an even split of this node, ~0 for a lopsided one.
+func subsetBalance(with, without int) float64 {
+	total := with + without
+	if total == 0 {
+		return 0
+	}
+	smaller := with
+	if without < smaller {
+		smaller = without
+	}
+	b := float64(smaller) / (float64(total) / 2.0)
+	if b > 1 {
+		return 1
+	}
+	return b
 }
 
 // appendPred returns pred + [kw] on a fresh slice, so sibling recursion
