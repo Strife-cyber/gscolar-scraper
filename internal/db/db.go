@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS count_cache (
     PRIMARY KEY (query, year_from, year_to)
 );
 
+CREATE TABLE IF NOT EXISTS keyword_rank (
+    keyword     TEXT PRIMARY KEY,
+    score       REAL NOT NULL,               -- rank position: higher = better splitter
+    corpus_size INTEGER NOT NULL DEFAULT 0   -- paper count the ranking was mined from
+);
+
 CREATE TABLE IF NOT EXISTS plan_harvest_pages (
     query     TEXT NOT NULL,
     year_from INTEGER NOT NULL,
@@ -823,6 +829,63 @@ func (d *DB) GetCachedCount(ctx context.Context, query string, yearFrom, yearTo 
 		return 0, false, err
 	}
 	return n, true, nil
+}
+
+// LoadKeywordRank returns the persisted mined-keyword ranking when it was
+// computed over a corpus of exactly corpusSize papers. ok=false on a miss or
+// when the corpus has grown since the ranking was mined.
+func (d *DB) LoadKeywordRank(ctx context.Context, corpusSize int) ([]string, bool, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT keyword FROM keyword_rank WHERE corpus_size = ? ORDER BY score DESC`, corpusSize)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var kw string
+		if err := rows.Scan(&kw); err != nil {
+			return nil, false, err
+		}
+		out = append(out, kw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return out, len(out) > 0, nil
+}
+
+// SaveKeywordRank replaces the persisted mined-keyword ranking. Older
+// generations are deleted so the table never accumulates stale rankings; the
+// stored score is the rank position, not the Balance×IDF product, so only the
+// ordering round-trips.
+func (d *DB) SaveKeywordRank(ctx context.Context, corpusSize int, kws []string) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM keyword_rank`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO keyword_rank (keyword, score, corpus_size) VALUES (?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	for i, kw := range kws {
+		if _, err := stmt.ExecContext(ctx, kw, float64(len(kws)-i), corpusSize); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetCachedCount stores an "About N results" count.

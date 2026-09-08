@@ -62,6 +62,11 @@ type Crawler struct {
 	// text in the DB), fetched once per Crawler.
 	bgOnce  sync.Once
 	bgTexts []string
+
+	// minedKws is the TF-IDF-ranked mined keyword list, computed at most once
+	// per Crawler and persisted in keyword_rank across runs.
+	kwOnce   sync.Once
+	minedKws []string
 }
 
 // New builds a Crawler. The browser must already be connected.
@@ -207,25 +212,7 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 // to rank high, so generic vocabulary can never masquerade as a splitter.
 // Mined keywords come first so the partition sees the best splitters first.
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
-	// The keyword dataset is every stored paper, not just this conference's:
-	// words that split the literature well are discovered wherever they have
-	// been crawled. Mining and the IDF background share the same whole-DB
-	// corpus — IDF still sinks vocabulary that is common across all venues.
-	texts := c.backgroundTexts(ctx)
-	opts := mine.DefaultOptions()
-	opts.MinBalance = c.cfg.MinBalance
-	opts.Bigrams = c.cfg.MineBigrams
-	opts.MaxCandidates = c.cfg.MaxMinedKeywords
-	mp := make([]mine.Paper, 0, len(texts))
-	for i, t := range texts {
-		mp = append(mp, mine.Paper{Hash: fmt.Sprintf("bg-%d", i), Title: t})
-	}
-	cands := mine.MineIDF(mp, texts, opts)
-
-	mined := make([]string, 0, len(cands))
-	for _, cd := range cands {
-		mined = append(mined, cd.Keyword)
-	}
+	mined := c.minedKeywords(ctx)
 	seen := map[string]bool{}
 	var kws []string
 	for _, w := range append(mined, c.cfg.Keywords...) {
@@ -236,6 +223,45 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 		kws = append(kws, w)
 	}
 	return split.DropDegenerateKeywords(conf.Query, kws)
+}
+
+// minedKeywords returns the TF-IDF-ranked mined keyword list. It is computed
+// at most once per Crawler AND persisted in the keyword_rank table keyed by
+// corpus size: a run that finds the same paper count reuses the previous
+// ranking instantly instead of re-tokenizing the whole corpus at startup.
+// The moment any new paper is stored, PaperCount changes and the ranking is
+// re-mined once.
+func (c *Crawler) minedKeywords(ctx context.Context) []string {
+	c.kwOnce.Do(func() {
+		n, err := c.db.PaperCount(ctx)
+		if err == nil {
+			if kws, ok, lerr := c.db.LoadKeywordRank(ctx, n); lerr == nil && ok {
+				c.minedKws = kws
+				return
+			}
+		}
+		texts := c.backgroundTexts(ctx)
+		opts := mine.DefaultOptions()
+		opts.MinBalance = c.cfg.MinBalance
+		opts.Bigrams = c.cfg.MineBigrams
+		opts.MaxCandidates = c.cfg.MaxMinedKeywords
+		mp := make([]mine.Paper, 0, len(texts))
+		for i, t := range texts {
+			mp = append(mp, mine.Paper{Hash: fmt.Sprintf("bg-%d", i), Title: t})
+		}
+		cands := mine.MineIDF(mp, texts, opts)
+		kws := make([]string, 0, len(cands))
+		for _, cd := range cands {
+			kws = append(kws, cd.Keyword)
+		}
+		if err == nil {
+			if serr := c.db.SaveKeywordRank(ctx, n, kws); serr != nil {
+				c.log.Info(fmt.Sprintf("persist keyword ranking: %v", serr))
+			}
+		}
+		c.minedKws = kws
+	})
+	return c.minedKws
 }
 
 // backgroundTexts returns every stored paper's text, fetched once per Crawler

@@ -16,8 +16,10 @@
 //
 //  2. Recursive balance-guided keyword splitting (for a single year still over
 //     the cap), via ResolveOverCap. At each over-cap node, up to probesPerNode
-//     keyword candidates are counted and the one whose with/without split is
-//     closest to even (and at least minBalance) is chosen. The node then
+//     keyword candidates are counted in ranked order and the first whose
+//     with/without split clears minBalance is chosen — probing stops there
+//     rather than comparing every candidate, so a working splitter costs one
+//     Scholar search per node. The node then
 //     becomes exactly two disjoint children:
 //
 //     parent AND "keyword"
@@ -177,9 +179,9 @@ func DropDegenerateKeywords(baseQuery string, keywords []string) []string {
 // expensive Scholar search.
 //
 // keywords must be pre-ranked best-splitter-first (e.g. descending offline
-// balance). At each node up to probesPerNode candidates are counted; the one
-// whose with/without split is closest to even (balance >= minBalance) is
-// chosen and recursion continues on both halves. ok is false when some subtree
+// Balance × IDF). At each node up to probesPerNode candidates are counted; the
+// first one whose with/without split clears minBalance is chosen and the
+// remaining candidates are never probed. ok is false when some subtree
 // cannot be brought under the cap with the given keywords/budget — the caller
 // should then keep treating the leaf as needs_split rather than emit an
 // over-cap task. ResolveOverCap never emits an over-cap leaf itself.
@@ -233,10 +235,15 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		return false
 	}
 
-	// Probe up to probesPerNode candidates, keep the best balance that divides.
-	best := -1.0
-	var bestWith, bestWithout, bestIdx int
+	// Probe candidates in ranked order; the FIRST one that produces a valid
+	// split (nonempty both sides, balance >= minBalance) is selected and the
+	// remaining candidates are never searched. Candidates arrive best-first
+	// (TF-IDF over the corpus), so the first acceptable probe is almost always
+	// a good splitter — and stopping there costs one Scholar search per node
+	// instead of one per candidate.
+	bestIdx := -1
 	bestKey := ""
+	var bestWith, bestWithout int
 	probed := 0
 
 	for k := range keywords {
@@ -257,14 +264,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		if with <= 0 || without <= 0 {
 			continue // this keyword does not divide the node
 		}
-		b := balanceOf(with, without)
-		if b > best {
-			best, bestWith, bestWithout = b, with, without
-			bestIdx, bestKey = k, keywords[k]
+		if balanceOf(with, without) >= minBalance {
+			bestIdx, bestKey, bestWith, bestWithout = k, keywords[k], with, without
+			break
 		}
 	}
-	if bestKey == "" || best < minBalance {
-		return false // no keyword divides within budget
+	if bestKey == "" {
+		return false // no candidate cleared minBalance within budget
 	}
 
 	// Recurse on the with-side (papers containing the keyword) and the

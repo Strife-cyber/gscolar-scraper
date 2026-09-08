@@ -288,15 +288,22 @@ func TestPlanRejectsInvalidMinBalance(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestResolveOverCap: a 1200-result leaf under a 1000 cap resolves into two
-// under-cap leaves by the best-balanced keyword ("neural", 600/600).
+// under-cap leaves on the FIRST acceptable splitter in ranked order — once
+// "learning" returns a valid 700/500 split, "neural" is never even probed
+// (one Scholar search per node, not one per candidate).
 func TestResolveOverCap(t *testing.T) {
 	base := `"ICML"`
 	leaf := Leaf{Query: base, YearFrom: 2020, YearTo: 2020, Count: 1200, HasCount: true}
 	table := map[string]int{
 		key(base+` AND "learning"`, 2020, 2020): 700,
-		key(base+` AND "neural"`, 2020, 2020):   600,
+		key(base+` AND "neural"`, 2020, 2020):   600, // better balance, never reached
 	}
-	out, ok := ResolveOverCap(leaf, []string{"learning", "neural"}, fakeCount(table), 4, 0.1, 1000)
+	probed := 0
+	count := func(q string, yf, yt int) (int, bool) {
+		probed++
+		return fakeCount(table)(q, yf, yt)
+	}
+	out, ok := ResolveOverCap(leaf, []string{"learning", "neural"}, count, 4, 0.1, 1000)
 	if !ok {
 		t.Fatalf("expected resolution, ok=false")
 	}
@@ -304,8 +311,8 @@ func TestResolveOverCap(t *testing.T) {
 		t.Fatalf("got %d leaves, want 2: %+v", len(out), out)
 	}
 	want := []string{
-		base + ` AND "neural"`,
-		base + ` -"neural"`,
+		base + ` AND "learning"`,
+		base + ` -"learning"`,
 	}
 	for i, wq := range want {
 		if out[i].Query != wq {
@@ -317,6 +324,9 @@ func TestResolveOverCap(t *testing.T) {
 	}
 	if !WithinLimit(out) {
 		t.Error("WithinLimit(out) should be true")
+	}
+	if probed != 1 {
+		t.Errorf("probed %d candidates, want exactly 1 (stop at first acceptable split)", probed)
 	}
 }
 
