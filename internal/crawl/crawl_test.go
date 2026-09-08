@@ -834,21 +834,30 @@ func TestResolveYearPartitionsOverCapYear(t *testing.T) {
 // offline (known-paper) size fits but whose real Scholar count is over the cap
 // is re-split online into smaller pending leaves.
 //
-// Corpus: 45 "Foo Bar" + 45 "Foo Zoo" papers. "bar" divides them 45/45 into two
-// offline buckets (each ≤ 80). The "-bar" bucket is cached at 150 (the offline
-// 45 under-estimates Scholar), so ResolveOverCap re-splits it on "foo" into
-// 75/75.
+// Corpus: 45 "Alpha Bar" + 30 "Zoo Foo" + 15 "Zoo Qux" papers. "bar" divides
+// them 45/45 into two offline buckets (each ≤ 80). The "-bar" bucket is cached
+// at 150 (the offline 45 under-estimates Scholar), so ResolveOverCap re-splits
+// it on "foo" into 75/75. "foo" survives the corpus veto here because it
+// covers 30/45 ≈ 67% of the "-bar" conditioned subset.
 func TestResolveYearOfflineUndercountFallsBackToResolveOverCap(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	ctx := context.Background()
 	var papers []db.Paper
 	for i := 0; i < 45; i++ {
 		papers = append(papers, db.Paper{
-			Hash: fmt.Sprintf("fb-%d", i), Title: fmt.Sprintf("Foo Bar %d", i),
+			Hash: fmt.Sprintf("fb-%d", i), Title: fmt.Sprintf("Alpha Bar %d", i),
 			Year: 2020, ConferenceID: conf.ID, SourcedFrom: "crawl",
 		})
+	}
+	for i := 0; i < 30; i++ {
 		papers = append(papers, db.Paper{
-			Hash: fmt.Sprintf("fz-%d", i), Title: fmt.Sprintf("Foo Zoo %d", i),
+			Hash: fmt.Sprintf("zf-%d", i), Title: fmt.Sprintf("Zoo Foo %d", i),
+			Year: 2020, ConferenceID: conf.ID, SourcedFrom: "crawl",
+		})
+	}
+	for i := 0; i < 15; i++ {
+		papers = append(papers, db.Paper{
+			Hash: fmt.Sprintf("zq-%d", i), Title: fmt.Sprintf("Zoo Qux %d", i),
 			Year: 2020, ConferenceID: conf.ID, SourcedFrom: "crawl",
 		})
 	}

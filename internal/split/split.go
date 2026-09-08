@@ -64,6 +64,15 @@ type Leaf struct {
 // cannot be read.
 type CountFunc func(query string, yearFrom, yearTo int) (count int, ok bool)
 
+// VetoFunc reports whether a candidate keyword is worth a live count probe at
+// the current branch. inc/exc are the node's accumulated predicates, so the
+// caller can prove from the known corpus that a term cannot divide THIS
+// branch — e.g. a term covering >75% (or 0) of the subset that already
+// satisfies the branch's predicates — before Scholar is searched. Returning
+// false skips the candidate without consuming probe budget. A nil VetoFunc
+// probes every candidate.
+type VetoFunc func(inc, exc []string, kw string) bool
+
 // Plan partitions the [yearFrom, yearTo] result space of baseQuery into
 // disjoint leaf tasks, walking the range in 2-year windows (a trailing odd year
 // is its own window), narrowing an oversized 2-year window to its two single
@@ -190,6 +199,13 @@ func DropDegenerateKeywords(baseQuery string, keywords []string) []string {
 // should then keep treating the leaf as needs_split rather than emit an
 // over-cap task. ResolveOverCap never emits an over-cap leaf itself.
 func ResolveOverCap(leaf Leaf, keywords []string, count CountFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
+	return ResolveOverCapV(leaf, keywords, count, nil, probesPerNode, minBalance, limit)
+}
+
+// ResolveOverCapV is ResolveOverCap with a corpus veto: before each live
+// probe, veto(inc, exc, kw) is consulted and a false return skips the
+// candidate without spending a Scholar search.
+func ResolveOverCapV(leaf Leaf, keywords []string, count CountFunc, veto VetoFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
 	var out []Leaf
 
 	resolved := resolveNode(
@@ -200,6 +216,7 @@ func ResolveOverCap(leaf Leaf, keywords []string, count CountFunc, probesPerNode
 		leaf.HasCount,
 		keywords,
 		count,
+		veto,
 		probesPerNode,
 		minBalance,
 		limit,
@@ -217,7 +234,7 @@ func ResolveOverCap(leaf Leaf, keywords []string, count CountFunc, probesPerNode
 // positive/negative keyword predicates accumulated along the path; the current
 // node covers 'size' results. A partial split is never returned: if any subtree
 // fails, resolved=false and out is left in an undefined state (caller discards).
-func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, probesPerNode int, minBalance float64, limit int, inc, exc []string, out *[]Leaf, depth int) bool {
+func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, veto VetoFunc, probesPerNode int, minBalance float64, limit int, inc, exc []string, out *[]Leaf, depth int) bool {
 	if size == 0 {
 		return true
 	}
@@ -265,6 +282,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		if probed >= probesPerNode {
 			break
 		}
+		// The corpus veto is consulted BEFORE the probe: a term the known
+		// corpus proves cannot divide this branch (covers 0 or >75% of the
+		// subset satisfying inc/exc) is skipped without spending a search or
+		// consuming probe budget.
+		if veto != nil && !veto(inc, exc, keywords[k]) {
+			continue
+		}
 		q := leafQuery(base, appendPred(inc, keywords[k]), exc)
 		n, okC := count(q, yFrom, yTo)
 		probed++
@@ -304,13 +328,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	var withLeaves, withoutLeaves []Leaf
 	withOK := resolveNode(
 		base, yFrom, yTo, bestWith, true,
-		remaining, count, probesPerNode,
+		remaining, count, veto, probesPerNode,
 		minBalance, limit,
 		appendPred(inc, bestKey), exc,
 		&withLeaves, depth+1)
 	withoutOK := resolveNode(
 		base, yFrom, yTo, bestWithout, true,
-		remaining, count, probesPerNode,
+		remaining, count, veto, probesPerNode,
 		minBalance, limit,
 		inc, appendPred(exc, bestKey),
 		&withoutLeaves, depth+1)

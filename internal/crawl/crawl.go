@@ -361,6 +361,17 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if err != nil {
 		return nil, false
 	}
+	// The branch-conditional corpus veto: a candidate may only be probed on a
+	// branch when the papers already satisfying that branch's predicates show
+	// it can divide — the term must appear in more than 0 and at most ~75% of
+	// the conditioned subset. "data" inside the AND "network" branch is
+	// measured against network papers only, so a term universal inside the
+	// parent's subset is never searched there.
+	yearTexts := make([]string, 0, len(papers))
+	for _, p := range papers {
+		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
+	}
+	veto := corpusVeto(yearTexts, nil, nil)
 	coverage := 1.0
 	if trueCount > len(papers) {
 		coverage = float64(len(papers)) / float64(trueCount)
@@ -412,7 +423,10 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 			// Offline underestimate (a bucket that "fit" offline is really bigger):
 			// re-split it online, still under the shared probe budget.
 			leaf.NeedsSplit = true
-			rs, ok := split.ResolveOverCap(leaf, keywords, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+			// The leaf's own predicates are the veto's base context: a
+			// candidate is measured inside the bucket's conditioned corpus.
+			bv := corpusVeto(yearTexts, b.Includes, b.Excludes)
+			rs, ok := split.ResolveOverCapV(leaf, keywords, liveOnly(count, budget), bv, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
 			if !ok || budget.exhausted() {
 				offlineOK = false
 				break
@@ -492,25 +506,87 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	// so an empty fresh list must not stop the split attempt — bailing here is
 	// what left every big year needs_split without ever probing an AND term.
 	merged := split.DropDegenerateKeywords(conf.Query, append(append([]string{}, keywords...), fresh...))
-	// Same dataset veto at the year level: the corpus for this year already
-	// proves whether a term can split its result space — never probe a term
-	// covering 0 or >75% of the known papers, and collapse plural/substring
-	// duplicates ("network"/"networks") to a single probe.
-	yearTexts := make([]string, 0, len(papers))
-	for _, p := range papers {
-		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
-	}
+	// The flat veto over the whole year corpus prunes the obvious dead ends
+	// up front; corpusVeto then re-checks each surviving term CONDITIONALLY
+	// inside resolveNode, so a term that is uniform within a branch's subset
+	// is never probed there either.
 	merged = viableKeywords(yearTexts, dedupSubstringKeywords(merged))
 	if len(merged) == 0 {
 		return nil, false
 	}
-	return split.ResolveOverCap(split.Leaf{
+	return split.ResolveOverCapV(split.Leaf{
 		Query:    query,
 		YearFrom: year,
 		YearTo:   year,
 		Count:    trueCount,
 		HasCount: true,
-	}, merged, liveOnly(count, budget), c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+	}, merged, liveOnly(count, budget), veto, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+}
+
+// corpusVeto builds a split.VetoFunc over a set of document texts: a keyword
+// may be probed on a branch only when the texts already satisfying that
+// branch's include/exclude predicates show it can divide — the term must
+// appear in more than 0 and at most ~75% of the conditioned subset.
+// baseInc/baseExc carry predicates already baked into the leaf's query (the
+// resolver starts its own inc/exc empty). With no corpus evidence for a
+// branch the probe is allowed through.
+func corpusVeto(texts []string, baseInc, baseExc []string) split.VetoFunc {
+	if len(texts) == 0 {
+		return nil
+	}
+	lower := make([]string, 0, len(texts))
+	for _, t := range texts {
+		lower = append(lower, strings.ToLower(t))
+	}
+	lbaseInc := lowerAll(baseInc)
+	lbaseExc := lowerAll(baseExc)
+	return func(inc, exc []string, kw string) bool {
+		lkw := strings.ToLower(kw)
+		subset, with := 0, 0
+		for _, t := range lower {
+			ok := true
+			for _, w := range lbaseInc {
+				if !strings.Contains(t, w) {
+					ok = false
+					break
+				}
+			}
+			for _, w := range inc {
+				if ok && !strings.Contains(t, strings.ToLower(w)) {
+					ok = false
+				}
+			}
+			for _, w := range lbaseExc {
+				if ok && strings.Contains(t, w) {
+					ok = false
+				}
+			}
+			for _, w := range exc {
+				if ok && strings.Contains(t, strings.ToLower(w)) {
+					ok = false
+				}
+			}
+			if !ok {
+				continue
+			}
+			subset++
+			if strings.Contains(t, lkw) {
+				with++
+			}
+		}
+		if subset == 0 {
+			return true // no corpus evidence for this branch — cannot prove
+		}
+		return with > 0 && float64(with)/float64(subset) <= 0.75
+	}
+}
+
+func lowerAll(ws []string) []string {
+	out := make([]string, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, strings.ToLower(w))
+	}
+	return out
 }
 
 // liveOnly wraps count so that once the shared budget is spent the wrapper
