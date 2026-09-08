@@ -538,6 +538,42 @@ func TestBalanceThresholdAllBelowMinFails(t *testing.T) {
 	}
 }
 
+// TestForcedSplitChainsKeywords: when no probed candidate produces a clean
+// ≤75% split, the best divider is forced anyway and the oversized side chains
+// a second keyword — conjuncts only shrink the count, so the node still
+// resolves instead of becoming needs_split.
+func TestForcedSplitChainsKeywords(t *testing.T) {
+	base := `"ICML"`
+	leaf := Leaf{Query: base, YearFrom: 2020, YearTo: 2020, Count: 1500, HasCount: true}
+	table := map[string]int{
+		key(base+` AND "big"`, 2020, 2020):           1400, // 1400/100: lopsided (maxSide 1125)
+		key(base+` AND "fix"`, 2020, 2020):           1450, // 1450/50: below minBalance, ignored
+		key(base+` AND "big" AND "fix"`, 2020, 2020): 600,  // chained second keyword splits 600/800
+	}
+	out, ok := ResolveOverCap(leaf, []string{"big", "fix"}, fakeCount(table), 2, 0.1, 1000)
+	if !ok {
+		t.Fatalf("forced split must resolve the node, got ok=false")
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d leaves, want 3 (600 + 800 + 100): %+v", len(out), out)
+	}
+	for _, l := range out {
+		if l.Count > 1000 || l.NeedsSplit {
+			t.Errorf("leaf %q count %d exceeds cap or is needs_split", l.Query, l.Count)
+		}
+	}
+	want := []string{
+		base + ` AND "big" AND "fix"`,
+		base + ` AND "big" -"fix"`,
+		base + ` -"big"`,
+	}
+	for i, wq := range want {
+		if out[i].Query != wq {
+			t.Errorf("leaf %d query = %q, want %q", i, out[i].Query, wq)
+		}
+	}
+}
+
 // TestDegenerateKeywordNeverProbed (Test 6): a keyword that is a substring of
 // the base query must be removed before ResolveOverCap probes anything — the
 // planner filters it via dropDegenerateKeywords before recursion starts.

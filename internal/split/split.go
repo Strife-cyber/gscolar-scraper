@@ -20,7 +20,10 @@
 //     with/without split keeps neither side above 75% of the node (and clears
 //     minBalance) is chosen — probing stops there rather than comparing every
 //     candidate, so a working splitter costs one Scholar search per node.
-//     The node then
+//     If no probed candidate clears that bar, the best divider is used anyway
+//     (a forced split): conjuncts can only shrink the count, so the oversized
+//     side recurses and chains further keywords until it fits or the depth
+//     bound is hit. The node then
 //     becomes exactly two disjoint children:
 //
 //     parent AND "keyword"
@@ -236,19 +239,25 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		return false
 	}
 
-	// Probe candidates in ranked order; the FIRST one that produces a real
+	// Probe candidates in ranked order; the FIRST one that produces a clean
 	// split is selected and the remaining candidates are never searched. A
-	// split only counts when NEITHER side keeps more than maxSideFraction of
-	// the node — a keyword covering >75% of the results (or leaving >75%
-	// behind) barely divides the corpus, so the next candidate is probed
-	// instead. Candidates arrive best-first (TF-IDF over the corpus), so a
-	// passing probe is almost always a good splitter — and stopping there
-	// costs one Scholar search per node instead of one per candidate.
+	// split is clean when NEITHER side keeps more than maxSideFraction of the
+	// node — a keyword covering >75% of the results (or leaving >75% behind)
+	// barely divides the corpus, so the next candidate is probed instead.
+	//
+	// When no probed candidate produces a clean split the node does NOT fail:
+	// the best-dividing candidate seen is used anyway — a forced split. Each
+	// conjunct can only shrink the result count, so the oversized side recurses
+	// and chains a second keyword ("... AND k1 AND k2"), a third, and so on
+	// until it fits or the depth bound is reached. The node only fails when no
+	// probed candidate divides it at all (one side empty) or every valid
+	// candidate is below minBalance.
 	const maxSideFraction = 0.75
 	maxSide := int(float64(size) * maxSideFraction)
 
 	bestIdx := -1
 	bestKey := ""
+	bestBal := -1.0
 	var bestWith, bestWithout int
 	probed := 0
 
@@ -270,13 +279,21 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		if with <= 0 || without <= 0 {
 			continue // this keyword does not divide the node
 		}
-		if with <= maxSide && without <= maxSide && balanceOf(with, without) >= minBalance {
+		b := balanceOf(with, without)
+		if b < minBalance {
+			continue
+		}
+		if with <= maxSide && without <= maxSide {
 			bestIdx, bestKey, bestWith, bestWithout = k, keywords[k], with, without
-			break
+			break // clean split found — stop probing
+		}
+		if b > bestBal {
+			// Valid but lopsided: remember it as the forced-split fallback.
+			bestBal, bestIdx, bestKey, bestWith, bestWithout = b, k, keywords[k], with, without
 		}
 	}
 	if bestKey == "" {
-		return false // no candidate produced a within-75% split within budget
+		return false // nothing probed divides the node at all
 	}
 
 	// Recurse on the with-side (papers containing the keyword) and the
