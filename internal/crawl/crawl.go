@@ -71,17 +71,20 @@ func New(cfg *config.Config, d *db.DB, br Browserer, l *slog.Logger) *Crawler {
 // as a task and prunes obsolete needs_split TODOs. Returns how many leaves are
 // still flagged for re-splitting (>=0 even on a fully clean plan).
 //
-// Splitting uses double leverage from the scraped corpus:
+// Splitting is decided on the scraped corpus, not by probing Scholar:
 //
-//   - Mined keyword candidates from the conference's known papers seed the year
-//     chain (so the count-probe fallback subtracts discriminative words rather
-//     than generic config terms).
-//   - A single year that still exceeds the cap is first resolved offline: its
-//     known papers are partitioned by the Balance-ranked keywords into buckets
-//     of at most floor(limit*headroom), and each bucket query is verified with a
-//     single count probe. A bucket the offline estimate under-counted is
-//     re-split online via split.ResolveOverCap. Only what cannot be brought
-//     under the cap stays a needs_split TODO.
+//   - The plan walk itself performs no keyword probes (maxKeywords=0); it only
+//     pays for the window/year result counts, and an over-cap single year comes
+//     out as a needs_split leaf.
+//   - resolveYear then picks split keywords offline: the year's known papers
+//     are partitioned by the Balance-ranked candidates (mined from the DB,
+//     merged with the configured terms) into buckets of at most
+//     floor(limit*headroom), and each bucket query is verified with a single
+//     count probe. A bucket the offline estimate under-counted is re-split
+//     online via split.ResolveOverCap; a year whose corpus is too thin to
+//     trust falls back to the bounded online probe so a fresh conference can
+//     still bootstrap. Only what cannot be brought under the cap stays a
+//     needs_split TODO.
 //
 // probeBudget is a shared cap on real Scholar count searches (browser
 // round-trips) for one conference plan. Cache hits are free; only an actual
@@ -104,7 +107,14 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	}
 
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, c.cfg.MaxKeywords, c.cfg.MaxProbes, pl, live, c.cfg.MinBalance)
+	// maxKeywords=0 disables the inline online split inside split.Plan: an
+	// over-cap single year is emitted as a needs_split leaf and resolved below
+	// by resolveYear, which picks split keywords on the conference's known
+	// papers (offline corpus partitioning) and spends live Scholar probes only
+	// verifying the resulting bucket counts. Probing candidate keywords on
+	// Scholar itself — one search per keyword per node — is what burned the
+	// probe budget on useless terms and risks tripping the block detection.
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, pl, live, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
@@ -392,7 +402,10 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 		return n, ok
 	}
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, c.cfg.MaxKeywords, c.cfg.MaxProbes, pl, cacheOnly, c.cfg.MinBalance)
+	// Same as PlanConference: maxKeywords=0 keeps split.Plan from probing
+	// candidate keywords; every over-cap year is resolved by resolveYear on the
+	// known-paper corpus below.
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, pl, cacheOnly, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
