@@ -17,9 +17,10 @@
 //  2. Recursive balance-guided keyword splitting (for a single year still over
 //     the cap), via ResolveOverCap. At each over-cap node, up to probesPerNode
 //     keyword candidates are counted in ranked order and the first whose
-//     with/without split clears minBalance is chosen — probing stops there
-//     rather than comparing every candidate, so a working splitter costs one
-//     Scholar search per node. The node then
+//     with/without split keeps neither side above 75% of the node (and clears
+//     minBalance) is chosen — probing stops there rather than comparing every
+//     candidate, so a working splitter costs one Scholar search per node.
+//     The node then
 //     becomes exactly two disjoint children:
 //
 //     parent AND "keyword"
@@ -235,12 +236,17 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		return false
 	}
 
-	// Probe candidates in ranked order; the FIRST one that produces a valid
-	// split (nonempty both sides, balance >= minBalance) is selected and the
-	// remaining candidates are never searched. Candidates arrive best-first
-	// (TF-IDF over the corpus), so the first acceptable probe is almost always
-	// a good splitter — and stopping there costs one Scholar search per node
-	// instead of one per candidate.
+	// Probe candidates in ranked order; the FIRST one that produces a real
+	// split is selected and the remaining candidates are never searched. A
+	// split only counts when NEITHER side keeps more than maxSideFraction of
+	// the node — a keyword covering >75% of the results (or leaving >75%
+	// behind) barely divides the corpus, so the next candidate is probed
+	// instead. Candidates arrive best-first (TF-IDF over the corpus), so a
+	// passing probe is almost always a good splitter — and stopping there
+	// costs one Scholar search per node instead of one per candidate.
+	const maxSideFraction = 0.75
+	maxSide := int(float64(size) * maxSideFraction)
+
 	bestIdx := -1
 	bestKey := ""
 	var bestWith, bestWithout int
@@ -264,13 +270,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		if with <= 0 || without <= 0 {
 			continue // this keyword does not divide the node
 		}
-		if balanceOf(with, without) >= minBalance {
+		if with <= maxSide && without <= maxSide && balanceOf(with, without) >= minBalance {
 			bestIdx, bestKey, bestWith, bestWithout = k, keywords[k], with, without
 			break
 		}
 	}
 	if bestKey == "" {
-		return false // no candidate cleared minBalance within budget
+		return false // no candidate produced a within-75% split within budget
 	}
 
 	// Recurse on the with-side (papers containing the keyword) and the
