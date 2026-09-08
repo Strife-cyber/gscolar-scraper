@@ -1042,3 +1042,24 @@ func TestOfflineGenTasksFromCachedCounts(t *testing.T) {
 		t.Errorf("browser was touched (idx=%d), want 0: gen-tasks must be offline", fb.idx)
 	}
 }
+
+// TestViableKeywords: the dataset vetoes a candidate before Scholar is ever
+// searched — a term covering 0 papers or >75% of them can never split, and
+// near-duplicate substrings ("network"/"networks") probe the same coverage.
+func TestViableKeywords(t *testing.T) {
+	texts := []string{
+		"deep learning for graphs", "graph neural net",
+		"data mining approach", "data analysis method", "data pipeline",
+		"data system", "data storage", "data processing", "data model", "data network",
+	}
+	got := viableKeywords(texts, []string{"learning", "data", "nonexistent"})
+	if len(got) != 1 || got[0] != "learning" {
+		t.Fatalf("viableKeywords = %v, want [learning]", got)
+	}
+	// "data" (10/10 = 100%) and "nonexistent" (0) are vetoed.
+
+	deduped := dedupSubstringKeywords([]string{"networks", "network", "graph"})
+	if len(deduped) != 2 || deduped[0] != "networks" || deduped[1] != "graph" {
+		t.Fatalf("dedupSubstringKeywords = %v, want [networks graph]", deduped)
+	}
+}

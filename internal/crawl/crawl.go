@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -222,7 +223,63 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 		seen[w] = true
 		kws = append(kws, w)
 	}
+	// The dataset vetoes a candidate before Scholar is ever searched: a term
+	// covering 0 known papers or >75% of them can never produce a clean split,
+	// and plural/substring variants ("network" vs "networks") probe the same
+	// coverage twice.
+	kws = viableKeywords(c.backgroundTexts(ctx), dedupSubstringKeywords(kws))
 	return split.DropDegenerateKeywords(conf.Query, kws)
+}
+
+// viableKeywords drops candidates the corpus already proves cannot split: a
+// term appearing in 0 texts has no evidence of coverage, and a term appearing
+// in more than 75% of them can only return a dominant count — probing either
+// on Scholar wastes a search.
+func viableKeywords(texts []string, kws []string) []string {
+	if len(texts) == 0 || len(kws) == 0 {
+		return kws
+	}
+	lower := make([]string, 0, len(texts))
+	for _, t := range texts {
+		lower = append(lower, strings.ToLower(t))
+	}
+	const maxCoverage = 0.75
+	out := make([]string, 0, len(kws))
+	for _, kw := range kws {
+		lkw := strings.ToLower(kw)
+		with := 0
+		for _, t := range lower {
+			if strings.Contains(t, lkw) {
+				with++
+			}
+		}
+		if with == 0 || float64(with)/float64(len(lower)) > maxCoverage {
+			continue
+		}
+		out = append(out, kw)
+	}
+	return out
+}
+
+// dedupSubstringKeywords drops a candidate that shares a strict substring
+// relation with an earlier (better-ranked) one: "network"/"networks" cover
+// nearly the same papers, so the second probe buys nothing.
+func dedupSubstringKeywords(kws []string) []string {
+	out := make([]string, 0, len(kws))
+	for i, kw := range kws {
+		dup := false
+		for j := 0; j < i; j++ {
+			a, b := kws[j], kw
+			if len(a) != len(b) && (strings.Contains(a, b) || strings.Contains(b, a)) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, kw)
+		}
+	}
+	return out
 }
 
 // minedKeywords returns the TF-IDF-ranked mined keyword list. It is computed
@@ -435,6 +492,15 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	// so an empty fresh list must not stop the split attempt — bailing here is
 	// what left every big year needs_split without ever probing an AND term.
 	merged := split.DropDegenerateKeywords(conf.Query, append(append([]string{}, keywords...), fresh...))
+	// Same dataset veto at the year level: the corpus for this year already
+	// proves whether a term can split its result space — never probe a term
+	// covering 0 or >75% of the known papers, and collapse plural/substring
+	// duplicates ("network"/"networks") to a single probe.
+	yearTexts := make([]string, 0, len(papers))
+	for _, p := range papers {
+		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
+	}
+	merged = viableKeywords(yearTexts, dedupSubstringKeywords(merged))
 	if len(merged) == 0 {
 		return nil, false
 	}
