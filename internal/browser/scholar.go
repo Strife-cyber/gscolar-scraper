@@ -48,8 +48,12 @@ const (
 // fields:
 //
 //	source:"Venue" (or a bare quoted phrase) → "published in" (as_publication)
-//	AND "word"                                → "with all the words" (as_q)
-//	-"word"                                   → "without the words" (as_eq)
+//	AND "word" / AND "a phrase"               → "with all the words" (as_q);
+//	                                            multi-word terms keep their
+//	                                            quotes so Scholar treats them
+//	                                            as phrases inside the box
+//	-"word" / -"a phrase"                     → "without the words" (as_eq),
+//	                                            quoted the same way
 var (
 	advSourceRe = regexp.MustCompile(`source:"([^"]*)"`)
 	advAndRe    = regexp.MustCompile(`\bAND\s+"([^"]*)"`)
@@ -66,13 +70,13 @@ func decomposeAdvancedQuery(q string) (venue, allWords, withoutWords string, ok 
 		if allWords != "" {
 			allWords += " "
 		}
-		allWords += m[1]
+		allWords += quotePhrase(m[1])
 	}
 	for _, m := range advNotRe.FindAllStringSubmatch(q, -1) {
 		if withoutWords != "" {
 			withoutWords += " "
 		}
-		withoutWords += m[1]
+		withoutWords += quotePhrase(m[1])
 	}
 
 	// Whatever is left after stripping source:/AND/-NOT is the base phrase.
@@ -92,6 +96,16 @@ func decomposeAdvancedQuery(q string) (venue, allWords, withoutWords string, ok 
 	}
 
 	return venue, allWords, withoutWords, venue != "" || allWords != "" || withoutWords != ""
+}
+
+// quotePhrase re-quotes a multi-word term so Scholar's "all the words" /
+// "without the words" boxes treat it as a phrase instead of loose terms —
+// `deep learning` would otherwise match both words anywhere.
+func quotePhrase(term string) string {
+	if strings.Contains(term, " ") {
+		return `"` + term + `"`
+	}
+	return term
 }
 
 // Search runs the full navigation recipe for one task: open Scholar, open the

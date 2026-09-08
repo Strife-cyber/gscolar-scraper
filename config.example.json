@@ -11,6 +11,7 @@
   "min_coverage": 0.5,
   "max_probes_per_conf": 60,
   "mine_bigrams": false,
+  "mine_max_ngram": 3,
   "max_mined_keywords": 200,
   "min_completion_ratio": 0.5,
 

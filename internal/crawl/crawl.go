@@ -262,14 +262,19 @@ func viableKeywords(texts []string, kws []string) []string {
 }
 
 // dedupSubstringKeywords drops a candidate that shares a strict substring
-// relation with an earlier (better-ranked) one: "network"/"networks" cover
-// nearly the same papers, so the second probe buys nothing.
+// relation with an earlier (better-ranked) candidate OF THE SAME TOKEN
+// LENGTH: "network"/"networks" cover nearly the same papers, so the second
+// probe buys nothing. A phrase is never deduped against its component words —
+// "deep learning" covers a strictly smaller set than "learning".
 func dedupSubstringKeywords(kws []string) []string {
 	out := make([]string, 0, len(kws))
 	for i, kw := range kws {
 		dup := false
 		for j := 0; j < i; j++ {
 			a, b := kws[j], kw
+			if len(strings.Fields(a)) != len(strings.Fields(b)) {
+				continue // different phrase lengths split differently
+			}
 			if len(a) != len(b) && (strings.Contains(a, b) || strings.Contains(b, a)) {
 				dup = true
 				break
@@ -291,8 +296,11 @@ func dedupSubstringKeywords(kws []string) []string {
 func (c *Crawler) minedKeywords(ctx context.Context) []string {
 	c.kwOnce.Do(func() {
 		n, err := c.db.PaperCount(ctx)
+		// The cache key encodes the n-gram level too: a ranking mined
+		// words-only must not be reused after phrase mining is enabled.
+		cacheKey := n*1000 + c.cfg.MineMaxNGram
 		if err == nil {
-			if kws, ok, lerr := c.db.LoadKeywordRank(ctx, n); lerr == nil && ok {
+			if kws, ok, lerr := c.db.LoadKeywordRank(ctx, cacheKey); lerr == nil && ok {
 				c.minedKws = kws
 				return
 			}
@@ -300,7 +308,10 @@ func (c *Crawler) minedKeywords(ctx context.Context) []string {
 		texts := c.backgroundTexts(ctx)
 		opts := mine.DefaultOptions()
 		opts.MinBalance = c.cfg.MinBalance
-		opts.Bigrams = c.cfg.MineBigrams
+		opts.MaxNGram = c.cfg.MineMaxNGram
+		if c.cfg.MineBigrams && opts.MaxNGram < 2 {
+			opts.MaxNGram = 2 // legacy flag: enable bigram phrases
+		}
 		opts.MaxCandidates = c.cfg.MaxMinedKeywords
 		mp := make([]mine.Paper, 0, len(texts))
 		for i, t := range texts {
@@ -312,7 +323,7 @@ func (c *Crawler) minedKeywords(ctx context.Context) []string {
 			kws = append(kws, cd.Keyword)
 		}
 		if err == nil {
-			if serr := c.db.SaveKeywordRank(ctx, n, kws); serr != nil {
+			if serr := c.db.SaveKeywordRank(ctx, cacheKey, kws); serr != nil {
 				c.log.Info(fmt.Sprintf("persist keyword ranking: %v", serr))
 			}
 		}
@@ -494,7 +505,10 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	opts := mine.DefaultOptions()
 	opts.MinFreq = 2
 	opts.MinBalance = c.cfg.MinBalance
-	opts.Bigrams = c.cfg.MineBigrams
+	opts.MaxNGram = c.cfg.MineMaxNGram
+	if c.cfg.MineBigrams && opts.MaxNGram < 2 {
+		opts.MaxNGram = 2 // legacy flag: enable bigram phrases
+	}
 	opts.MaxCandidates = c.cfg.MaxMinedKeywords
 	cands := mine.MineIDF(mp, c.backgroundTexts(ctx), opts)
 	fresh := make([]string, 0, len(cands))

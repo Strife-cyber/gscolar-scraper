@@ -39,7 +39,14 @@ type Options struct {
 	// MaxFreqFraction drops candidates appearing in more than this fraction of
 	// all papers — such a word cannot divide the corpus meaningfully.
 	MaxFreqFraction float64
-	// Bigrams enables 2-word phrase candidates in addition to single tokens.
+	// MaxNGram enables contiguous n-gram phrase candidates of up to this many
+	// tokens (2 = "federated learning", 3 = "graph neural networks"). 0/1 means
+	// single words only. Unlike the legacy Bigrams window, n-gram candidates
+	// are verbatim phrases: membership is contiguous containment in the raw
+	// token stream, matching Scholar's quoted-phrase operator.
+	MaxNGram int
+	// Bigrams (legacy) enables 2-word phrase candidates — equivalent to
+	// MaxNGram >= 2.
 	Bigrams bool
 	// BigramSep is the max position gap between the two words of a bigram.
 	// Only meaningful when Bigrams is true.
@@ -68,6 +75,7 @@ func DefaultOptions() Options {
 		MaxFreqFraction: 0.95,
 		Bigrams:         false,
 		BigramSep:       2,
+		MaxNGram:        1,
 		MaxCandidates:   200,
 	}
 }
@@ -168,6 +176,12 @@ func Mine(papers []Paper, o Options) []Candidate {
 	if o.BigramSep < 1 {
 		o.BigramSep = 1
 	}
+	if o.MaxNGram < 1 {
+		o.MaxNGram = 1
+	}
+	if o.Bigrams && o.MaxNGram < 2 {
+		o.MaxNGram = 2 // legacy flag: contiguous bigram phrases
+	}
 
 	docs := make([]doc, 0, len(papers))
 	for _, p := range papers {
@@ -179,31 +193,28 @@ func Mine(papers []Paper, o Options) []Candidate {
 		d := doc{
 			title:     toSet(title),
 			snip:      toSet(snip),
-			titleList: title,
-			snipList:  snip,
+			titleList: tokenizeAll(p.Title),
+			snipList:  tokenizeAll(p.Snippet),
 		}
 		docs = append(docs, d)
 	}
 
-	// Candidate vocabulary: every token everywhere, plus optional bigrams.
+	// Candidate vocabulary: every content token, plus contiguous n-gram
+	// phrases when MaxNGram > 1. Phrases are built on the unfiltered token
+	// stream so they appear verbatim in the text (a mined phrase must be a
+	// phrase Scholar's "..." operator can match), but junk is pruned by
+	// requiring a content word at both ends.
 	words := map[string]bool{}
-	if o.Bigrams {
-		for _, d := range docs {
-			for _, b := range adjacentBigrams(d.titleList, o.BigramSep) {
-				words[b] = true
-			}
-			for _, b := range adjacentBigrams(d.snipList, o.BigramSep) {
-				words[b] = true
-			}
+	for _, d := range docs {
+		for w := range d.title {
+			words[w] = true
 		}
-	} else {
-		for _, d := range docs {
-			for w := range d.title {
-				words[w] = true
-			}
-			for w := range d.snip {
-				words[w] = true
-			}
+		for w := range d.snip {
+			words[w] = true
+		}
+		if o.MaxNGram > 1 {
+			ngrams(d.titleList, o.MaxNGram, func(p string) { words[p] = true })
+			ngrams(d.snipList, o.MaxNGram, func(p string) { words[p] = true })
 		}
 	}
 
@@ -269,10 +280,10 @@ func MineIDF(target []Paper, background []string, o Options) []Candidate {
 		return capCands(cands, o.MaxCandidates)
 	}
 
-	df := docFreq(background)
+	df, rawBg := docFreq(background)
 	n := float64(len(background))
 	for i := range cands {
-		cands[i].IDF = idfOf(cands[i].Keyword, df, n)
+		cands[i].IDF = idfOf(cands[i].Keyword, df, n, rawBg)
 	}
 	sort.Slice(cands, func(i, j int) bool {
 		si := cands[i].Balance * cands[i].IDF
@@ -295,36 +306,41 @@ func capCands(cands []Candidate, max int) []Candidate {
 	return cands
 }
 
-// docFreq counts, per token, how many background texts contain it.
-func docFreq(texts []string) map[string]int {
+// docFreq counts, per token, how many background texts contain it, and also
+// returns each text as a space-padded normalized token stream so phrase
+// candidates can be counted by contiguous containment.
+func docFreq(texts []string) (map[string]int, []string) {
 	df := make(map[string]int)
+	raw := make([]string, 0, len(texts))
 	for _, t := range texts {
 		for w := range toSet(Tokenize(t)) {
 			df[w]++
 		}
+		raw = append(raw, " "+strings.Join(tokenizeAll(t), " ")+" ")
 	}
-	return df
+	return df, raw
 }
 
-// idfOf scores a candidate: log(1 + N / (1 + df)) smoothed so a word in every
-// background document bottoms out near log(2) instead of -inf. A bigram
-// candidate scores the IDF of its rarer component (a phrase can never appear
-// in more documents than its least common word).
-func idfOf(kw string, df map[string]int, nDocs float64) float64 {
+// idfOf scores a candidate: log(1 + N / (1 + df)) smoothed so a term in every
+// background document bottoms out near log(2) instead of -inf. A phrase
+// candidate is counted by contiguous containment over the raw background
+// streams — its real document frequency, which can never exceed that of its
+// rarest component word.
+func idfOf(kw string, df map[string]int, nDocs float64, rawBg []string) float64 {
 	if nDocs <= 0 {
 		return 1
 	}
-	worst := math.MaxFloat64
-	for _, w := range strings.Split(kw, " ") {
-		v := math.Log(1 + nDocs/(1+float64(df[w])))
-		if v < worst {
-			worst = v
+	if strings.Contains(kw, " ") {
+		pad := " " + kw + " "
+		c := 0
+		for _, t := range rawBg {
+			if strings.Contains(t, pad) {
+				c++
+			}
 		}
+		return math.Log(1 + nDocs/(1+float64(c)))
 	}
-	if worst == math.MaxFloat64 {
-		return 1
-	}
-	return worst
+	return math.Log(1 + nDocs/(1+float64(df[kw])))
 }
 
 // dedupSubstrings drops a candidate that is a strict substring of an already
@@ -354,14 +370,74 @@ func dedupSubstrings(cands []Candidate) []Candidate {
 	return out
 }
 
-// inDoc reports whether doc d contains candidate kw. Bigram candidates are
-// tokens joined by a space ("neural network"); anything else is a single word.
+// inDoc reports whether doc d contains candidate kw. A phrase candidate
+// (tokens joined by spaces, e.g. "neural network") matches on contiguous
+// occurrence in the raw token stream — the same semantics Scholar applies to
+// a quoted phrase. A single word matches its token sets.
 func inDoc(d doc, kw string, o Options) bool {
 	if strings.Contains(kw, " ") {
-		pair := strings.Split(kw, " ")
-		return hasAdjacentPair(d.titleList, pair, o.BigramSep) || hasAdjacentPair(d.snipList, pair, o.BigramSep)
+		seq := strings.Fields(kw)
+		return containsSeq(d.titleList, seq) || containsSeq(d.snipList, seq)
 	}
 	return d.title[kw] || d.snip[kw]
+}
+
+// tokenizeAll is Tokenize without the content filters: stopwords and short
+// tokens are kept so a mined phrase is a verbatim contiguous run that
+// Scholar's quoted-phrase operator can match. Only punctuation splits the
+// stream; pure-digit tokens still drop out.
+func tokenizeAll(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z')
+	})
+	toks := make([]string, 0, len(fields))
+	for _, f := range fields {
+		w := strings.ToLower(f)
+		if w == "" || isDigits(w) {
+			continue
+		}
+		toks = append(toks, w)
+	}
+	return toks
+}
+
+// containsSeq reports whether toks contains seq as a contiguous run.
+func containsSeq(toks, seq []string) bool {
+	if len(seq) == 0 || len(seq) > len(toks) {
+		return false
+	}
+	for i := 0; i+len(seq) <= len(toks); i++ {
+		match := true
+		for j := range seq {
+			if toks[i+j] != seq[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// ngrams yields every contiguous n-gram of 2..maxN tokens over toks whose
+// first and last tokens are content words (non-stopword, length >= 3).
+// Interior tokens may be stopwords, so "learning in the wild" is mined while
+// "in the" or "of a model" never are.
+func ngrams(toks []string, maxN int, add func(string)) {
+	for n := 2; n <= maxN && n <= len(toks); n++ {
+		for i := 0; i+n <= len(toks); i++ {
+			if !contentToken(toks[i]) || !contentToken(toks[i+n-1]) {
+				continue
+			}
+			add(strings.Join(toks[i:i+n], " "))
+		}
+	}
+}
+
+func contentToken(w string) bool {
+	return len(w) >= 3 && !stopWords[w] && !isDigits(w)
 }
 
 func toSet(toks []string) map[string]bool {
@@ -372,34 +448,7 @@ func toSet(toks []string) map[string]bool {
 	return m
 }
 
-// adjacentBigrams joins every pair of title tokens within sep positions of each
-// other into a "word1 word2" candidate.
-func adjacentBigrams(toks []string, sep int) []string {
-	out := make([]string, 0, len(toks))
-	for i := 0; i < len(toks); i++ {
-		for j := i + 1; j < len(toks) && j-i <= sep; j++ {
-			out = append(out, toks[i]+" "+toks[j])
-		}
-	}
-	return out
-}
 
-func hasAdjacentPair(toks []string, pair []string, sep int) bool {
-	if len(pair) != 2 {
-		return false
-	}
-	for i := 0; i < len(toks); i++ {
-		if toks[i] != pair[0] {
-			continue
-		}
-		for j := i + 1; j < len(toks) && j-i <= sep; j++ {
-			if toks[j] == pair[1] {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 func balanceOf(with, without int) float64 {
 	total := with + without

@@ -296,3 +296,38 @@ func TestMineCoverageTieBreaker(t *testing.T) {
 	}
 }
 
+
+// TestMinePhrases: MaxNGram=3 mines contiguous phrase candidates scored like
+// words — a phrase is a verbatim contiguous run in the raw text, and a
+// stopword may sit inside it ("learning in the wild") but never at the edges.
+func TestMinePhrases(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "graph neural networks for molecules"},
+		{Hash: "b", Title: "graph neural networks in chemistry"},
+		{Hash: "c", Title: "convolutional models for images"},
+		{Hash: "d", Title: "recurrent models for text"},
+	}
+	o := DefaultOptions()
+	o.MaxNGram = 3
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+	cands := Mine(papers, o)
+	byName := map[string]Candidate{}
+	for _, c := range cands {
+		byName[c.Keyword] = c
+	}
+	gnn, ok := byName["graph neural networks"]
+	if !ok {
+		t.Fatalf("expected trigram candidate 'graph neural networks', got %v", cands)
+	}
+	if gnn.With != 2 || gnn.Total != 4 {
+		t.Errorf("phrase stats = %+v, want With=2 of 4", gnn)
+	}
+	if _, ok := byName["in the"]; ok {
+		t.Error("stopword-edged junk phrase 'in the' must never be mined")
+	}
+	if _, ok := byName["for molecules"]; ok {
+		t.Error("phrase starting with a stopword ('for ...') must not be mined")
+	}
+}

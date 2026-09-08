@@ -84,7 +84,7 @@ Edit `config.json`:
 | `max_probes` | max keyword searches per split node (default 8) — the first keyword keeping both sides ≤75% of the node is used |
 | `max_probes_per_conf` | hard cap on live Scholar count searches per conference plan (default 60) |
 | `min_balance` / `headroom` / `min_papers_to_trust` / `min_coverage` | split-quality floor / offline bucket size / offline-corpus trust gates |
-| `mine_bigrams` / `max_mined_keywords` / `min_completion_ratio` | mining and shortfall tuning |
+| `mine_max_ngram` / `max_mined_keywords` / `min_completion_ratio` | phrase mining depth (2–3-word candidates) and shortfall tuning |
 
 The shipped `config.example.json` already lists all 20 conferences.
 
