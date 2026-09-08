@@ -383,7 +383,12 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if len(mp) == 0 {
 		return nil, false
 	}
+	// The harvest page is ~10 items, so the corpus-level MinFreq would drop
+	// nearly every word. A page-level candidate only needs to show up more than
+	// once to be worth a single verification probe — ResolveOverCap checks the
+	// real count anyway.
 	opts := mine.DefaultOptions()
+	opts.MinFreq = 2
 	opts.MinBalance = c.cfg.MinBalance
 	opts.Bigrams = c.cfg.MineBigrams
 	opts.MaxCandidates = c.cfg.MaxMinedKeywords
@@ -392,11 +397,14 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	for _, cd := range cands {
 		fresh = append(fresh, cd.Keyword)
 	}
-	fresh = split.DropDegenerateKeywords(conf.Query, fresh)
-	if len(fresh) == 0 {
+	// Fresh page terms refine the corpus+config list but are not required:
+	// `keywords` already carries the conference's mined/configured splitters,
+	// so an empty fresh list must not stop the split attempt — bailing here is
+	// what left every big year needs_split without ever probing an AND term.
+	merged := split.DropDegenerateKeywords(conf.Query, append(append([]string{}, keywords...), fresh...))
+	if len(merged) == 0 {
 		return nil, false
 	}
-	merged := split.DropDegenerateKeywords(conf.Query, append(append([]string{}, keywords...), fresh...))
 	return split.ResolveOverCap(split.Leaf{
 		Query:    query,
 		YearFrom: year,
