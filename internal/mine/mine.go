@@ -87,6 +87,9 @@ func Tokenize(s string) []string {
 
 // stopWords are function words that carry no topical signal. Deliberately a
 // short list: domain terms like "learning" or "network" must never be culled.
+// Auxiliary verbs, pronouns, determiners and generic adverbs are included so
+// they cannot masquerade as high-Balance splitters — words like "has", "have"
+// and "been" split titles evenly but barely reduce a Scholar count.
 var stopWords = map[string]bool{
 	"the": true, "a": true, "an": true, "of": true, "for": true, "with": true,
 	"on": true, "at": true, "in": true, "from": true, "to": true, "and": true,
@@ -94,6 +97,32 @@ var stopWords = map[string]bool{
 	"towards": true, "via": true, "this": true, "that": true, "we": true,
 	"it": true, "its": true, "by": true, "into": true, "than": true, "as": true,
 	"their": true, "over": true, "under": true, "between": true,
+	// auxiliary / modal verbs
+	"has": true, "have": true, "had": true, "been": true, "being": true,
+	"was": true, "were": true, "am": true, "do": true, "does": true,
+	"did": true, "doing": true, "done": true, "will": true, "would": true,
+	"shall": true, "should": true, "can": true, "could": true, "may": true,
+	"might": true, "must": true, "ought": true,
+	// pronouns and possessives
+	"i": true, "you": true, "he": true, "she": true, "they": true,
+	"me": true, "him": true, "her": true, "us": true, "them": true,
+	"my": true, "mine": true, "your": true, "yours": true, "his": true,
+	"hers": true, "our": true, "ours": true, "theirs": true,
+	"myself": true, "yourself": true, "himself": true, "herself": true,
+	"itself": true, "ourselves": true, "themselves": true,
+	// determiners / quantifiers / conjunctions / adverbs
+	"these": true, "those": true, "all": true, "any": true, "both": true,
+	"each": true, "few": true, "more": true, "most": true, "other": true,
+	"others": true, "some": true, "such": true, "no": true, "not": true,
+	"only": true, "own": true, "same": true, "so": true, "too": true,
+	"very": true, "just": true, "but": true, "if": true, "then": true,
+	"else": true, "when": true, "where": true, "why": true, "how": true,
+	"what": true, "which": true, "who": true, "whom": true, "here": true,
+	"there": true, "again": true, "further": true, "once": true,
+	"during": true, "before": true, "after": true, "above": true,
+	"below": true, "through": true, "while": true, "also": true,
+	"new": true, "one": true, "two": true, "three": true, "use": true,
+	"used": true, "get": true, "got": true, "make": true, "made": true,
 }
 
 func isDigits(s string) bool {
