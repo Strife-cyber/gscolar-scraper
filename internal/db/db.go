@@ -567,6 +567,38 @@ func (d *DB) PapersForConference(ctx context.Context, conferenceID int64, yearFr
 	return out, rows.Err()
 }
 
+// PapersInYears returns every stored paper inside a year range, across ALL
+// conferences — the broad corpus a year's split is partitioned over. Splitting
+// a conference's year is not limited to that conference's own papers: known
+// papers from other venues in the same year are equally valid evidence for
+// which keywords divide the result space.
+func (d *DB) PapersInYears(ctx context.Context, yearFrom, yearTo int) ([]Paper, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT hash, title, snippet, year, authors, raw_html, task_id, conference_id, sourced_from
+		FROM papers WHERE year BETWEEN ? AND ? ORDER BY year, hash`, yearFrom, yearTo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Paper
+	for rows.Next() {
+		var p Paper
+		var taskID, confID *int64
+		if err := rows.Scan(&p.Hash, &p.Title, &p.Snippet, &p.Year, &p.Authors,
+			&p.RawHTML, &taskID, &confID, &p.SourcedFrom); err != nil {
+			return nil, err
+		}
+		if taskID != nil {
+			p.TaskID = *taskID
+		}
+		if confID != nil {
+			p.ConferenceID = *confID
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // AllPaperTexts returns "title snippet" for every stored paper — the
 // background corpus the TF-IDF keyword miner scores a conference's candidate
 // splitters against.

@@ -898,6 +898,38 @@ func TestResolveYearThinCorpusFallsBack(t *testing.T) {
 	}
 }
 
+// TestResolveYearUsesCrossConferenceCorpus: the year's partition corpus is
+// every known paper in that year, not only this conference's. A conference
+// whose own corpus is below the trust floor still resolves when papers crawled
+// under other venues fill out the year.
+func TestResolveYearUsesCrossConferenceCorpus(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	ctx := context.Background()
+	// This conference alone: 8 papers < MinPapersToTrust — would bail offline.
+	seedConfPapers(t, d, conf.ID, 4, 4)
+	// Another conference's papers in the same year fill out the corpus: the
+	// widened pool of 128 papers partitions foo/¬foo under the 80-doc offline
+	// cap and each bucket verifies under the 100-result crawl cap.
+	otherID, err := d.UpsertConference(ctx, "OTHER", `"Other"`)
+	if err != nil {
+		t.Fatalf("upsert other conference: %v", err)
+	}
+	seedConfPapers(t, d, otherID, 60, 60)
+	base := `"Conf"`
+	for _, q := range []string{base + ` AND "foo"`, base + ` -"foo"`} {
+		if err := d.SetCachedCount(ctx, q, 2020, 2020, 60); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget())
+	if !ok {
+		t.Fatal("resolveYear must partition the cross-conference corpus, not just this venue's papers")
+	}
+	if len(leaves) != 2 {
+		t.Fatalf("leaves = %d, want 2", len(leaves))
+	}
+}
+
 // TestResolveYearInfeasibleCore: a corpus where every paper shares a single
 // token and no keyword divides it must surface as unresolved (needs_split),
 // never as an over-cap task or an infinite loop.

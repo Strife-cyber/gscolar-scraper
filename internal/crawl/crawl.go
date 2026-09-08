@@ -199,28 +199,28 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 	return needsSplit, nil
 }
 
-// planKeywords returns the keyword candidates fed to the planner: the
-// conference's mined splitter words merged with the configured defaults, minus
-// degenerate terms that are substrings of the venue query. Candidates are
-// mined with TF-IDF — a word must divide this conference's papers (Balance)
-// AND be rare across the whole stored corpus (IDF) to rank high — so generic
-// vocabulary can never masquerade as a splitter. Mined keywords come first
-// (highest Balance×IDF first) so the partition sees the best splitters first.
+// planKeywords returns the keyword candidates fed to the planner: splitter
+// words mined from EVERY stored paper (not just this conference's) merged with
+// the configured defaults, minus degenerate terms that are substrings of the
+// venue query. Candidates are ranked by Balance × IDF over the same whole-DB
+// corpus — a word must divide the corpus evenly AND be topically distinctive
+// to rank high, so generic vocabulary can never masquerade as a splitter.
+// Mined keywords come first so the partition sees the best splitters first.
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
-	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
-	if err != nil {
-		c.log.Info(fmt.Sprintf("load papers for %s keyword mining: %v", conf.Name, err))
-		papers = nil
-	}
+	// The keyword dataset is every stored paper, not just this conference's:
+	// words that split the literature well are discovered wherever they have
+	// been crawled. Mining and the IDF background share the same whole-DB
+	// corpus — IDF still sinks vocabulary that is common across all venues.
+	texts := c.backgroundTexts(ctx)
 	opts := mine.DefaultOptions()
 	opts.MinBalance = c.cfg.MinBalance
 	opts.Bigrams = c.cfg.MineBigrams
 	opts.MaxCandidates = c.cfg.MaxMinedKeywords
-	mp := make([]mine.Paper, 0, len(papers))
-	for _, p := range papers {
-		mp = append(mp, mine.Paper{Hash: p.Hash, Title: p.Title, Snippet: p.Snippet, Year: p.Year})
+	mp := make([]mine.Paper, 0, len(texts))
+	for i, t := range texts {
+		mp = append(mp, mine.Paper{Hash: fmt.Sprintf("bg-%d", i), Title: t})
 	}
-	cands := mine.MineIDF(mp, c.backgroundTexts(ctx), opts)
+	cands := mine.MineIDF(mp, texts, opts)
 
 	mined := make([]string, 0, len(cands))
 	for _, cd := range cands {
@@ -254,8 +254,9 @@ func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 }
 
 // resolveYear brings a single over-cap year under the cap using offline
-// partitioning of the conference's known papers, verified with one count probe
-// per bucket and re-split online where the estimate under-counts. It returns
+// partitioning of every known paper in that year (across all conferences),
+// verified with one count probe per bucket and re-split online where the
+// estimate under-counts. It returns
 // pending leaves on success and ok=false when the corpus is too thin, too
 // under-covered, the shared budget is exhausted, or some atom cannot be brought
 // under the cap (caller keeps the year's needs_split TODO untouched).
@@ -267,7 +268,13 @@ func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 // explode (each count() is an expensive Scholar search), so instead of trusting
 // a biased sample we bail to the bounded count-probe chain.
 func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, trueCount int, keywords []string, count split.CountFunc, budget *probeBudget) ([]split.Leaf, bool) {
-	papers, err := c.db.PapersForConference(ctx, conf.ID, year, year)
+	// The corpus is every known paper in this year across ALL conferences, not
+	// just this venue's: a keyword that divides the year's result space is
+	// equally evidenced by papers crawled under other venues, and restricting
+	// to this conference's rows alone would leave most years too thin to
+	// partition. Buckets are still verified against this conference's query, so
+	// an over-broad corpus can only over-estimate a bucket — never under-count.
+	papers, err := c.db.PapersInYears(ctx, year, year)
 	if err != nil {
 		return nil, false
 	}
