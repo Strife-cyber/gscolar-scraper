@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -56,6 +57,11 @@ type Crawler struct {
 	db  *db.DB
 	br  Browserer
 	log *slog.Logger
+
+	// bgTexts is the lazily loaded TF-IDF background corpus (every paper's
+	// text in the DB), fetched once per Crawler.
+	bgOnce  sync.Once
+	bgTexts []string
 }
 
 // New builds a Crawler. The browser must already be connected.
@@ -106,7 +112,13 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 		return c.budgetCount(ctx, budget, query, yearFrom, yearTo)
 	}
 
-	pl := c.planKeywords(ctx, conf)
+	// Keyword mining runs on its own goroutine: it is pure DB+CPU work and
+	// overlaps the plan's slow count probes (each search carries a human-like
+	// pause), so by the time an over-cap year needs split candidates the
+	// TF-IDF ranking is ready.
+	kwCh := make(chan []string, 1)
+	go func() { kwCh <- c.planKeywords(ctx, conf) }()
+
 	// maxKeywords=0 disables the inline online split inside split.Plan: an
 	// over-cap single year is emitted as a needs_split leaf and resolved below
 	// by resolveYear, which picks split keywords on the conference's known
@@ -114,10 +126,12 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	// verifying the resulting bucket counts. Probing candidate keywords on
 	// Scholar itself — one search per keyword per node — is what burned the
 	// probe budget on useless terms and risks tripping the block detection.
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, pl, live, c.cfg.MinBalance)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
+
+	pl := <-kwCh
 
 	// Resolve any single-year over-cap leaf into finer pending tasks. The probe
 	// budget is shared so no single year can consume the conference's whole
@@ -187,9 +201,11 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 
 // planKeywords returns the keyword candidates fed to the planner: the
 // conference's mined splitter words merged with the configured defaults, minus
-// degenerate terms that are substrings of the venue query. Mined keywords come
-// first (higher Balance first) so the partition and the count chain see the
-// best splitters first.
+// degenerate terms that are substrings of the venue query. Candidates are
+// mined with TF-IDF — a word must divide this conference's papers (Balance)
+// AND be rare across the whole stored corpus (IDF) to rank high — so generic
+// vocabulary can never masquerade as a splitter. Mined keywords come first
+// (highest Balance×IDF first) so the partition sees the best splitters first.
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
 	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
 	if err != nil {
@@ -204,7 +220,7 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 	for _, p := range papers {
 		mp = append(mp, mine.Paper{Hash: p.Hash, Title: p.Title, Snippet: p.Snippet, Year: p.Year})
 	}
-	cands := mine.Mine(mp, opts)
+	cands := mine.MineIDF(mp, c.backgroundTexts(ctx), opts)
 
 	mined := make([]string, 0, len(cands))
 	for _, cd := range cands {
@@ -220,6 +236,21 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 		kws = append(kws, w)
 	}
 	return split.DropDegenerateKeywords(conf.Query, kws)
+}
+
+// backgroundTexts returns every stored paper's text, fetched once per Crawler
+// and reused for the IDF denominator of every mining pass. A load failure
+// degrades gracefully to plain Balance ranking (empty background → IDF 1.0).
+func (c *Crawler) backgroundTexts(ctx context.Context) []string {
+	c.bgOnce.Do(func() {
+		texts, err := c.db.AllPaperTexts(ctx)
+		if err != nil {
+			c.log.Info(fmt.Sprintf("load background corpus for TF-IDF: %v", err))
+			return
+		}
+		c.bgTexts = texts
+	})
+	return c.bgTexts
 }
 
 // resolveYear brings a single over-cap year under the cap using offline
@@ -356,7 +387,7 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	opts.MinBalance = c.cfg.MinBalance
 	opts.Bigrams = c.cfg.MineBigrams
 	opts.MaxCandidates = c.cfg.MaxMinedKeywords
-	cands := mine.Mine(mp, opts)
+	cands := mine.MineIDF(mp, c.backgroundTexts(ctx), opts)
 	fresh := make([]string, 0, len(cands))
 	for _, cd := range cands {
 		fresh = append(fresh, cd.Keyword)
@@ -401,11 +432,12 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 		}
 		return n, ok
 	}
-	pl := c.planKeywords(ctx, conf)
 	// Same as PlanConference: maxKeywords=0 keeps split.Plan from probing
 	// candidate keywords; every over-cap year is resolved by resolveYear on the
-	// known-paper corpus below.
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, pl, cacheOnly, c.cfg.MinBalance)
+	// known-paper corpus below. No background goroutine needed here — nothing
+	// slow runs concurrently to overlap it with.
+	pl := c.planKeywords(ctx, conf)
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}

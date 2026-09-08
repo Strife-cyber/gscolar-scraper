@@ -16,6 +16,7 @@
 package mine
 
 import (
+	"math"
 	"sort"
 	"strings"
 )
@@ -54,6 +55,9 @@ type Candidate struct {
 	Without int
 	Total   int
 	Balance float64
+	// IDF is the candidate's inverse document frequency over the background
+	// corpus passed to MineIDF (1.0 when no background is supplied).
+	IDF float64
 }
 
 // DefaultOptions returns sensible defaults for a corpus of thousands of papers.
@@ -246,6 +250,81 @@ func Mine(papers []Paper, o Options) []Candidate {
 		cands = cands[:o.MaxCandidates]
 	}
 	return cands
+}
+
+// MineIDF is Mine with an inverse-document-frequency term computed over a
+// background corpus (typically every paper already in the DB). A candidate's
+// final rank is Balance × IDF, so a word must both divide the target corpus
+// and be topically distinctive to rank well — generic words that appear in
+// every background document (the "has"/"have"/"been" class) get a near-minimum
+// IDF and sink to the bottom even when their Balance is perfect.
+//
+// The MaxCandidates cap is applied after the IDF re-rank so a high-IDF word
+// is never cut by the plain-Balance ordering.
+func MineIDF(target []Paper, background []string, o Options) []Candidate {
+	uncapped := o
+	uncapped.MaxCandidates = 0
+	cands := Mine(target, uncapped)
+	if len(background) == 0 || len(cands) == 0 {
+		return capCands(cands, o.MaxCandidates)
+	}
+
+	df := docFreq(background)
+	n := float64(len(background))
+	for i := range cands {
+		cands[i].IDF = idfOf(cands[i].Keyword, df, n)
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		si := cands[i].Balance * cands[i].IDF
+		sj := cands[j].Balance * cands[j].IDF
+		if si != sj {
+			return si > sj
+		}
+		if cands[i].With != cands[j].With {
+			return cands[i].With > cands[j].With
+		}
+		return cands[i].Keyword < cands[j].Keyword
+	})
+	return capCands(dedupSubstrings(cands), o.MaxCandidates)
+}
+
+func capCands(cands []Candidate, max int) []Candidate {
+	if max > 0 && len(cands) > max {
+		return cands[:max]
+	}
+	return cands
+}
+
+// docFreq counts, per token, how many background texts contain it.
+func docFreq(texts []string) map[string]int {
+	df := make(map[string]int)
+	for _, t := range texts {
+		for w := range toSet(Tokenize(t)) {
+			df[w]++
+		}
+	}
+	return df
+}
+
+// idfOf scores a candidate: log(1 + N / (1 + df)) smoothed so a word in every
+// background document bottoms out near log(2) instead of -inf. A bigram
+// candidate scores the IDF of its rarer component (a phrase can never appear
+// in more documents than its least common word).
+func idfOf(kw string, df map[string]int, nDocs float64) float64 {
+	if nDocs <= 0 {
+		return 1
+	}
+	worst := math.MaxFloat64
+	for _, w := range strings.Split(kw, " ") {
+		v := math.Log(1 + nDocs/(1+float64(df[w])))
+		if v < worst {
+			worst = v
+		}
+	}
+	if worst == math.MaxFloat64 {
+		return 1
+	}
+	return worst
 }
 
 // dedupSubstrings drops a candidate that is a strict substring of an already

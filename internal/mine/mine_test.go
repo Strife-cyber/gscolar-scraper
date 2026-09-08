@@ -201,6 +201,71 @@ func TestMineSnippetBigrams(t *testing.T) {
 	}
 }
 
+// TestMineIDFSinksUbiquitousWord: two candidates with identical Balance on the
+// target corpus — "generic" appears in every background document while "rare"
+// appears in almost none. The TF-IDF re-rank must push "rare" above "generic"
+// even though their Balance is equal.
+func TestMineIDFSinksUbiquitousWord(t *testing.T) {
+	// 8 target papers: "rare" on the first 4, "generic" on the last 4 — both
+	// split the target exactly 50/50 (Balance 1.0).
+	var papers []Paper
+	for i := 0; i < 8; i++ {
+		title := "commonword "
+		if i < 4 {
+			title += "rare term"
+		} else {
+			title += "generic term"
+		}
+		papers = append(papers, Paper{Hash: "p" + string(rune('a'+i)), Title: title})
+	}
+	// Background: "generic" in every doc, "rare" in one of a hundred.
+	bg := make([]string, 100)
+	for i := range bg {
+		bg[i] = "generic padding " + string(rune('a'+i%26))
+	}
+	bg[0] += " rare"
+	cands := MineIDF(papers, bg, DefaultOptions())
+	if len(cands) == 0 {
+		t.Fatal("no candidates")
+	}
+	if cands[0].Keyword != "rare" {
+		t.Errorf("top candidate = %q, want 'rare' (background-ubiquitous words must sink): %v", cands[0].Keyword, cands)
+	}
+	var rare, generic Candidate
+	for _, c := range cands {
+		switch c.Keyword {
+		case "rare":
+			rare = c
+		case "generic":
+			generic = c
+		}
+	}
+	if rare.IDF <= generic.IDF {
+		t.Errorf("rare IDF %.2f must exceed generic IDF %.2f", rare.IDF, generic.IDF)
+	}
+}
+
+// TestMineIDFNoBackgroundFallsBackToBalance: an empty background corpus must
+// degrade to the plain Balance ranking (every IDF is 1.0).
+func TestMineIDFNoBackgroundFallsBackToBalance(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "zebra"},
+		{Hash: "b", Title: "zebra"},
+		{Hash: "c", Title: "zebra"},
+		{Hash: "d", Title: "zebra"},
+		{Hash: "e", Title: "zebra"},
+		{Hash: "f", Title: "alpha"},
+	}
+	o := DefaultOptions()
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+	cands := MineIDF(papers, nil, o)
+	if len(cands) == 0 || cands[0].Keyword != "zebra" {
+		t.Fatalf("empty background must fall back to Balance ranking, got %v", cands)
+	}
+}
+
 // TestMineCoverageTieBreaker: when two candidates have the same Balance, the
 // one covering more papers (higher With) is ranked first.
 func TestMineCoverageTieBreaker(t *testing.T) {

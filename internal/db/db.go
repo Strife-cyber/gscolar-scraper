@@ -567,6 +567,26 @@ func (d *DB) PapersForConference(ctx context.Context, conferenceID int64, yearFr
 	return out, rows.Err()
 }
 
+// AllPaperTexts returns "title snippet" for every stored paper — the
+// background corpus the TF-IDF keyword miner scores a conference's candidate
+// splitters against.
+func (d *DB) AllPaperTexts(ctx context.Context) ([]string, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT title, snippet FROM papers`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var title, snippet string
+		if err := rows.Scan(&title, &snippet); err != nil {
+			return nil, err
+		}
+		out = append(out, title+" "+snippet)
+	}
+	return out, rows.Err()
+}
+
 // PaperCount reports how many unique papers are stored.
 func (d *DB) PaperCount(ctx context.Context) (int, error) {
 	var n int
