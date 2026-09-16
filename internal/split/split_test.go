@@ -574,6 +574,71 @@ func TestForcedSplitChainsKeywords(t *testing.T) {
 	}
 }
 
+// TestRankFuncReordersPerBranch: global rank order puts "learning" and "data"
+// ahead of "bayes", but conditioned on the root's "neural networks" branch,
+// "learning"/"data" barely split that subset (lopsided, over maxSideFraction)
+// while "bayes" splits it cleanly. With probesPerNode=1, walking the fixed
+// global order would burn the only probe on "learning" and force a lopsided
+// split; a RankFunc that reorders by conditional quality moves "bayes" first
+// so the one probe actually available is spent on the candidate that works.
+func TestRankFuncReordersPerBranch(t *testing.T) {
+	base := `"ICML"`
+	leaf := Leaf{Query: base, YearFrom: 2020, YearTo: 2020, Count: 2000, HasCount: true}
+	table := map[string]int{
+		// Root split on "neural networks": clean 1000/1000.
+		key(base+` AND "neural networks"`, 2020, 2020): 1000,
+		// Inside the neural-networks branch, "learning" is lopsided (950/50,
+		// far over the 75% maxSideFraction) — a bad splitter for THIS branch
+		// despite outranking "bayes" globally.
+		key(base+` AND "neural networks" AND "learning"`, 2020, 2020): 950,
+		// "bayes" splits the same branch cleanly (400/600).
+		key(base+` AND "neural networks" AND "bayes"`, 2020, 2020): 400,
+	}
+	var asked []string
+	count := func(query string, yFrom, yTo int) (int, bool) {
+		asked = append(asked, query)
+		return fakeCount(table)(query, yFrom, yTo)
+	}
+
+	// rank moves "bayes" to the front whenever the branch already includes
+	// "neural networks" — a stand-in for a real corpus-conditioned ranker.
+	rank := func(inc, exc []string, candidates []string) []string {
+		hasNN := false
+		for _, w := range inc {
+			if w == "neural networks" {
+				hasNN = true
+			}
+		}
+		if !hasNN {
+			return candidates
+		}
+		out := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			if c == "bayes" {
+				out = append([]string{c}, out...)
+			} else {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+
+	out, ok := ResolveOverCapVR(leaf, []string{"neural networks", "learning", "data", "bayes"}, count, nil, rank, 1, 0.1, 1200)
+	if !ok {
+		t.Fatalf("expected the branch to resolve via the re-ranked candidate, got ok=false")
+	}
+	for _, q := range asked {
+		if containsWord(q, `AND "neural networks" AND "learning"`) {
+			t.Fatalf("with only 1 probe/node, the re-ranked branch must never waste it on the globally-ranked-but-branch-weak 'learning': asked %v", asked)
+		}
+	}
+	for _, l := range out {
+		if l.Count > 1200 || l.NeedsSplit {
+			t.Errorf("leaf %q count %d exceeds cap or is needs_split", l.Query, l.Count)
+		}
+	}
+}
+
 // TestDegenerateKeywordNeverProbed (Test 6): a keyword that is a substring of
 // the base query must be removed before ResolveOverCap probes anything — the
 // planner filters it via dropDegenerateKeywords before recursion starts.
@@ -788,7 +853,7 @@ func TestPlannerFallback(t *testing.T) {
 // genPapers produces n papers with a known keyword distribution.
 func genPapers(n int) []map[string]bool {
 	out := make([]map[string]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		kw := map[string]bool{}
 		if i%19 < 10 { // ~10/19 have "neural"
 			kw["neural"] = true

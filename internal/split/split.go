@@ -73,6 +73,22 @@ type CountFunc func(query string, yearFrom, yearTo int) (count int, ok bool)
 // probes every candidate.
 type VetoFunc func(inc, exc []string, kw string) bool
 
+// RankFunc reorders a node's surviving candidate keywords (veto already
+// applied) by how well each one is expected to split the CURRENT branch —
+// e.g. offline conditional Balance over the known corpus subset satisfying
+// inc/exc — best splitter first. Candidates are pre-ranked once globally
+// (best-splitter-of-the-whole-corpus-first) before probing begins, but a
+// keyword's global rank says nothing about how well it splits a branch
+// already conditioned on other keywords: "learning" and "data" both divide
+// the whole corpus decently, but inside an "AND neural networks" branch most
+// papers already mention both, so they barely divide that branch while a
+// globally-weaker term ("bayesian") might split it cleanly. Re-ranking
+// per-node lets probesPerNode be spent on the candidates most likely to work
+// for THIS branch instead of walking the fixed global order and wasting
+// probes on ones only the veto rejects. A nil RankFunc leaves the incoming
+// order untouched (the original global-rank-order behavior).
+type RankFunc func(inc, exc []string, candidates []string) []string
+
 // Plan partitions the [yearFrom, yearTo] result space of baseQuery into
 // disjoint leaf tasks, walking the range in 2-year windows (a trailing odd year
 // is its own window), narrowing an oversized 2-year window to its two single
@@ -206,6 +222,14 @@ func ResolveOverCap(leaf Leaf, keywords []string, count CountFunc, probesPerNode
 // probe, veto(inc, exc, kw) is consulted and a false return skips the
 // candidate without spending a Scholar search.
 func ResolveOverCapV(leaf Leaf, keywords []string, count CountFunc, veto VetoFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
+	return ResolveOverCapVR(leaf, keywords, count, veto, nil, probesPerNode, minBalance, limit)
+}
+
+// ResolveOverCapVR is ResolveOverCapV with a per-node RankFunc: after veto,
+// the surviving candidates for each node are reordered by how well they are
+// expected to split THAT branch (not the whole corpus) before any of them
+// are probed. A nil rank leaves the incoming (global-rank) order untouched.
+func ResolveOverCapVR(leaf Leaf, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
 	var out []Leaf
 
 	resolved := resolveNode(
@@ -217,6 +241,7 @@ func ResolveOverCapV(leaf Leaf, keywords []string, count CountFunc, veto VetoFun
 		keywords,
 		count,
 		veto,
+		rank,
 		probesPerNode,
 		minBalance,
 		limit,
@@ -234,7 +259,7 @@ func ResolveOverCapV(leaf Leaf, keywords []string, count CountFunc, veto VetoFun
 // positive/negative keyword predicates accumulated along the path; the current
 // node covers 'size' results. A partial split is never returned: if any subtree
 // fails, resolved=false and out is left in an undefined state (caller discards).
-func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, veto VetoFunc, probesPerNode int, minBalance float64, limit int, inc, exc []string, out *[]Leaf, depth int) bool {
+func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int, inc, exc []string, out *[]Leaf, depth int) bool {
 	if size == 0 {
 		return true
 	}
@@ -256,7 +281,20 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 		return false
 	}
 
-	// Probe candidates in ranked order; the FIRST one that produces a clean
+	// A candidate's GLOBAL rank (best splitter of the whole corpus) says
+	// nothing about how well it splits THIS branch: two terms that both
+	// divide the whole corpus well can both be near-universal inside a
+	// branch already conditioned on another keyword (e.g. "learning" and
+	// "data" inside an "AND neural networks" branch, where most papers
+	// mention both) while a globally-weaker term still splits that branch
+	// cleanly. rank, when provided, reorders the surviving candidates by
+	// conditional split quality for inc/exc before any of them are probed,
+	// so probesPerNode is spent on the candidates most likely to work HERE.
+	if rank != nil {
+		keywords = rank(inc, exc, keywords)
+	}
+
+	// Probe candidates in (ranked) order; the FIRST one that produces a clean
 	// split is selected and the remaining candidates are never searched. A
 	// split is clean when NEITHER side keeps more than maxSideFraction of the
 	// node — a keyword covering >75% of the results (or leaving >75% behind)
@@ -328,13 +366,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	var withLeaves, withoutLeaves []Leaf
 	withOK := resolveNode(
 		base, yFrom, yTo, bestWith, true,
-		remaining, count, veto, probesPerNode,
+		remaining, count, veto, rank, probesPerNode,
 		minBalance, limit,
 		appendPred(inc, bestKey), exc,
 		&withLeaves, depth+1)
 	withoutOK := resolveNode(
 		base, yFrom, yTo, bestWithout, true,
-		remaining, count, veto, probesPerNode,
+		remaining, count, veto, rank, probesPerNode,
 		minBalance, limit,
 		inc, appendPred(exc, bestKey),
 		&withoutLeaves, depth+1)
@@ -348,14 +386,15 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 
 // leafQuery renders base plus include (AND) and exclude (-) predicates.
 func leafQuery(base string, inc, exc []string) string {
-	q := base
+	var q strings.Builder
+	q.WriteString(base)
 	for _, w := range inc {
-		q += ` AND "` + w + `"`
+		q.WriteString(` AND "` + w + `"`)
 	}
 	for _, w := range exc {
-		q += ` -"` + w + `"`
+		q.WriteString(` -"` + w + `"`)
 	}
-	return q
+	return q.String()
 }
 
 // predicateChain is the ordered provenance list (includes then excludes).
@@ -389,10 +428,7 @@ func balanceOf(with, without int) float64 {
 	if total == 0 {
 		return 0
 	}
-	smaller := with
-	if without < smaller {
-		smaller = without
-	}
+	smaller := min(without, with)
 	b := float64(smaller) / (float64(total) / 2.0)
 	if b > 1 {
 		return 1

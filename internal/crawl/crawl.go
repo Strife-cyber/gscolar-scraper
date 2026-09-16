@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -270,7 +271,7 @@ func dedupSubstringKeywords(kws []string) []string {
 	out := make([]string, 0, len(kws))
 	for i, kw := range kws {
 		dup := false
-		for j := 0; j < i; j++ {
+		for j := range i {
 			a, b := kws[j], kw
 			if len(strings.Fields(a)) != len(strings.Fields(b)) {
 				continue // different phrase lengths split differently
@@ -312,6 +313,7 @@ func (c *Crawler) minedKeywords(ctx context.Context) []string {
 		if c.cfg.MineBigrams && opts.MaxNGram < 2 {
 			opts.MaxNGram = 2 // legacy flag: enable bigram phrases
 		}
+		opts.PhraseBoost = c.cfg.MinePhraseBoost
 		opts.MaxCandidates = c.cfg.MaxMinedKeywords
 		mp := make([]mine.Paper, 0, len(texts))
 		for i, t := range texts {
@@ -406,12 +408,26 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 			p := byHash[d.Hash]
 			return p.Title + " " + p.Snippet
 		}
-		limit := int(float64(c.cfg.MaxResults) * c.cfg.Headroom)
-		if limit < 1 {
-			limit = 1
-		}
+		limit := max(int(float64(c.cfg.MaxResults)*c.cfg.Headroom), 1)
 
-		out := partition.Partition(docs, keywords, text, limit)
+		out := partition.PartitionOpts(docs, keywords, text, limit, partition.Options{
+			MinBalance:  c.cfg.MinBalance,
+			PhraseBoost: c.cfg.MinePhraseBoost,
+		})
+		// An unresolved group means every candidate in `keywords` is either
+		// near-universal or near-absent inside that specific group — the
+		// classic case being a chain like "AND neural networks" where generic
+		// splitters ("learning", "data") are already true for almost every
+		// paper in the group. Rather than giving up on the whole year, mine
+		// fresh phrase candidates from JUST that group's own papers (escalating
+		// past the configured mine_max_ngram once, since a wider phrase is
+		// more likely to isolate a stubborn subset than another generic word)
+		// and retry partitioning only the unresolved groups with the enlarged
+		// candidate list. This costs zero Scholar searches — it is pure
+		// offline re-mining of papers already in the DB.
+		if len(out.Unresolved) > 0 {
+			out = escalateUnresolved(out, docs, keywords, text, limit, byHash, c.cfg)
+		}
 		var sub []split.Leaf
 		offlineOK := true
 		for _, b := range out.Buckets {
@@ -436,8 +452,12 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 			leaf.NeedsSplit = true
 			// The leaf's own predicates are the veto's base context: a
 			// candidate is measured inside the bucket's conditioned corpus.
+			// The rank uses the same base predicates so a chained keyword
+			// inside this bucket is scored on how well it splits the
+			// bucket's subset, not the whole year.
 			bv := corpusVeto(yearTexts, b.Includes, b.Excludes)
-			rs, ok := split.ResolveOverCapV(leaf, keywords, liveOnly(count, budget), bv, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+			br := corpusRank(yearTexts, b.Includes, b.Excludes, c.cfg.MinePhraseBoost)
+			rs, ok := split.ResolveOverCapVR(leaf, keywords, liveOnly(count, budget), bv, br, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
 			if !ok || budget.exhausted() {
 				offlineOK = false
 				break
@@ -509,6 +529,7 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if c.cfg.MineBigrams && opts.MaxNGram < 2 {
 		opts.MaxNGram = 2 // legacy flag: enable bigram phrases
 	}
+	opts.PhraseBoost = c.cfg.MinePhraseBoost
 	opts.MaxCandidates = c.cfg.MaxMinedKeywords
 	cands := mine.MineIDF(mp, c.backgroundTexts(ctx), opts)
 	fresh := make([]string, 0, len(cands))
@@ -528,13 +549,98 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if len(merged) == 0 {
 		return nil, false
 	}
-	return split.ResolveOverCapV(split.Leaf{
+	rank := corpusRank(yearTexts, nil, nil, c.cfg.MinePhraseBoost)
+	return split.ResolveOverCapVR(split.Leaf{
 		Query:    query,
 		YearFrom: year,
 		YearTo:   year,
 		Count:    trueCount,
 		HasCount: true,
-	}, merged, liveOnly(count, budget), veto, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+	}, merged, liveOnly(count, budget), veto, rank, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+}
+
+// escalateUnresolved retries every Unresolved group from an initial
+// partition.Partition pass with a richer, group-specific candidate list: a
+// group lands in Unresolved because none of `keywords` divides it (each one
+// is near-universal or near-absent among exactly those papers), so trying
+// the SAME list again can never help — what the group needs is a term mined
+// FROM ITS OWN papers, at a wider phrase length than the corpus-wide mining
+// pass used (mine_max_ngram+1), since a longer, more specific phrase is more
+// likely to isolate a stubborn subset than another generic word. This is
+// pure offline re-mining of papers already in the DB — no Scholar searches.
+// Buckets already resolved by the first pass are kept as-is.
+func escalateUnresolved(out partition.Outcome, allDocs []partition.Doc, keywords []string, text func(partition.Doc) string, limit int, byHash map[string]db.Paper, cfg *config.Config) partition.Outcome {
+	docByHash := make(map[string]partition.Doc, len(allDocs))
+	for _, d := range allDocs {
+		docByHash[d.Hash] = d
+	}
+
+	final := partition.Outcome{Buckets: append([]partition.Bucket{}, out.Buckets...)}
+	for _, group := range out.Unresolved {
+		groupDocs := make([]partition.Doc, 0, len(group.Papers))
+		mp := make([]mine.Paper, 0, len(group.Papers))
+		for _, h := range group.Papers {
+			d, ok := docByHash[h]
+			if !ok {
+				continue
+			}
+			groupDocs = append(groupDocs, d)
+			p := byHash[h]
+			mp = append(mp, mine.Paper{Hash: h, Title: p.Title, Snippet: p.Snippet, Year: p.Year})
+		}
+		if len(groupDocs) == 0 {
+			final.Unresolved = append(final.Unresolved, group)
+			continue
+		}
+
+		opts := mine.DefaultOptions()
+		opts.MinFreq = 2 // a group is a small slice of the corpus; the global MinFreq would drop everything
+		opts.MinBalance = cfg.MinBalance
+		opts.MaxNGram = cfg.MineMaxNGram + 1 // escalate one phrase length past the corpus-wide pass
+		opts.PhraseBoost = cfg.MinePhraseBoost
+		opts.MaxCandidates = cfg.MaxMinedKeywords
+		fresh := mine.MineIDF(mp, nil, opts)
+
+		merged := make([]string, 0, len(keywords)+len(fresh))
+		seen := make(map[string]bool, len(keywords)+len(fresh))
+		for _, kw := range keywords {
+			if !seen[kw] {
+				seen[kw] = true
+				merged = append(merged, kw)
+			}
+		}
+		for _, cd := range fresh {
+			if !seen[cd.Keyword] {
+				seen[cd.Keyword] = true
+				merged = append(merged, cd.Keyword)
+			}
+		}
+		if len(merged) == len(keywords) {
+			// Mining found nothing new for this group — retrying would just
+			// reproduce the same Unresolved result.
+			final.Unresolved = append(final.Unresolved, group)
+			continue
+		}
+
+		sub := partition.PartitionOpts(groupDocs, merged, text, limit, partition.Options{
+			MinBalance:  cfg.MinBalance,
+			PhraseBoost: cfg.MinePhraseBoost,
+		})
+		// The sub-partition's buckets carry only the NEW predicates relative to
+		// this group; prefix them with the group's own include/exclude chain so
+		// the rendered query still carries the full path from the root.
+		for _, b := range sub.Buckets {
+			b.Includes = append(append([]string{}, group.Includes...), b.Includes...)
+			b.Excludes = append(append([]string{}, group.Excludes...), b.Excludes...)
+			final.Buckets = append(final.Buckets, b)
+		}
+		for _, u := range sub.Unresolved {
+			u.Includes = append(append([]string{}, group.Includes...), u.Includes...)
+			u.Excludes = append(append([]string{}, group.Excludes...), u.Excludes...)
+			final.Unresolved = append(final.Unresolved, u)
+		}
+	}
+	return final
 }
 
 // corpusVeto builds a split.VetoFunc over a set of document texts: a keyword
@@ -548,51 +654,127 @@ func corpusVeto(texts []string, baseInc, baseExc []string) split.VetoFunc {
 	if len(texts) == 0 {
 		return nil
 	}
-	lower := make([]string, 0, len(texts))
-	for _, t := range texts {
-		lower = append(lower, strings.ToLower(t))
-	}
+	lower := lowerAll(texts)
 	lbaseInc := lowerAll(baseInc)
 	lbaseExc := lowerAll(baseExc)
 	return func(inc, exc []string, kw string) bool {
-		lkw := strings.ToLower(kw)
-		subset, with := 0, 0
-		for _, t := range lower {
-			ok := true
-			for _, w := range lbaseInc {
-				if !strings.Contains(t, w) {
-					ok = false
-					break
-				}
-			}
-			for _, w := range inc {
-				if ok && !strings.Contains(t, strings.ToLower(w)) {
-					ok = false
-				}
-			}
-			for _, w := range lbaseExc {
-				if ok && strings.Contains(t, w) {
-					ok = false
-				}
-			}
-			for _, w := range exc {
-				if ok && strings.Contains(t, strings.ToLower(w)) {
-					ok = false
-				}
-			}
-			if !ok {
-				continue
-			}
-			subset++
-			if strings.Contains(t, lkw) {
-				with++
-			}
-		}
+		subset, with := conditionedCounts(lower, lbaseInc, lbaseExc, inc, exc, kw)
 		if subset == 0 {
 			return true // no corpus evidence for this branch — cannot prove
 		}
 		return with > 0 && float64(with)/float64(subset) <= 0.75
 	}
+}
+
+// corpusRank builds a split.RankFunc that reorders a node's candidates by
+// their CONDITIONAL Balance over the known corpus subset satisfying the
+// branch's predicates (baseInc/baseExc, then the node's own inc/exc) — best
+// splitter of THIS branch first. This is the fix for a keyword that ranks
+// well globally (e.g. "learning", "data") but is near-uniform inside a
+// branch already conditioned on another term (e.g. "AND neural networks",
+// where most papers mention both): its conditional Balance is low even
+// though its global rank is high, so it must not keep monopolizing the
+// limited probesPerNode budget ahead of a globally-weaker but
+// branch-discriminating term (e.g. "bayesian"). The corpus scan is the same
+// data corpusVeto already reads — no extra Scholar searches.
+//
+// A candidate the corpus proves cannot divide the branch at all (with=0 or
+// with=subset) sorts last rather than being dropped, so ResolveOverCap's
+// own veto (if any) or live probe still gets the final say — corpusRank only
+// reorders, it never removes a candidate the caller didn't already veto.
+// phraseBoost multiplies a multi-word candidate's conditional-Balance sort
+// score at every branch, matching partition.Options.PhraseBoost — it never
+// affects resolveNode's own minBalance gate (that still checks the real
+// live-probed Balance), only which eligible candidate gets probed first.
+func corpusRank(texts []string, baseInc, baseExc []string, phraseBoost float64) split.RankFunc {
+	if len(texts) == 0 {
+		return nil
+	}
+	if phraseBoost <= 0 {
+		phraseBoost = 1.0
+	}
+	lower := lowerAll(texts)
+	lbaseInc := lowerAll(baseInc)
+	lbaseExc := lowerAll(baseExc)
+	return func(inc, exc []string, candidates []string) []string {
+		type scored struct {
+			kw    string
+			score float64
+		}
+		out := make([]scored, len(candidates))
+		for i, kw := range candidates {
+			subset, with := conditionedCounts(lower, lbaseInc, lbaseExc, inc, exc, kw)
+			b := -1.0 // no corpus evidence: sort after every scored candidate but preserve relative order among themselves via a stable sort
+			if subset > 0 {
+				b = subsetBalanceOf(with, subset-with)
+				if strings.Contains(kw, " ") {
+					b *= phraseBoost
+				}
+			}
+			out[i] = scored{kw: kw, score: b}
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
+		ranked := make([]string, len(out))
+		for i, s := range out {
+			ranked[i] = s.kw
+		}
+		return ranked
+	}
+}
+
+// conditionedCounts scans lower for the subset of texts satisfying
+// baseInc/baseExc (already lowercased) plus the node's own inc/exc, and
+// returns that subset's size and how many of those texts also contain kw.
+func conditionedCounts(lower, lbaseInc, lbaseExc, inc, exc []string, kw string) (subset, with int) {
+	lkw := strings.ToLower(kw)
+	for _, t := range lower {
+		ok := true
+		for _, w := range lbaseInc {
+			if !strings.Contains(t, w) {
+				ok = false
+				break
+			}
+		}
+		for _, w := range inc {
+			if ok && !strings.Contains(t, strings.ToLower(w)) {
+				ok = false
+			}
+		}
+		for _, w := range lbaseExc {
+			if ok && strings.Contains(t, w) {
+				ok = false
+			}
+		}
+		for _, w := range exc {
+			if ok && strings.Contains(t, strings.ToLower(w)) {
+				ok = false
+			}
+		}
+		if !ok {
+			continue
+		}
+		subset++
+		if strings.Contains(t, lkw) {
+			with++
+		}
+	}
+	return subset, with
+}
+
+// subsetBalanceOf is the paper's Balance measure restricted to a branch's
+// conditioned subset: 1.0 for an even split of that subset, ~0 for a
+// lopsided one.
+func subsetBalanceOf(with, without int) float64 {
+	total := with + without
+	if total == 0 {
+		return 0
+	}
+	smaller := min(without, with)
+	b := float64(smaller) / (float64(total) / 2.0)
+	if b > 1 {
+		return 1
+	}
+	return b
 }
 
 func lowerAll(ws []string) []string {
@@ -662,6 +844,21 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 // shared probe budget before driving an actual browser search. When the budget
 // is spent it reports ok=false (no search) so planning can end gracefully.
 func (c *Crawler) budgetCount(ctx context.Context, budget *probeBudget, query string, yearFrom, yearTo int) (int, bool) {
+	// Checked before every candidate, cached or not: without this, a
+	// cancelled ctx (Ctrl+C during -plan) only ever surfaces once a browser
+	// call itself happens to fail, and the caller (resolveNode/resolveYear)
+	// just treats that as "this candidate didn't count" and moves on to the
+	// NEXT candidate — burning further searches after shutdown was already
+	// requested instead of stopping. A cache hit is still served (looked up
+	// with a fresh context: QueryRowContext on the caller's cancelled ctx
+	// would fail the local SQLite read too, and there is no browser work or
+	// reason to block a cheap cache read on shutdown).
+	if ctx.Err() != nil {
+		if n, ok, err := c.db.GetCachedCount(context.Background(), query, yearFrom, yearTo); err == nil && ok {
+			return n, true
+		}
+		return 0, false
+	}
 	if budget.exhausted() {
 		return 0, false
 	}
@@ -787,9 +984,16 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			t.Page = committedNext
 			c.log.Info(fmt.Sprintf("task %d: reconciled resume page to %d", t.ID, committedNext))
 		}
+		if err := ctx.Err(); err != nil {
+			c.log.Info(fmt.Sprintf("conference %d: shutdown requested, stopping before task %d", confID, t.ID))
+			return err
+		}
 		c.br.PauseBetweenSearches()
 		if err := c.crawlTask(ctx, *t); err != nil {
 			c.log.Info(fmt.Sprintf("task %d failed: %v", t.ID, err))
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 		}
 	}
 	return nil
@@ -814,10 +1018,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	}
 	c.log.Info(fmt.Sprintf("task %d: %q [%d-%d] from page %d", task.ID, task.Query, task.YearFrom, task.YearTo, task.Page))
 
-	page := task.Page
-	if page < 1 {
-		page = 1
-	}
+	page := max(task.Page, 1)
 	if err := c.issueSearch(task); err != nil {
 		_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
 		return err
@@ -947,6 +1148,17 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 				fmt.Sprintf("hit %d-page cap (estimate %d)", maxPages, task.TotalEstimate))
 			c.log.Info(fmt.Sprintf("task %d: page cap %d reached -> needs_split", task.ID, maxPages))
 			return nil
+		}
+
+		// Shutdown is only ever observed here, right after the just-scraped
+		// page's CommitPage has durably saved it: the task is left 'running'
+		// and CrawlConference's ResetStaleRunning flips it back to 'pending' on
+		// the next start, so resume continues from the committed page pointer
+		// with nothing lost. Checking mid-page (before CommitPage) would risk
+		// abandoning a page Scholar already served but never persisted.
+		if err := ctx.Err(); err != nil {
+			c.log.Info(fmt.Sprintf("task %d: shutdown requested, stopping after page %d", task.ID, page))
+			return err
 		}
 
 		// Paginate: occasional reading scroll, human pause, then click Next.

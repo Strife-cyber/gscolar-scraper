@@ -24,10 +24,10 @@ import (
 // Page is the parsed view of one results page.
 type Page struct {
 	Items     []model.ResultItem
+	Count     int
 	HasNext   bool
 	Blocked   bool
 	NoResults bool // Scholar's "did not match any articles" empty state
-	Count     int
 	HasCount  bool
 }
 

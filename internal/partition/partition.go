@@ -73,12 +73,61 @@ type textOf func(d Doc) string
 //
 // Membership is a case-insensitive substring test against the document text,
 // matching Scholar's semantics.
+//
+// Partition applies no minimum-balance floor: the top-scoring candidate at
+// each node is used even when every candidate is lopsided there (e.g. a word
+// that is a near-superset of an ancestor phrase predicate, such as "network"
+// inside a branch already conditioned on "neural networks" — most of that
+// branch's papers contain "network" too, so it barely divides it further).
+// Callers that want a quality floor should use PartitionMinBalance instead.
 func Partition(docs []Doc, keywords []string, text textOf, limit int) Outcome {
+	return PartitionMinBalance(docs, keywords, text, limit, 0)
+}
+
+// PartitionMinBalance is Partition with a minimum conditional Balance floor:
+// at each over-cap node, only candidates whose subsetBalance (computed
+// against THAT node's subset, not the whole corpus) clears minBalance are
+// eligible to be chosen. If every candidate falls below the floor, the node
+// is treated exactly like "no candidate divides it" — it lands in
+// Unresolved rather than being split on a near-useless predicate. This is
+// the fix for a chained pair like "neural networks" + "network": the second
+// term's conditional balance inside the first term's branch is close to 0
+// (nearly every paper in that branch already contains "network"), so it must
+// not be accepted just because it is technically the least-bad option among
+// equally poor candidates. minBalance <= 0 disables the floor (same as
+// Partition).
+func PartitionMinBalance(docs []Doc, keywords []string, text textOf, limit int, minBalance float64) Outcome {
+	return PartitionOpts(docs, keywords, text, limit, Options{MinBalance: minBalance})
+}
+
+// Options tunes PartitionOpts.
+type Options struct {
+	// MinBalance is the conditional-Balance floor; see PartitionMinBalance.
+	MinBalance float64
+	// PhraseBoost multiplies a multi-word candidate's conditional Balance
+	// at EVERY node of the recursion (not just the top-level candidate
+	// ranking) before it is compared against other candidates for that
+	// node. 1.0 (or <= 0) leaves scoring unboosted. A boost > 1 makes a
+	// phrase win ties against an equally-good word at any branch depth, and
+	// can even let a slightly weaker phrase outscore a slightly better word
+	// — the point being that a quoted phrase is a stricter, less ambiguous
+	// Scholar predicate than a bare word, so it is worth preferring even at
+	// a small quality cost, especially several branches deep where reaching
+	// a two-phrase chain is otherwise rare (a word tends to win each
+	// individual node's ties simply because there are more single-word
+	// candidates than phrase candidates competing).
+	PhraseBoost float64
+}
+
+// PartitionOpts is Partition/PartitionMinBalance with full control over
+// scoring: see Options.
+func PartitionOpts(docs []Doc, keywords []string, text textOf, limit int, opts Options) Outcome {
 	// Deterministic document order.
 	sorted := append([]Doc(nil), docs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Hash < sorted[j].Hash })
 
 	kwBits := make([]*bitset, len(keywords))
+	isPhrase := make([]bool, len(keywords))
 	for k := range keywords {
 		bs := newBitset(len(sorted))
 		for i, d := range sorted {
@@ -87,14 +136,20 @@ func Partition(docs []Doc, keywords []string, text textOf, limit int) Outcome {
 			}
 		}
 		kwBits[k] = bs
+		isPhrase[k] = strings.Contains(keywords[k], " ")
+	}
+
+	phraseBoost := opts.PhraseBoost
+	if phraseBoost <= 0 {
+		phraseBoost = 1.0
 	}
 
 	var out Outcome
-	split(&out, newBitsetFull(len(sorted)), nil, nil, sorted, keywords, kwBits, limit)
+	split(&out, newBitsetFull(len(sorted)), nil, nil, sorted, keywords, kwBits, isPhrase, limit, opts.MinBalance, phraseBoost)
 	return out
 }
 
-func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords []string, kwBits []*bitset, limit int) {
+func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords []string, kwBits []*bitset, isPhrase []bool, limit int, minBalance, phraseBoost float64) {
 	size := set.count()
 	if size == 0 {
 		return
@@ -111,7 +166,16 @@ func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords 
 	// Score every candidate on how evenly it divides THIS group — the child
 	// competes on the parent's subset, so a keyword correlated with an ancestor
 	// predicate is near-uniform inside it and loses to a conditionally
-	// independent one. Ties break to the earlier keyword in ranked order.
+	// independent one. Ties break to the earlier keyword in ranked order. A
+	// candidate below minBalance is excluded from winning even if it is the
+	// least-bad option: "network" scoring 0.08 inside a branch already
+	// conditioned on "neural networks" must not be accepted just because
+	// nothing else in the list scored higher — it barely divides the branch
+	// either way. The floor is always checked against the TRUE (unboosted)
+	// Balance so a genuinely degenerate phrase can never be waved through by
+	// the boost; only the winner comparison among already-eligible
+	// candidates uses the boosted score, so phraseBoost governs which
+	// GOOD splitter wins a node, not whether a bad one is allowed to.
 	best := -1.0
 	bestK := -1
 	var bestWith, bestWithout *bitset
@@ -122,12 +186,21 @@ func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords 
 		if wc == 0 || woc == 0 {
 			continue // this keyword does not divide the group
 		}
-		if b := subsetBalance(wc, woc); b > best {
-			best, bestK, bestWith, bestWithout = b, k, with, without
+		b := subsetBalance(wc, woc)
+		if b < minBalance {
+			continue
+		}
+		scored := b
+		if isPhrase[k] {
+			scored *= phraseBoost
+		}
+		if scored > best {
+			best, bestK, bestWith, bestWithout = scored, k, with, without
 		}
 	}
 	if bestK < 0 {
-		// No remaining keyword divides this group: an atom floor.
+		// No remaining keyword divides this group above the floor: an atom
+		// floor, same as "nothing divides it at all".
 		out.Unresolved = append(out.Unresolved, Bucket{
 			Papers:   hashesOf(sorted, set),
 			Includes: inc,
@@ -136,8 +209,8 @@ func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords 
 		return
 	}
 
-	split(out, bestWith, appendPred(inc, keywords[bestK]), exc, sorted, keywords, kwBits, limit)
-	split(out, bestWithout, inc, appendPred(exc, keywords[bestK]), sorted, keywords, kwBits, limit)
+	split(out, bestWith, appendPred(inc, keywords[bestK]), exc, sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost)
+	split(out, bestWithout, inc, appendPred(exc, keywords[bestK]), sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost)
 }
 
 // subsetBalance is the paper's Balance restricted to the current group: 1.0
@@ -147,10 +220,7 @@ func subsetBalance(with, without int) float64 {
 	if total == 0 {
 		return 0
 	}
-	smaller := with
-	if without < smaller {
-		smaller = without
-	}
+	smaller := min(without, with)
 	b := float64(smaller) / (float64(total) / 2.0)
 	if b > 1 {
 		return 1
@@ -168,7 +238,7 @@ func appendPred(pred []string, kw string) []string {
 
 func hashesOf(sorted []Doc, set *bitset) []string {
 	out := make([]string, 0, set.count())
-	for i := 0; i < len(sorted); i++ {
+	for i := range sorted {
 		if set.get(i) {
 			out = append(out, sorted[i].Hash)
 		}
@@ -186,17 +256,17 @@ type bitset struct {
 	n     int
 }
 
-func newBitset(n int) *bitset      { return &bitset{words: make([]uint64, (n+63)/64), n: n} }
+func newBitset(n int) *bitset { return &bitset{words: make([]uint64, (n+63)/64), n: n} }
 func newBitsetFull(n int) *bitset {
 	bs := newBitset(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		bs.set(i)
 	}
 	return bs
 }
 
-func (b *bitset) set(i int)       { b.words[i>>6] |= 1 << uint(i&63) }
-func (b *bitset) get(i int) bool  { return b.words[i>>6]&(1<<uint(i&63)) != 0 }
+func (b *bitset) set(i int)      { b.words[i>>6] |= 1 << uint(i&63) }
+func (b *bitset) get(i int) bool { return b.words[i>>6]&(1<<uint(i&63)) != 0 }
 func (b *bitset) count() int {
 	c := 0
 	for _, w := range b.words {

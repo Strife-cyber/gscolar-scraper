@@ -116,23 +116,24 @@ func main() {
 	}
 	c := crawl.New(cfg, d, br, logger)
 
-	// Catch Ctrl+C / SIGTERM so a mid-crawl shutdown can flip any tasks left
-	// in 'running' back to 'pending' instead of leaving them stale until the
-	// next CrawlConference call.
-	sigCh := make(chan os.Signal, 1)
+	// Catch Ctrl+C / SIGTERM by cancelling ctx: crawlTask/CrawlConference only
+	// observe it at safe checkpoints (right after a page's CommitPage has
+	// durably saved it), so the current page's already-scraped results are
+	// never abandoned — the task is left 'running' and resumes cleanly from
+	// its committed page pointer next time. A second signal is a genuine
+	// "stop now" escape hatch (e.g. a hung browser call ctx cannot interrupt)
+	// and force-exits immediately, same as before.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
-
-	// A signal caught while a conference is mid-flight is only seen by the
-	// loop's select after the current conference finishes, so also watch on a
-	// second channel: reset any 'running' tasks left stale by the in-flight
-	// conference, close the DB, and exit promptly.
-	sigForce := make(chan os.Signal, 1)
-	signal.Notify(sigForce, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigForce)
 	go func() {
-		sig := <-sigForce
-		logger.Info(fmt.Sprintf("received %v: resetting stale 'running' tasks to pending", sig))
+		sig := <-sigCh
+		logger.Info(fmt.Sprintf("received %v, shutting down after the current page (press again to force-quit)", sig))
+		cancel()
+		sig = <-sigCh
+		logger.Info(fmt.Sprintf("received %v again: force-quitting", sig))
 		for _, conf := range confs {
 			if err := d.ResetStaleRunning(context.Background(), conf.ID); err != nil {
 				logger.Info(fmt.Sprintf("reset running tasks %s: %v", conf.Name, err))
@@ -144,15 +145,9 @@ func main() {
 		os.Exit(130)
 	}()
 
-	shutdown := false
 	for _, conf := range confs {
-		select {
-		case sig := <-sigCh:
-			logger.Info(fmt.Sprintf("received %v, shutting down", sig))
-			shutdown = true
-		default:
-		}
-		if shutdown {
+		if err := ctx.Err(); err != nil {
+			logger.Info(fmt.Sprintf("shutdown requested, stopping before conference %s", conf.Name))
 			break
 		}
 
@@ -172,7 +167,7 @@ func main() {
 			}
 			logger.Info(fmt.Sprintf("%s tasks generated from DB: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need))
 		}
-		if *doPlan {
+		if *doPlan && ctx.Err() == nil {
 			need, err := c.PlanConference(ctx, conf)
 			if err != nil {
 				logger.Info(fmt.Sprintf("plan %s: %v", conf.Name, err))
@@ -180,7 +175,7 @@ func main() {
 			}
 			logger.Info(fmt.Sprintf("%s planned: %d leaves (%d need re-split)", conf.Name, countLeaves(ctx, d, conf.ID), need))
 		}
-		if *doCrawl {
+		if *doCrawl && ctx.Err() == nil {
 			if err := c.CrawlConference(ctx, conf.ID); err != nil {
 				logger.Info(fmt.Sprintf("crawl %s: %v", conf.Name, err))
 				continue

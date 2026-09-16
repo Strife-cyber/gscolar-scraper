@@ -53,6 +53,18 @@ type Options struct {
 	BigramSep int
 	// MaxCandidates caps how many scored candidates are returned, best first.
 	MaxCandidates int
+	// PhraseBoost multiplies a multi-word candidate's ranking score before
+	// Mine/MineIDF sort by it (1.0 = no effect, the default). A phrase that
+	// clears MinBalance/MinFreq is a stronger splitter to send to Scholar than
+	// a same-scoring single word: Scholar's quoted "..." phrase match is a
+	// stricter, less ambiguous predicate than a bare word (which can match
+	// unrelated senses or substrings across the corpus), so it is more likely
+	// to reproduce the offline Balance when verified live. A boost >1 nudges
+	// phrases ahead of comparably-scored single words without overriding a
+	// clearly better word; it does not affect the score used for MinBalance
+	// filtering, only the sort order used to pick which candidates get probed
+	// or partitioned on first.
+	PhraseBoost float64
 }
 
 // Candidate is one mined keyword with its offline discriminative statistics.
@@ -77,6 +89,7 @@ func DefaultOptions() Options {
 		BigramSep:       2,
 		MaxNGram:        1,
 		MaxCandidates:   200,
+		PhraseBoost:     1.0,
 	}
 }
 
@@ -135,6 +148,20 @@ var stopWords = map[string]bool{
 	"below": true, "through": true, "while": true, "also": true,
 	"new": true, "one": true, "two": true, "three": true, "use": true,
 	"used": true, "get": true, "got": true, "make": true, "made": true,
+	// discourse / transition connectives: common in academic writing
+	// (abstracts and snippets specifically) purely as prose glue, not
+	// topical content — "however" split evenly across a corpus is a
+	// writing-style artifact, not a real splitter, and must never be
+	// offered as a candidate.
+	"however": true, "moreover": true, "furthermore": true, "therefore": true,
+	"thus": true, "hence": true, "nevertheless": true, "nonetheless": true,
+	"although": true, "though": true, "despite": true, "whereas": true,
+	"meanwhile": true, "additionally": true, "consequently": true,
+	"accordingly": true, "otherwise": true, "instead": true, "besides": true,
+	"unless": true, "since": true, "because": true, "indeed": true,
+	"specifically": true, "particularly": true, "overall": true,
+	"finally": true, "firstly": true, "secondly": true, "lastly": true,
+	"regardless": true, "still": true,
 }
 
 func isDigits(s string) bool {
@@ -144,15 +171,6 @@ func isDigits(s string) bool {
 		}
 	}
 	return true
-}
-
-// doc holds one paper's normalized, deduplicated token streams.
-type doc struct {
-	title map[string]bool
-	snip  map[string]bool
-	// titleList and snipList keep order so bigram adjacency is testable.
-	titleList []string
-	snipList  []string
 }
 
 // Mine scores every candidate keyword that appears in the corpus and returns
@@ -182,51 +200,45 @@ func Mine(papers []Paper, o Options) []Candidate {
 	if o.Bigrams && o.MaxNGram < 2 {
 		o.MaxNGram = 2 // legacy flag: contiguous bigram phrases
 	}
+	if o.PhraseBoost <= 0 {
+		o.PhraseBoost = 1.0
+	}
 
-	docs := make([]doc, 0, len(papers))
+	// Document frequency is accumulated in a single pass per document: every
+	// candidate (word or n-gram phrase) that appears in a doc increments a
+	// shared counter exactly once, via a per-doc dedup set. This replaces a
+	// two-phase generate-global-vocabulary-then-rescan-every-doc-per-candidate
+	// approach, which was O(|candidates| x |docs| x |doc length|) — with
+	// mine_max_ngram enabled over a large corpus, the candidate vocabulary
+	// itself is tens of thousands of phrases, so rescanning every doc per
+	// candidate dominated startup time. This pass is O(|docs| x |doc length| x
+	// MaxNGram), independent of vocabulary size.
+	total := 0
+	df := map[string]int{}
+	seen := map[string]bool{}
 	for _, p := range papers {
 		if p.Hash == "" {
 			continue
 		}
-		title := Tokenize(p.Title)
-		snip := Tokenize(p.Snippet)
-		d := doc{
-			title:     toSet(title),
-			snip:      toSet(snip),
-			titleList: tokenizeAll(p.Title),
-			snipList:  tokenizeAll(p.Snippet),
+		total++
+		for k := range seen {
+			delete(seen, k)
 		}
-		docs = append(docs, d)
-	}
-
-	// Candidate vocabulary: every content token, plus contiguous n-gram
-	// phrases when MaxNGram > 1. Phrases are built on the unfiltered token
-	// stream so they appear verbatim in the text (a mined phrase must be a
-	// phrase Scholar's "..." operator can match), but junk is pruned by
-	// requiring a content word at both ends.
-	words := map[string]bool{}
-	for _, d := range docs {
-		for w := range d.title {
-			words[w] = true
-		}
-		for w := range d.snip {
-			words[w] = true
-		}
+		titleList := tokenizeAll(p.Title)
+		snipList := tokenizeAll(p.Snippet)
+		addContentTokens(titleList, seen)
+		addContentTokens(snipList, seen)
 		if o.MaxNGram > 1 {
-			ngrams(d.titleList, o.MaxNGram, func(p string) { words[p] = true })
-			ngrams(d.snipList, o.MaxNGram, func(p string) { words[p] = true })
+			ngrams(titleList, o.MaxNGram, func(g string) { seen[g] = true })
+			ngrams(snipList, o.MaxNGram, func(g string) { seen[g] = true })
+		}
+		for w := range seen {
+			df[w]++
 		}
 	}
 
-	total := len(docs)
-	cands := make([]Candidate, 0, len(words))
-	for w := range words {
-		with := 0
-		for _, d := range docs {
-			if inDoc(d, w, o) {
-				with++
-			}
-		}
+	cands := make([]Candidate, 0, len(df))
+	for w, with := range df {
 		without := total - with
 		balance := balanceOf(with, without)
 		if balance < o.MinBalance || with < o.MinFreq {
@@ -245,8 +257,9 @@ func Mine(papers []Paper, o Options) []Candidate {
 	}
 
 	sort.Slice(cands, func(i, j int) bool {
-		if cands[i].Balance != cands[j].Balance {
-			return cands[i].Balance > cands[j].Balance
+		si, sj := boostedScore(cands[i], cands[i].Balance, o.PhraseBoost), boostedScore(cands[j], cands[j].Balance, o.PhraseBoost)
+		if si != sj {
+			return si > sj
 		}
 		if cands[i].With+cands[i].Without != cands[j].With+cands[j].Without {
 			return cands[i].With+cands[i].Without > cands[j].With+cands[j].Without
@@ -261,6 +274,17 @@ func Mine(papers []Paper, o Options) []Candidate {
 		cands = cands[:o.MaxCandidates]
 	}
 	return cands
+}
+
+// boostedScore multiplies base (Balance for Mine, Balance*IDF for MineIDF) by
+// phraseBoost when the candidate is a multi-word phrase. Boosting only the
+// sort key — not Balance/IDF themselves — keeps MinBalance filtering and
+// reported stats unaffected by the boost.
+func boostedScore(c Candidate, base, phraseBoost float64) float64 {
+	if phraseBoost != 1.0 && strings.Contains(c.Keyword, " ") {
+		return base * phraseBoost
+	}
+	return base
 }
 
 // MineIDF is Mine with an inverse-document-frequency term computed over a
@@ -286,8 +310,8 @@ func MineIDF(target []Paper, background []string, o Options) []Candidate {
 		cands[i].IDF = idfOf(cands[i].Keyword, df, n, rawBg)
 	}
 	sort.Slice(cands, func(i, j int) bool {
-		si := cands[i].Balance * cands[i].IDF
-		sj := cands[j].Balance * cands[j].IDF
+		si := boostedScore(cands[i], cands[i].Balance*cands[i].IDF, o.PhraseBoost)
+		sj := boostedScore(cands[j], cands[j].Balance*cands[j].IDF, o.PhraseBoost)
 		if si != sj {
 			return si > sj
 		}
@@ -344,20 +368,36 @@ func idfOf(kw string, df map[string]int, nDocs float64, rawBg []string) float64 
 }
 
 // dedupSubstrings drops a candidate that is a strict substring of an already
-// higher-ranked candidate, keeping only the more specific term. Two near-
-// identical keywords ("model"/"models") are redundant — they partition the same
-// docs with a marginal difference, so including both wastes a chain/probe slot
-// and, on a small biased sample, lets a generic high-frequency word (e.g.
-// "large") masquerade as a splitter next to its more specific form. Keeping the
-// best-ranked (higher Balance) one and dropping its substrings is deterministic
-// and cheap (candidates are already bounded by MaxCandidates).
+// higher-ranked candidate OF THE SAME TOKEN LENGTH, keeping only the more
+// specific term. Two near-identical keywords ("model"/"models") are
+// redundant — they partition the same docs with a marginal difference, so
+// including both wastes a chain/probe slot and, on a small biased sample,
+// lets a generic high-frequency word (e.g. "large") masquerade as a
+// splitter next to its more specific form.
+//
+// The token-length guard is essential: without it, a single word that is a
+// substring of some longer, higher-ranked PHRASE gets dropped globally too
+// ("neural" vanishes because "graph neural networks" outranks it), which
+// silently destroys the single-word half of the candidate pool. A phrase is
+// never deduped against its component words — "graph neural networks"
+// covers a strictly smaller, more specific set of papers than "neural"
+// alone, so both are independently useful splitters and must both survive.
+// Keeping the best-ranked (higher Balance) one among same-length candidates
+// and dropping its substrings is deterministic and cheap (candidates are
+// already bounded by MaxCandidates).
 func dedupSubstrings(cands []Candidate) []Candidate {
 	out := make([]Candidate, 0, len(cands))
 	for i, c := range cands {
 		dup := false
+		cLen := len(strings.Fields(c.Keyword))
 		for j := i + 1; j < len(cands); j++ {
-			// cands[j] is strictly worse or equal; a longer, better-or-equal
-			// keyword that contains c as a strict substring subsumes it.
+			// cands[j] is strictly worse or equal; a same-length,
+			// better-or-equal keyword that contains c as a strict substring
+			// subsumes it. Different token lengths split differently and are
+			// never considered duplicates of each other.
+			if len(strings.Fields(cands[j].Keyword)) != cLen {
+				continue
+			}
 			if len(cands[j].Keyword) > len(c.Keyword) && strings.Contains(cands[j].Keyword, c.Keyword) {
 				dup = true
 				break
@@ -370,16 +410,16 @@ func dedupSubstrings(cands []Candidate) []Candidate {
 	return out
 }
 
-// inDoc reports whether doc d contains candidate kw. A phrase candidate
-// (tokens joined by spaces, e.g. "neural network") matches on contiguous
-// occurrence in the raw token stream — the same semantics Scholar applies to
-// a quoted phrase. A single word matches its token sets.
-func inDoc(d doc, kw string, o Options) bool {
-	if strings.Contains(kw, " ") {
-		seq := strings.Fields(kw)
-		return containsSeq(d.titleList, seq) || containsSeq(d.snipList, seq)
+// addContentTokens marks every content token (length >= 3, not a stopword,
+// not pure digits) of toks as present in seen — the single-word half of a
+// document's candidate set, matching Tokenize's filter but without allocating
+// an intermediate slice.
+func addContentTokens(toks []string, seen map[string]bool) {
+	for _, w := range toks {
+		if contentToken(w) {
+			seen[w] = true
+		}
 	}
-	return d.title[kw] || d.snip[kw]
 }
 
 // tokenizeAll is Tokenize without the content filters: stopwords and short
@@ -399,26 +439,6 @@ func tokenizeAll(s string) []string {
 		toks = append(toks, w)
 	}
 	return toks
-}
-
-// containsSeq reports whether toks contains seq as a contiguous run.
-func containsSeq(toks, seq []string) bool {
-	if len(seq) == 0 || len(seq) > len(toks) {
-		return false
-	}
-	for i := 0; i+len(seq) <= len(toks); i++ {
-		match := true
-		for j := range seq {
-			if toks[i+j] != seq[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
 }
 
 // ngrams yields every contiguous n-gram of 2..maxN tokens over toks whose
@@ -448,17 +468,12 @@ func toSet(toks []string) map[string]bool {
 	return m
 }
 
-
-
 func balanceOf(with, without int) float64 {
 	total := with + without
 	if total == 0 {
 		return 0
 	}
-	smaller := with
-	if without < smaller {
-		smaller = without
-	}
+	smaller := min(without, with)
 	b := float64(smaller) / (float64(total) / 2.0)
 	if b > 1 {
 		return 1

@@ -1,6 +1,7 @@
 package partition
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -22,16 +23,16 @@ func docs() []Doc {
 		membership[out[len(out)-1].Hash] = text
 		n++
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		assign("alpha beta")
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		assign("alpha")
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		assign("beta")
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		assign("common only")
 	}
 	return out
@@ -145,15 +146,15 @@ func TestPartitionPicksConditionallyBalancedChild(t *testing.T) {
 	}
 	// 10 "alpha" docs: "loppy" is lopsided inside the subset (9/1) while "even"
 	// splits it exactly in half (5/5).
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		assign("alpha loppy even")
 	}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		assign("alpha loppy")
 	}
 	assign("alpha")
 	// 10 docs with none of the keywords: an unresolved atom floor.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		assign("plain")
 	}
 	out := Partition(ds, []string{"alpha", "loppy", "even"}, text, 5)
@@ -195,7 +196,7 @@ func TestPartitionPicksConditionallyBalancedChild(t *testing.T) {
 func TestPartitionInfeasible(t *testing.T) {
 	var ds []Doc
 	membership = map[string]string{}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		d := Doc{Hash: "same" + string(rune('0'+i)), Year: 2020}
 		ds = append(ds, d)
 		membership[d.Hash] = "convolutional network" // every doc identical
@@ -256,5 +257,136 @@ func TestPartitionNoDocs(t *testing.T) {
 	out := Partition(nil, []string{"alpha"}, func(d Doc) string { return "" }, 5)
 	if len(out.Buckets) != 0 || len(out.Unresolved) != 0 {
 		t.Fatalf("empty corpus should produce nothing, got %+v", out)
+	}
+}
+
+// TestPartitionMinBalanceRejectsNearDegenerateChain reproduces the real bug:
+// "neural networks" splits the corpus cleanly (50/50), but "network" is a
+// near-superset of "neural networks" — almost every paper in the
+// "neural networks" branch also contains "network" alone, so chaining it
+// there barely divides anything further (90/10 inside that branch). Plain
+// Partition has no quality floor and picks it anyway because SOME candidate
+// must win; PartitionMinBalance must instead treat that branch as
+// unresolved rather than emit a near-useless "AND neural networks AND
+// network" leaf.
+func TestPartitionMinBalanceRejectsNearDegenerateChain(t *testing.T) {
+	var docs []Doc
+	mem := map[string]string{}
+	add := func(hash, text string) {
+		docs = append(docs, Doc{Hash: hash, Year: 2020})
+		mem[hash] = text
+	}
+	txt := func(d Doc) string { return mem[d.Hash] }
+
+	// 20 papers total. "neural networks" covers exactly the first 10 (clean
+	// 10/10 split). Within that branch, "network" covers 9 of the 10 (a
+	// near-degenerate 9/1 split — conditional balance ~0.2) because it is a
+	// near-superset of the phrase; the other 10 papers never mention
+	// "network" at all so the whole-corpus stats would look fine, but the
+	// CONDITIONAL split inside the branch is what matters.
+	for i := 0; i < 9; i++ {
+		add(fmt.Sprintf("nn-both-%d", i), "neural networks and network topology")
+	}
+	add("nn-solo", "neural networks only, no other term")
+	for i := 0; i < 10; i++ {
+		add(fmt.Sprintf("other-%d", i), "gradient descent optimization")
+	}
+
+	keywords := []string{"neural networks", "network"}
+	// limit=8 forces both the root (20 docs) and the "neural networks" branch
+	// (10 docs) to look for a divider.
+	out := PartitionMinBalance(docs, keywords, txt, 8, 0.3)
+
+	for _, b := range out.Buckets {
+		hasPhrase := false
+		hasWord := false
+		for _, inc := range b.Includes {
+			if inc == "neural networks" {
+				hasPhrase = true
+			}
+			if inc == "network" {
+				hasWord = true
+			}
+		}
+		if hasPhrase && hasWord {
+			t.Errorf("bucket chained 'neural networks' AND 'network' despite failing the minBalance floor: %+v", b)
+		}
+	}
+	// The "neural networks" branch (10 docs, over the limit=8 cap) must
+	// surface as Unresolved since "network" is its only candidate and it
+	// fails the floor — not silently accepted as a near-useless split.
+	foundUnresolvedPhraseBranch := false
+	for _, u := range out.Unresolved {
+		for _, inc := range u.Includes {
+			if inc == "neural networks" {
+				foundUnresolvedPhraseBranch = true
+			}
+		}
+	}
+	if !foundUnresolvedPhraseBranch {
+		t.Errorf("expected the 'neural networks' branch to be Unresolved (no candidate clears minBalance), got buckets=%+v unresolved=%+v", out.Buckets, out.Unresolved)
+	}
+}
+
+// TestPartitionOptsPhraseBoostBreaksTies: at a node where a phrase and a
+// word split the group EQUALLY well (identical conditional Balance),
+// PhraseBoost must make the phrase win instead of the word — this is the
+// lever for getting more multi-phrase chains: without a boost, a tie always
+// goes to whichever candidate is earlier in the ranked list, and since a
+// corpus typically has far more candidate WORDS than PHRASES, a word wins
+// most ties by sheer numeric advantage even when a phrase would split just
+// as well. Boosting phrase scores at EVERY node (not just the top-level
+// mining rank) lets a phrase win the first split, and then win again at the
+// next branch down, producing the "two phrases chained" result.
+func TestPartitionOptsPhraseBoostBreaksTies(t *testing.T) {
+	var docs []Doc
+	mem := map[string]string{}
+	add := func(hash, text string) {
+		docs = append(docs, Doc{Hash: hash, Year: 2020})
+		mem[hash] = text
+	}
+	txt := func(d Doc) string { return mem[d.Hash] }
+
+	// "alpha" (word) and "alpha beta" (phrase) split the 12-doc corpus
+	// IDENTICALLY: both cover exactly the same 6 docs (every "alpha" doc here
+	// also says "alpha beta"), so their conditional Balance is tied at the
+	// root.
+	for i := 0; i < 6; i++ {
+		add(fmt.Sprintf("a-%d", i), "alpha beta")
+	}
+	for i := 0; i < 6; i++ {
+		add(fmt.Sprintf("b-%d", i), "gamma delta")
+	}
+
+	// Without a boost, "alpha" (ranked first) wins the tie. limit=6 so the
+	// root's 6/6 split alone resolves both sides.
+	plain := PartitionOpts(docs, []string{"alpha", "alpha beta"}, txt, 6, Options{})
+	wantWord := false
+	for _, b := range plain.Buckets {
+		for _, inc := range b.Includes {
+			if inc == "alpha" {
+				wantWord = true
+			}
+		}
+	}
+	if !wantWord {
+		t.Fatalf("test setup: expected 'alpha' to win the tie without a boost, got %+v", plain.Buckets)
+	}
+
+	// With PhraseBoost > 1.0, the phrase must win the same tie instead.
+	boosted := PartitionOpts(docs, []string{"alpha", "alpha beta"}, txt, 6, Options{PhraseBoost: 1.5})
+	gotPhrase := false
+	for _, b := range boosted.Buckets {
+		for _, inc := range b.Includes {
+			if inc == "alpha beta" {
+				gotPhrase = true
+			}
+			if inc == "alpha" {
+				t.Errorf("PhraseBoost should have made 'alpha beta' win the tie, but 'alpha' was used: %+v", b)
+			}
+		}
+	}
+	if !gotPhrase {
+		t.Errorf("expected 'alpha beta' to win the boosted tie, got %+v", boosted.Buckets)
 	}
 }

@@ -34,9 +34,17 @@ type fakeBrowser struct {
 	blocked        bool  // IsBlocked() return value (cleared by a successful CAPTCHA wait)
 	captchaErr     error // returned by WaitForCaptchaResolved
 	captchaWaits   int   // how many times WaitForCaptchaResolved was called
+
+	// cancel, if set, is invoked from PauseBetweenPages (right after a page has
+	// been committed, mirroring where crawlTask checks ctx.Err()) to simulate a
+	// Ctrl+C landing between pages.
+	cancel context.CancelFunc
+
+	searchCalls int // how many times Search was actually invoked
 }
 
 func (f *fakeBrowser) Search(_ string, _, _ int) error {
+	f.searchCalls++
 	f.idx = 0
 	if err := f.searchErr; err != nil {
 		f.searchErr = nil
@@ -80,11 +88,15 @@ func (f *fakeBrowser) WaitForCaptchaResolved() error {
 	f.blocked = false // a solved CAPTCHA unblocks the crawl
 	return nil
 }
-func (f *fakeBrowser) IncreaseThrottle()             {}
-func (f *fakeBrowser) PauseBetweenPages()            {}
-func (f *fakeBrowser) PauseBetweenSearches()         {}
-func (f *fakeBrowser) PausePlanning()                {}
-func (f *fakeBrowser) MaybeReadingScroll() error     { return nil }
+func (f *fakeBrowser) IncreaseThrottle() {}
+func (f *fakeBrowser) PauseBetweenPages() {
+	if f.cancel != nil {
+		f.cancel()
+	}
+}
+func (f *fakeBrowser) PauseBetweenSearches()     {}
+func (f *fakeBrowser) PausePlanning()            {}
+func (f *fakeBrowser) MaybeReadingScroll() error { return nil }
 
 // readSample loads one of the recorded Scholar pages used by the parser tests.
 func readSample(t *testing.T, name string) string {
@@ -212,6 +224,46 @@ func TestCrawlTaskTwoPageNextThenEnd(t *testing.T) {
 	}
 	if task := firstTask(t, d); task.Page != 3 {
 		t.Fatalf("expected resume pointer page 3, got %d", task.Page)
+	}
+}
+
+// TestCrawlTaskCancelAfterPageCommit: a shutdown signal (ctx cancelled) lands
+// between page 1 and page 2, mirroring a Ctrl+C mid-crawl. Page 1's
+// already-scraped results must be durably committed and the task left
+// resumable — never lost, and never marked error/needs_split just because a
+// shutdown was requested. This guards against a regression back to the old
+// os.Exit(130)-on-first-signal behavior, which could kill the process before
+// a fully-scraped page's CommitPage ever ran.
+func TestCrawlTaskCancelAfterPageCommit(t *testing.T) {
+	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, true)
+	pageB := mkScholarPage([]string{"DDD", "EEE", "FFF"}, false)
+	fb := &fakeBrowser{contents: []string{pageA, pageB}}
+	d, c := setup(t, 1, fb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fb.cancel = cancel // fires from PauseBetweenPages, right after page 1 commits
+
+	err := c.CrawlConference(ctx, 1)
+	if err == nil {
+		t.Fatal("expected CrawlConference to return the cancellation error, got nil")
+	}
+
+	s := statusCounts(t, d)
+	if s.Pages != 1 {
+		t.Fatalf("expected page 1 to be committed before cancellation, got %d pages", s.Pages)
+	}
+	if s.Papers != 3 {
+		t.Fatalf("expected page 1's 3 papers to be saved, got %d", s.Papers)
+	}
+	if s.Completed != 0 {
+		t.Fatalf("task must not be marked completed on a cancelled crawl, got %+v", s)
+	}
+	task := firstTask(t, d)
+	if task.Status == db.StatusError || task.Status == db.StatusNeedsSplit {
+		t.Fatalf("cancellation must not error or needs_split the task, got status %q", task.Status)
+	}
+	if task.Page != 2 {
+		t.Fatalf("expected resume pointer left at page 2 (after page 1), got %d", task.Page)
 	}
 }
 
@@ -793,6 +845,45 @@ func TestPlanHarvestPersistsPapers(t *testing.T) {
 	}
 }
 
+// TestBudgetCountStopsOnCancelledContext: once ctx is cancelled (Ctrl+C
+// during -plan), budgetCount must not drive any further browser searches —
+// it should fail fast (serving a cache hit if one exists, else returning
+// ok=false) instead of letting the caller (resolveNode/resolveYear) treat a
+// browser-level "context canceled" error as "this candidate didn't work,
+// try the next one" and keep searching. This is the fix for a real Ctrl+C
+// during -plan that kept issuing new Scholar searches for ~40s afterward.
+func TestBudgetCountStopsOnCancelledContext(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	page := mkScholarPage([]string{"Alpha", "Beta"}, false)
+	fb := &fakeBrowser{contents: []string{page}}
+	c.br = fb
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	budget := &probeBudget{confID: conf.ID, left: 100}
+	n, ok := c.budgetCount(ctx, budget, `"Conf" AND "neural"`, 2021, 2021)
+	if ok {
+		t.Errorf("budgetCount on a cancelled ctx with no cache entry should return ok=false, got n=%d", n)
+	}
+	if fb.searchCalls != 0 {
+		t.Errorf("budgetCount must not drive the browser once ctx is cancelled, got %d Search calls", fb.searchCalls)
+	}
+
+	// A cache hit is still served without touching the browser even when
+	// cancelled — cheap, no browser work, no reason to block on it.
+	if err := d.SetCachedCount(context.Background(), `"Conf" AND "cached"`, 2021, 2021, 42); err != nil {
+		t.Fatal(err)
+	}
+	n, ok = c.budgetCount(ctx, budget, `"Conf" AND "cached"`, 2021, 2021)
+	if !ok || n != 42 {
+		t.Errorf("budgetCount on a cancelled ctx should still serve a cache hit, got n=%d ok=%v", n, ok)
+	}
+	if fb.searchCalls != 0 {
+		t.Errorf("cache hit must not touch the browser, got %d Search calls", fb.searchCalls)
+	}
+}
+
 // TestResolveYearPartitionsOverCapYear: an over-cap year whose known papers
 // split cleanly on a mined keyword resolves into two pending leaves rather than
 // staying a needs_split TODO.
@@ -970,6 +1061,86 @@ func TestResolveYearRequiresMinedKeywords(t *testing.T) {
 	seedConfPapers(t, d, conf.ID, 60, 60)
 	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, nil, cacheCount(d), bigBudget()); ok {
 		t.Fatal("resolveYear with no keywords resolved, want ok=false")
+	}
+}
+
+// TestResolveYearEscalatesUnresolvedGroupToFreshMining: the offline keyword
+// list ("neural") is degenerate for this group — every paper mentions it, so
+// it cannot divide the group and Partition lands it in Unresolved. But half
+// the group's own papers share the word "bayesian" that "neural" alone would
+// never surface. escalateUnresolved must mine that word FROM the unresolved
+// group's own papers and successfully re-partition on it, recovering a leaf
+// set that a plain retry with the same keyword list could never produce —
+// matching the real scenario where a chain like "AND neural networks" leaves
+// generic words (learning/data) unable to divide the branch while a term
+// specific to that branch's own papers can.
+func TestResolveYearEscalatesUnresolvedGroupToFreshMining(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	ctx := context.Background()
+	var papers []db.Paper
+	for i := 0; i < 45; i++ {
+		papers = append(papers, db.Paper{
+			Hash:  fmt.Sprintf("bn-%d", i),
+			Title: fmt.Sprintf("Bayesian Study %d", i),
+			// "neural" is present in EVERY paper (degenerate: cannot split the
+			// group), planted in the snippet so the title stays a clean word.
+			Snippet: "a neural approach to probabilistic inference",
+			Year:    2020, ConferenceID: conf.ID, SourcedFrom: "crawl",
+		})
+	}
+	for i := 0; i < 45; i++ {
+		papers = append(papers, db.Paper{
+			Hash:    fmt.Sprintf("gd-%d", i),
+			Title:   fmt.Sprintf("Gradient Study %d", i),
+			Snippet: "a neural approach to probabilistic inference",
+			Year:    2020, ConferenceID: conf.ID, SourcedFrom: "crawl",
+		})
+	}
+	if _, err := d.SavePapers(ctx, papers); err != nil {
+		t.Fatal(err)
+	}
+	// Cache the count for every plausible term escalateUnresolved's fresh
+	// mining might surface from this group ("bayesian" or an n-gram built
+	// around it, e.g. "bayesian study") — the test asserts on the leaves it
+	// actually gets back rather than pinning one exact mined phrase. "neural"
+	// itself never appears in the rendered query: it is degenerate for the
+	// WHOLE group from the root (every paper mentions it), so Partition's
+	// first pass never uses it as a splitting predicate — the group that
+	// lands in Unresolved carries no include/exclude chain at all, and the
+	// mined term becomes the bucket's only predicate.
+	base := `"Conf"`
+	for _, term := range []string{"bayesian", "bayesian study"} {
+		for _, q := range []string{
+			base + ` AND "` + term + `"`,
+			base + ` -"` + term + `"`,
+		} {
+			if err := d.SetCachedCount(ctx, q, 2020, 2020, 45); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"neural"}, cacheCount(d), bigBudget())
+	if !ok {
+		t.Fatalf("resolveYear failed even after escalating to fresh phrase mining, want ok=true")
+	}
+	if len(leaves) != 2 {
+		t.Fatalf("leaves = %d, want 2 (45/45 split on a mined term), leaves=%+v", len(leaves), leaves)
+	}
+	foundBayesianSplit := false
+	for _, l := range leaves {
+		if l.NeedsSplit {
+			t.Errorf("leaf %q should be pending, not needs_split", l.Query)
+		}
+		if l.Count > c.cfg.MaxResults {
+			t.Errorf("leaf %q count %d exceeds cap %d", l.Query, l.Count, c.cfg.MaxResults)
+		}
+		if strings.Contains(l.Query, "bayesian") {
+			foundBayesianSplit = true
+		}
+	}
+	if !foundBayesianSplit {
+		t.Errorf("expected a leaf split on a term mined from the group's own papers (containing 'bayesian'), got %+v", leaves)
 	}
 }
 

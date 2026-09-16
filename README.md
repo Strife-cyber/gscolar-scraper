@@ -85,6 +85,7 @@ Edit `config.json`:
 | `max_probes_per_conf` | hard cap on live Scholar count searches per conference plan (default 60) |
 | `min_balance` / `headroom` / `min_papers_to_trust` / `min_coverage` | split-quality floor / offline bucket size / offline-corpus trust gates |
 | `mine_max_ngram` / `max_mined_keywords` / `min_completion_ratio` | phrase mining depth (2–3-word candidates) and shortfall tuning |
+| `mine_phrase_boost` | multiplies a multi-word candidate's score wherever splitters are ranked or chosen (default 1.5): the global mining rank, each branch's conditional re-rank, and each offline partition node's winner comparison — so a phrase is preferred over an equally-good word at every level of a split chain, not just the first pick. Raise it (e.g. 2.0-3.0) to see more multi-phrase chains; 1.0 disables the preference entirely (ties go to whichever candidate is ranked/listed first) |
 
 The shipped `config.example.json` already lists all 20 conferences.
 

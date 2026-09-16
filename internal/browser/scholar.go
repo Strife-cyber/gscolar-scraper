@@ -32,6 +32,7 @@ const (
 	selAdvLinkResults = `#gs_res_drw_adv` // results-page drawer
 	selAdvDialog      = `#gs_asd`
 	selAdvQuery       = `#gs_asd_q`   // "with all the words"
+	selAdvExactPhrase = `#gs_asd_epq` // "with the exact phrase"
 	selAdvWithout     = `#gs_asd_eq`  // "without the words"
 	selAdvPublication = `#gs_asd_pub` // "Return articles published in"
 	selAdvYearFrom    = `#gs_asd_ylo`
@@ -48,10 +49,17 @@ const (
 // fields:
 //
 //	source:"Venue" (or a bare quoted phrase) → "published in" (as_publication)
-//	AND "word" / AND "a phrase"               → "with all the words" (as_q);
-//	                                            multi-word terms keep their
-//	                                            quotes so Scholar treats them
-//	                                            as phrases inside the box
+//	AND "a phrase" (first multi-word AND term) → "with the exact phrase"
+//	                                            (as_epq) — the field the form
+//	                                            actually provides for this
+//	AND "word" / AND "another phrase"          → "with all the words" (as_q);
+//	                                            only the FIRST AND phrase can
+//	                                            go in as_epq (it is a single
+//	                                            text field, so it cannot hold
+//	                                            two independent phrase
+//	                                            constraints); any further
+//	                                            phrase term keeps its quotes
+//	                                            in as_q instead
 //	-"word" / -"a phrase"                     → "without the words" (as_eq),
 //	                                            quoted the same way
 var (
@@ -60,13 +68,21 @@ var (
 	advNotRe    = regexp.MustCompile(`-"([^"]*)"`)
 )
 
-// decomposeAdvancedQuery returns the venue, all-words and without-words parts
-// of a main-box query. ok is false when nothing could be placed in any field.
-func decomposeAdvancedQuery(q string) (venue, allWords, withoutWords string, ok bool) {
+// decomposeAdvancedQuery returns the venue, exact-phrase, all-words and
+// without-words parts of a main-box query. ok is false when nothing could be
+// placed in any field.
+func decomposeAdvancedQuery(q string) (venue, exactPhrase, allWords, withoutWords string, ok bool) {
 	if m := advSourceRe.FindStringSubmatch(q); m != nil {
 		venue = m[1]
 	}
 	for _, m := range advAndRe.FindAllStringSubmatch(q, -1) {
+		// The first multi-word AND term is the one Scholar's dedicated
+		// "exact phrase" field is for; a single word has no phrase to
+		// preserve, so it goes straight to "all the words" as before.
+		if exactPhrase == "" && strings.Contains(m[1], " ") {
+			exactPhrase = m[1]
+			continue
+		}
 		if allWords != "" {
 			allWords += " "
 		}
@@ -95,7 +111,7 @@ func decomposeAdvancedQuery(q string) (venue, allWords, withoutWords string, ok 
 		}
 	}
 
-	return venue, allWords, withoutWords, venue != "" || allWords != "" || withoutWords != ""
+	return venue, exactPhrase, allWords, withoutWords, venue != "" || exactPhrase != "" || allWords != "" || withoutWords != ""
 }
 
 // quotePhrase re-quotes a multi-word term so Scholar's "all the words" /
@@ -198,12 +214,17 @@ func (b *Browser) openAdvancedSearch() error {
 // fillAdvancedSearch decomposes the task query into the advanced form's fields
 // and types each one in with per-character delays, then sets the year range.
 func (b *Browser) fillAdvancedSearch(query string, yearFrom, yearTo int) error {
-	venue, allWords, withoutWords, ok := decomposeAdvancedQuery(query)
+	venue, exactPhrase, allWords, withoutWords, ok := decomposeAdvancedQuery(query)
 	if !ok {
 		return fmt.Errorf("cannot translate query %q into advanced-search fields", query)
 	}
 	if venue != "" {
 		if err := b.typeInto(selAdvPublication, venue); err != nil {
+			return err
+		}
+	}
+	if exactPhrase != "" {
+		if err := b.typeInto(selAdvExactPhrase, exactPhrase); err != nil {
 			return err
 		}
 	}
@@ -258,7 +279,7 @@ func (b *Browser) typeInto(sel, text string) error {
 		return fmt.Errorf("field %s not found: %w", sel, err)
 	}
 	var got string
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		if err := el.SelectAllText(); err != nil {
 			return err
 		}
@@ -297,11 +318,11 @@ func (b *Browser) elementExists(sel string) bool {
 // elementExists) — it is read from the page info via b.URL().
 func (b *Browser) hasHashAnchor(id string) bool {
 	u := b.URL()
-	i := strings.Index(u, "#d=")
-	if i < 0 {
+	_, after, ok := strings.Cut(u, "#d=")
+	if !ok {
 		return false
 	}
-	rest := u[i+3:]
+	rest := after
 	if j := strings.IndexByte(rest, '&'); j >= 0 {
 		rest = rest[:j]
 	}
@@ -327,11 +348,11 @@ func (b *Browser) ClickNext() error {
 		return err
 	}
 	before := b.URL()
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		if err := b.humanClick(link); err != nil {
 			return err
 		}
-		for i := 0; i < 20; i++ { // up to ~5s for the navigation to register
+		for range 20 { // up to ~5s for the navigation to register
 			if u := b.URL(); u != "" && u != before {
 				return b.WaitForResults(60 * time.Second)
 			}

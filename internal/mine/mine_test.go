@@ -1,6 +1,9 @@
 package mine
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // TestBalanceFormula: a 50/50 split scores ~1.0, a 95/5 split approaches 0.
 func TestBalanceFormula(t *testing.T) {
@@ -15,6 +18,36 @@ func TestBalanceFormula(t *testing.T) {
 	}
 	if b := balanceOf(0, 100); b != 0 {
 		t.Errorf("balanceOf(0,100) = %v, want 0", b)
+	}
+}
+
+// TestDiscourseConnectivesAreStopwords: prose glue words common in academic
+// abstracts ("however", "therefore", ...) carry no topical signal and must
+// never survive as split candidates, even when they happen to divide a
+// corpus evenly by pure writing-style coincidence.
+func TestDiscourseConnectivesAreStopwords(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "graph neural networks", Snippet: "however this approach fails on sparse graphs"},
+		{Hash: "b", Title: "convolutional models", Snippet: "however performance degrades under noise"},
+		{Hash: "c", Title: "recurrent architectures", Snippet: "moreover the results generalize well"},
+		{Hash: "d", Title: "transformer variants", Snippet: "therefore we propose a new method"},
+		{Hash: "e", Title: "attention mechanisms", Snippet: "nevertheless the baseline underperforms"},
+		{Hash: "f", Title: "bayesian inference", Snippet: "furthermore this extends prior work"},
+	}
+	o := DefaultOptions()
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+	cands := Mine(papers, o)
+	for _, c := range cands {
+		if stopWords[c.Keyword] {
+			t.Errorf("discourse connective %q must never appear as a mined candidate: %+v", c.Keyword, cands)
+		}
+	}
+	for _, w := range []string{"however", "moreover", "therefore", "nevertheless", "furthermore"} {
+		if !stopWords[w] {
+			t.Errorf("%q must be in stopWords", w)
+		}
 	}
 }
 
@@ -59,7 +92,7 @@ func TestMineRanksBalancedSplitterFirst(t *testing.T) {
 // MaxFreqFraction (it cannot split the corpus).
 func TestMineDropsDominantWord(t *testing.T) {
 	var papers []Paper
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		prefix := "convolutional model"
 		if i%2 == 1 {
 			prefix = "recurrent model"
@@ -135,11 +168,16 @@ func TestTokenizeKeepsDomainWords(t *testing.T) {
 	}
 }
 
-// TestDedupSubstringsKeepsMostSpecific: of two candidates where one is a strict
-// substring of the other ("model" / "models"), only the higher-ranked one wins —
-// the redundant substring is dropped so a split slot isn't wasted on a
-// near-identical term. "model" (substring of "models") is dropped when
-// "models" ranks equal or better.
+// TestDedupSubstringsKeepsMostSpecific: of two SAME-TOKEN-LENGTH candidates
+// where one is a strict substring of the other ("model" / "models"), only
+// the higher-ranked one wins — the redundant substring is dropped so a split
+// slot isn't wasted on a near-identical term. A single word is never deduped
+// against a longer phrase that happens to contain it: "large" and "large
+// language" split different (though related) sets of papers and both must
+// survive, or the phrase vocabulary silently collapses to only the longest
+// n-grams — the real-world bug this guards against ("neural" disappearing
+// globally because "graph neural networks" outranks it, leaving only a
+// single phrase and forcing the planner back onto bare config words).
 func TestDedupSubstringsKeepsMostSpecific(t *testing.T) {
 	cands := []Candidate{
 		{Keyword: "model", Balance: 0.6, With: 60, Without: 60},
@@ -154,7 +192,7 @@ func TestDedupSubstringsKeepsMostSpecific(t *testing.T) {
 		got[c.Keyword] = true
 	}
 	if got["model"] {
-		t.Error("'model' must be dropped (strict substring of 'models')")
+		t.Error("'model' must be dropped (same-length strict substring of 'models')")
 	}
 	if !got["models"] {
 		t.Error("'models' must survive")
@@ -162,13 +200,52 @@ func TestDedupSubstringsKeepsMostSpecific(t *testing.T) {
 	if !got["transformer"] {
 		t.Error("'transformer' must survive (no containing keyword)")
 	}
-	// "large" is a substring of "large language" (higher ranked) -> dropped;
-	// "large language" survives.
-	if got["large"] {
-		t.Error("'large' must be dropped (substring of 'large language')")
+	// "large" (1 token) and "large language" (2 tokens) are different phrase
+	// lengths — never deduped against each other — so BOTH must survive.
+	if !got["large"] {
+		t.Error("'large' must survive (never deduped against a longer phrase)")
 	}
 	if !got["large language"] {
 		t.Error("'large language' must survive")
+	}
+}
+
+// TestMineKeepsWordAlongsideContainingPhrase reproduces the real bug end to
+// end through Mine: a corpus where "neural" is a substring of the
+// higher-ranked phrase "graph neural networks" must still return "neural" as
+// its own candidate. Before the token-length guard, dedupSubstrings dropped
+// every single word that was a substring of ANY longer phrase in the
+// results, collapsing the candidate list down to only the longest n-grams —
+// in production this meant the planner's task queries only ever chained
+// bare config words ("learning", "neural", "network", "deep", ...) instead
+// of the mined phrases, because the phrases that survived were too few and
+// too specific to ever be picked.
+func TestMineKeepsWordAlongsideContainingPhrase(t *testing.T) {
+	var papers []Paper
+	for i := 0; i < 30; i++ {
+		papers = append(papers, Paper{
+			Hash: fmt.Sprintf("nn-%d", i), Title: fmt.Sprintf("Graph Neural Networks for Task %d", i),
+		})
+	}
+	for i := 0; i < 30; i++ {
+		papers = append(papers, Paper{
+			Hash: fmt.Sprintf("other-%d", i), Title: fmt.Sprintf("Symbolic Reasoning Study %d", i),
+		})
+	}
+	o := DefaultOptions()
+	o.MaxNGram = 3
+	o.MinFreq = 2
+	o.MinBalance = 0.1
+	cands := Mine(papers, o)
+	got := map[string]bool{}
+	for _, c := range cands {
+		got[c.Keyword] = true
+	}
+	if !got["neural"] {
+		t.Errorf("'neural' must survive as its own candidate alongside 'graph neural networks', got %v", cands)
+	}
+	if !got["graph neural networks"] {
+		t.Errorf("'graph neural networks' must also survive, got %v", cands)
 	}
 }
 
@@ -209,7 +286,7 @@ func TestMineIDFSinksUbiquitousWord(t *testing.T) {
 	// 8 target papers: "rare" on the first 4, "generic" on the last 4 — both
 	// split the target exactly 50/50 (Balance 1.0).
 	var papers []Paper
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		title := "commonword "
 		if i < 4 {
 			title += "rare term"
@@ -296,7 +373,6 @@ func TestMineCoverageTieBreaker(t *testing.T) {
 	}
 }
 
-
 // TestMinePhrases: MaxNGram=3 mines contiguous phrase candidates scored like
 // words — a phrase is a verbatim contiguous run in the raw text, and a
 // stopword may sit inside it ("learning in the wild") but never at the edges.
@@ -329,5 +405,47 @@ func TestMinePhrases(t *testing.T) {
 	}
 	if _, ok := byName["for molecules"]; ok {
 		t.Error("phrase starting with a stopword ('for ...') must not be mined")
+	}
+}
+
+// TestPhraseBoostPrefersPhraseAtEqualBalance: a phrase and a word with equal
+// Balance rank word-first without the boost, and phrase-first once
+// PhraseBoost pushes the phrase's sort score above the word's.
+func TestPhraseBoostPrefersPhraseAtEqualBalance(t *testing.T) {
+	papers := []Paper{
+		{Hash: "a", Title: "federated learning for edge devices"},
+		{Hash: "b", Title: "federated learning in mobile networks"},
+		{Hash: "c", Title: "centralized systems for edge devices"},
+		{Hash: "d", Title: "centralized systems in mobile networks"},
+	}
+	o := DefaultOptions()
+	o.MaxNGram = 2
+	o.MinFreq = 1
+	o.MinBalance = 0.001
+	o.MaxFreqFraction = 1.0
+
+	base := Mine(papers, o)
+	byName := map[string]Candidate{}
+	for _, c := range base {
+		byName[c.Keyword] = c
+	}
+	word, wOK := byName["learning"]
+	phrase, pOK := byName["federated learning"]
+	if !wOK || !pOK {
+		t.Fatalf("expected both 'learning' and 'federated learning' candidates, got %v", base)
+	}
+	if word.Balance != phrase.Balance {
+		t.Fatalf("test setup needs equal balance, got word=%v phrase=%v", word.Balance, phrase.Balance)
+	}
+
+	boosted := o
+	boosted.PhraseBoost = 2.0
+	cands := Mine(papers, boosted)
+	idx := map[string]int{}
+	for i, c := range cands {
+		idx[c.Keyword] = i
+	}
+	if idx["federated learning"] >= idx["learning"] {
+		t.Errorf("with PhraseBoost=2.0, phrase should rank ahead of equal-balance word: order %v", cands)
 	}
 }

@@ -27,6 +27,7 @@ type Config struct {
 	MaxProbesPerConf   int             `json:"max_probes_per_conf"`  // hard cap on real count searches (browser round-trips) per conference plan (default 60)
 	MineBigrams        bool            `json:"mine_bigrams"`         // legacy: mine two-word phrase candidates (default false) — subsumed by mine_max_ngram
 	MineMaxNGram       int             `json:"mine_max_ngram"`       // mine contiguous phrase candidates up to this many tokens (default 3)
+	MinePhraseBoost    float64         `json:"mine_phrase_boost"`    // multiplies a multi-word candidate's ranking score so phrases are preferred as splitters over comparably-scored single words (default 1.5, 1.0 = no effect)
 	MaxMinedKeywords   int             `json:"max_mined_keywords"`   // cap on mined keyword candidates fed to the planner (default 200)
 	MinCompletionRatio float64         `json:"min_completion_ratio"` // a task reaching the natural end of results with fewer than this fraction of TotalEstimate papers is flagged incomplete instead of completed (default 0.5)
 }
@@ -128,6 +129,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MineMaxNGram == 0 {
 		c.MineMaxNGram = 3
+	}
+	if c.MinePhraseBoost == 0 {
+		c.MinePhraseBoost = 1.5
 	}
 	if c.MinCompletionRatio == 0 {
 		c.MinCompletionRatio = 0.5
@@ -254,6 +258,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxMinedKeywords < 0 {
 		return fmt.Errorf("config: max_mined_keywords must be >= 0")
+	}
+	if c.MinePhraseBoost <= 0 {
+		return fmt.Errorf("config: mine_phrase_boost must be > 0")
 	}
 	if c.MinCompletionRatio <= 0 || c.MinCompletionRatio > 1 {
 		return fmt.Errorf("config: min_completion_ratio must be in (0,1]")
