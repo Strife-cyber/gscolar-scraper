@@ -13,10 +13,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
 
 	"gscolar-scraper/internal/config"
@@ -55,6 +57,19 @@ func New(cfg *config.Config) *Browser {
 // dir, so the browser runs against a dedicated non-default profile directory
 // seeded once from a copy of the user's real profile (logins/cookies carry
 // over). Never headless, never a sandbox.
+//
+// Both paths call NoDefaultDevice(). rod otherwise emulates
+// devices.LaptopWithMDPIScreen on every new page, and that emulation ends in
+// SetUserAgent with a hardcoded "Macintosh ... Chrome/114" string. Overriding
+// the UA does NOT override the Client Hints headers (Sec-CH-UA-Platform,
+// Sec-CH-UA-Full-Version-List) the real binary emits, so the browser announces
+// macOS/Chrome 114 and Windows/Chrome 154 in the same request — an OS and forty
+// versions apart. Scholar answers that contradiction with a soft block: no
+// CAPTCHA, no error, just degraded pages whose "About N results" count swings
+// by an order of magnitude between identical queries (313, 197, then 1940 for
+// the same ICRA 2004-2005 search). The override lives on the CDP session, which
+// is why the count snaps back to a stable, correct value the moment the scraper
+// detaches.
 func (b *Browser) Connect() error {
 	port := b.cfg.Browser.DebugPort
 	if port == 0 {
@@ -67,7 +82,7 @@ func (b *Browser) Connect() error {
 		if err != nil {
 			return fmt.Errorf("resolve running browser endpoint on port %d: %w", port, err)
 		}
-		browser := rod.New().ControlURL(wsURL)
+		browser := rod.New().ControlURL(wsURL).NoDefaultDevice()
 		if err := browser.Connect(); err != nil {
 			return fmt.Errorf("connect to running browser on %s: %w", wsURL, err)
 		}
@@ -92,6 +107,18 @@ func (b *Browser) Connect() error {
 	l.Headless(b.cfg.Browser.Headless)
 	l.Set("--remote-debugging-port", strconv.Itoa(port))
 	l.Set("--disable-blink-features", "AutomationControlled")
+	// rod's launcher sets --enable-automation by default. It is the single most
+	// explicit "I am a bot" signal a Chromium can send (it drives the automation
+	// infobar and a batch of navigator flags), which flatly contradicts driving
+	// a real profile to look human. Drop it.
+	l.Delete("enable-automation")
+	// Force the UI language. Scholar picks hl= from these, and hl=fr makes it
+	// treat "and" as a mandatory query word rather than a stopword — that alone
+	// slashes the counts of every venue whose name contains it (ICRA, KDD,
+	// AAMAS…). See BrowserConfig.Locale.
+	locale := b.locale()
+	l.Set("--lang", locale)
+	l.Set("--accept-lang", acceptLanguage(locale))
 	if p, err := b.resolveProfileDir(); err == nil && p != "" {
 		l.UserDataDir(p)
 	}
@@ -103,7 +130,7 @@ func (b *Browser) Connect() error {
 	if err != nil {
 		return fmt.Errorf("launch browser: %w (close your browser and retry)", err)
 	}
-	browser := rod.New().ControlURL(url)
+	browser := rod.New().ControlURL(url).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		return fmt.Errorf("connect to freshly launched browser: %w", err)
 	}
@@ -112,14 +139,75 @@ func (b *Browser) Connect() error {
 }
 
 func (b *Browser) newPage() error {
-	// stealth.Page creates a fresh tab and patches the automation telltales
-	// (navigator.webdriver and friends) before any page script runs. The user's
-	// real profile is the primary fingerprint defense; this is the secondary one.
-	page, err := stealth.Page(b.browser)
+	// stealth.Page patches the automation telltales (navigator.webdriver and
+	// friends) before any page script runs. It is OFF by default and must stay
+	// that way for Scholar: those same patches break Scholar's own browser
+	// sniffer, which then serves a degraded page — unstable "About N results"
+	// counts and missing pagination. The real profile is the fingerprint
+	// defense; this patching actively works against it here.
+	var (
+		page *rod.Page
+		err  error
+	)
+	if b.cfg.Browser.Stealth {
+		page, err = stealth.Page(b.browser)
+	} else {
+		page, err = b.browser.Page(proto.TargetCreateTarget{})
+	}
 	if err != nil {
 		return err
 	}
 	b.page = page
+	return b.applyLocale()
+}
+
+// locale returns the configured UI locale, defaulting to en-US.
+func (b *Browser) locale() string {
+	if l := b.cfg.Browser.Locale; l != "" {
+		return l
+	}
+	return "en-US"
+}
+
+// acceptLanguage builds the Accept-Language header value for a locale
+// ("en-US" -> "en-US,en;q=0.9").
+func acceptLanguage(locale string) string {
+	short := locale
+	if i := strings.Index(locale, "-"); i > 0 {
+		short = locale[:i]
+	}
+	return fmt.Sprintf("%s,%s;q=0.9", locale, short)
+}
+
+// applyLocale pins the page's language three ways, because no single one is
+// reliable: the Accept-Language header (what Scholar reads to pick hl=), and
+// Google's own PREF cookie (what it consults to remember a UI language, and
+// which otherwise wins over the header from a French IP). The --lang /
+// --accept-lang switches set at launch are the third.
+func (b *Browser) applyLocale() error {
+	locale := b.locale()
+	if _, err := b.page.SetExtraHeaders([]string{"Accept-Language", acceptLanguage(locale)}); err != nil {
+		return fmt.Errorf("set Accept-Language: %w", err)
+	}
+	short := locale
+	if i := strings.Index(locale, "-"); i > 0 {
+		short = locale[:i]
+	}
+	region := "US"
+	if i := strings.Index(locale, "-"); i > 0 {
+		region = locale[i+1:]
+	}
+	// Best-effort: a cookie rejection must not abort the crawl.
+	if err := b.browser.SetCookies([]*proto.NetworkCookieParam{{
+		Name:     "PREF",
+		Value:    fmt.Sprintf("hl=%s&gl=%s", short, region),
+		Domain:   ".google.com",
+		Path:     "/",
+		Secure:   true,
+		SameSite: proto.NetworkCookieSameSiteLax,
+	}}); err != nil {
+		fmt.Printf("seed PREF cookie: %v\n", err)
+	}
 	return nil
 }
 
@@ -157,7 +245,11 @@ func browserWebSocketURL(port int) (string, error) {
 	return v.WS, nil
 }
 
-// resolveExecutable returns the browser binary to drive.
+// resolveExecutable returns the browser binary to drive. It must return a real,
+// installed browser whenever one exists: leaving this empty lets rod's launcher
+// fall back to downloading its own ~600 MB Chromium, and that bare binary — no
+// history, no extensions, default everything — is precisely the fingerprint the
+// "drive the user's real browser" design exists to avoid.
 func (b *Browser) resolveExecutable() (string, error) {
 	if b.cfg.Browser.Executable != "" {
 		return b.cfg.Browser.Executable, nil
@@ -165,9 +257,34 @@ func (b *Browser) resolveExecutable() (string, error) {
 	switch b.resolveKind() {
 	case "edge":
 		return findEdge(), nil
-	default: // chrome: rod's launcher finds Chrome on its own
-		return "", nil
+	default:
+		return findChrome(), nil
 	}
+}
+
+// findChrome locates an installed Google Chrome, or "" to let rod decide.
+func findChrome() string {
+	candidates := []string{
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+	}
+	if d := os.Getenv("LOCALAPPDATA"); d != "" {
+		candidates = append(candidates, filepath.Join(d, "Google", "Chrome", "Application", "chrome.exe"))
+	}
+	for _, c := range candidates {
+		if fileExists(c) {
+			return c
+		}
+	}
+	for _, name := range []string{"google-chrome", "google-chrome-stable", "chrome"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // resolveKind normalizes cfg.Browser.Kind, auto-detecting Edge vs Chrome when
@@ -295,8 +412,11 @@ func findEdge() string {
 		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
 	}
+	// fileExists, not dirExists: these are paths to an executable FILE. The
+	// original dirExists check could never match, so auto-detection never
+	// picked Edge and "kind":"edge" resolved to an empty binary path.
 	for _, c := range candidates {
-		if dirExists(c) {
+		if fileExists(c) {
 			return c
 		}
 	}
