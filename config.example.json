@@ -1,7 +1,10 @@
 {
   "database": "scholar.db",
   "start_year": 2000,
+  "end_year": 0,
   "max_results": 1000,
+  "plan_window_years": 2,
+  "include_citations": false,
   "max_keywords": 5,
 
   "min_balance": 0.15,
@@ -21,7 +24,9 @@
     "executable": "",
     "profile_dir": "",
     "debug_port": 9222,
-    "headless": false
+    "headless": false,
+    "stealth": false,
+    "locale": "en-US"
   },
 
   "timing": {
@@ -32,7 +37,9 @@
     "after_captcha_ms": [30000, 90000],
     "click_move_step_ms": [12, 40],
     "scroll_step_ms": [100, 350],
-    "read_scroll_prob": 0.5
+    "read_scroll_prob": 0.5,
+    "captcha_poll_interval_ms": 10000,
+    "captcha_timeout_ms": 900000
   },
 
   "adaptive_throttle": {

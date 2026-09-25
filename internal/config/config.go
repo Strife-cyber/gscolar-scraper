@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 )
 
 // Config is the top-level configuration. All timing values are [min,max]
@@ -18,7 +19,10 @@ type Config struct {
 	MaxKeywords        int             `json:"max_keywords"`         // max keywords the split chain may use per query (default 5)
 	Database           string          `json:"database"`             // SQLite file path (default "scholar.db")
 	StartYear          int             `json:"start_year"`           // lower bound for "2000 to present" (default 2000)
+	EndYear            int             `json:"end_year"`             // upper bound of the planning range; 0 = the current year (see EffectiveEndYear)
 	MaxResults         int             `json:"max_results"`          // Scholar's cap (default 1000)
+	PlanWindowYears    int             `json:"plan_window_years"`    // base year-window width the planner walks: 1 = one task per year, 2 = chronological pairs (default 2)
+	IncludeCitations   bool            `json:"include_citations"`    // keep Scholar's citation-only records (entries with no document, known only from being cited). Default false: they inflate every count, can push a window that holds ~900 real articles over the 1000 cap and trigger a pointless keyword split, and they land in the papers table as rows that are not articles
 	MinBalance         float64         `json:"min_balance"`          // splitter: min balance score for a keyword to be used (default 0.15)
 	MaxProbes          int             `json:"max_probes"`           // splitter: max count() probes per node (default 8)
 	Headroom           float64         `json:"headroom"`             // target bucket capacity as a fraction of MaxResults (default 0.8)
@@ -39,6 +43,22 @@ type BrowserConfig struct {
 	ProfileDir string `json:"profile_dir"` // user data dir override; empty = auto-seeded copy of the real profile
 	DebugPort  int    `json:"debug_port"`  // CDP port (default 9222)
 	Headless   bool   `json:"headless"`
+
+	// Stealth applies go-rod/stealth's automation-telltale patches to every new
+	// page. Default OFF, deliberately: patching window.chrome/navigator makes
+	// Scholar's own browser sniffer fail, and Scholar then serves a DEGRADED
+	// page — unstable result counts, no pagination. A real un-patched browser on
+	// a real profile is the better disguise here. Only turn this on if you have
+	// measured that it helps.
+	Stealth bool `json:"stealth"`
+
+	// Locale drives the UI language Scholar serves (the hl= parameter), via
+	// --lang, --accept-lang, the Accept-Language header and Google's PREF
+	// cookie. Keep "en-US": under hl=fr Scholar treats "and" as a mandatory
+	// query word instead of a stopword, which slashes the result count of every
+	// venue whose name contains it ("Robotics and Automation", "Knowledge
+	// Discovery and Data Mining", …). Default "en-US".
+	Locale string `json:"locale"`
 }
 
 // ConferenceCfg is one line of the conference list.
@@ -93,6 +113,27 @@ func Parse(raw []byte) (*Config, error) {
 	return c, nil
 }
 
+// EffectiveEndYear returns the upper bound of the planning range: EndYear when
+// it is set, otherwise the current year ("2000 to present"). Resolving it here
+// rather than in applyDefaults keeps the fallback working for a Config built as
+// a struct literal, and lets a long-running process roll over on New Year's Day.
+func (c *Config) EffectiveEndYear() int {
+	if c.EndYear > 0 {
+		return c.EndYear
+	}
+	return time.Now().Year()
+}
+
+// EffectivePlanWindowYears returns the planner's base year-window width,
+// falling back to 2 when unset. Like EffectiveEndYear, resolving it here keeps
+// a Config built as a struct literal (which never runs applyDefaults) valid.
+func (c *Config) EffectivePlanWindowYears() int {
+	if c.PlanWindowYears > 0 {
+		return c.PlanWindowYears
+	}
+	return 2
+}
+
 func (c *Config) applyDefaults() {
 	if c.Database == "" {
 		c.Database = "scholar.db"
@@ -102,6 +143,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxResults == 0 {
 		c.MaxResults = 1000
+	}
+	if c.PlanWindowYears == 0 {
+		c.PlanWindowYears = 2
 	}
 	if c.MaxKeywords == 0 {
 		c.MaxKeywords = 5
@@ -143,6 +187,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Browser.DebugPort == 0 {
 		c.Browser.DebugPort = 9222
+	}
+	if c.Browser.Locale == "" {
+		c.Browser.Locale = "en-US"
 	}
 	if c.Timing.BetweenPagesMS == nil {
 		c.Timing.BetweenPagesMS = []int{30000, 60000}
@@ -234,6 +281,15 @@ func (c *Config) validate() error {
 	}
 	if c.StartYear < 0 || c.StartYear > 2100 {
 		return fmt.Errorf("config: start_year out of range")
+	}
+	if c.EndYear < 0 || c.EndYear > 2100 {
+		return fmt.Errorf("config: end_year out of range")
+	}
+	if c.EndYear > 0 && c.EndYear < c.StartYear {
+		return fmt.Errorf("config: end_year (%d) must be >= start_year (%d)", c.EndYear, c.StartYear)
+	}
+	if c.PlanWindowYears < 1 {
+		return fmt.Errorf("config: plan_window_years must be >= 1")
 	}
 	if c.MaxKeywords < 0 {
 		return fmt.Errorf("config: max_keywords must be >= 0")

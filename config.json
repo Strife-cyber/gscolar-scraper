@@ -1,15 +1,18 @@
 {
   "database": "scholar.db",
   "start_year": 2000,
+  "end_year": 2024,
   "max_results": 1000,
-  "max_keywords": 5,
+  "plan_window_years": 2,
+  "include_citations": false,
+  "max_keywords": 6,
 
   "min_balance": 0.15,
-  "max_probes": 3,
-  "headroom": 0.8,
+  "max_probes": 5,
+  "headroom": 0.9,
   "min_papers_to_trust": 5,
   "min_coverage": 0.2,
-  "max_probes_per_conf": 60,
+  "max_probes_per_conf": 150,
   "mine_bigrams": false,
   "mine_max_ngram": 3,
   "mine_phrase_boost": 4,
@@ -21,7 +24,9 @@
     "executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "profile_dir": "",
     "debug_port": 9333,
-    "headless": false
+    "headless": false,
+    "stealth": false,
+    "locale": "en-US"
   },
 
   "timing": {
@@ -32,7 +37,9 @@
     "after_captcha_ms": [30000, 90000],
     "click_move_step_ms": [12, 40],
     "scroll_step_ms": [100, 350],
-    "read_scroll_prob": 0.3
+    "read_scroll_prob": 0.3,
+    "captcha_poll_interval_ms": 10000,
+    "captcha_timeout_ms": 900000
   },
 
   "adaptive_throttle": {
@@ -43,10 +50,12 @@
 
   "keywords": [
     "learning", "neural", "network", "model", "data", "deep",
-    "training", "image", "language", "system", "method", "optimization",
-    "algorithm", "approach", "classification", "detection", "generation",
+    "training", "image", "language", "system", "optimization",
+    "algorithm", "classification", "detection", "generation",
     "reinforcement", "representation", "attention", "graph", "clustering",
-    "robot", "speech", "recognition", "prediction", "text", "video"
+    "robot", "speech", "recognition", "prediction", "text", "video",
+    "manipulation", "grasping", "navigation", "slam", "humanoid", "autonomous", "control",
+    "multi", "design", "human", "task", "dynamic", "object", "time"
   ],
 
   "conferences": [
@@ -63,12 +72,12 @@
     { "name": "KDD",        "query": "\"ACM SIGKDD Conference on Knowledge Discovery and Data Mining\"" },
     { "name": "WWW",        "query": "\"International World Wide Web Conference\"" },
     { "name": "SIGIR",      "query": "\"ACM SIGIR Conference on Research and Development in Information Retrieval\"" },
-    { "name": "UAI",        "query": "\"Conference on Uncertainty in Artificial Intelligence\"" },
     { "name": "ICRA",       "query": "\"IEEE International Conference on Robotics and Automation\"" },
     { "name": "IROS",       "query": "\"IEEE/RSJ International Conference on Intelligent Robots and Systems\"" },
     { "name": "AAMAS",      "query": "\"International Conference on Autonomous Agents and Multiagent Systems\"" },
     { "name": "ICDM",       "query": "\"IEEE International Conference on Data Mining\"" },
-    { "name": "INTERSPEECH", "query": "\"Conference of the International Speech Communication Association\"" },
-    { "name": "NeurIPS",    "query": "\"Conference on Neural Information Processing Systems\"" }
+    { "name": "NeurIPS",    "query": "\"Conference on Neural Information Processing Systems\"" },
+    { "name": "CHI",        "query": "\"CHI Conference on Human Factors in Computing Systems\"" },
+    { "name": "ICASSP",     "query": "\"IEEE International Conference on Acoustics, Speech and Signal Processing\"" }
   ]
 }
