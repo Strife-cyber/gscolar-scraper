@@ -251,13 +251,13 @@ func TestCommitPageAtomic(t *testing.T) {
 		},
 		NextPage: 2,
 	}
-	if err := d.CommitPage(ctx, pc); err != nil {
+	if _, err := d.CommitPage(ctx, pc); err != nil {
 		t.Fatal(err)
 	}
 
 	// Re-committing the same page must be idempotent (papers stay dedup'd,
 	// page_html not duplicated).
-	if err := d.CommitPage(ctx, pc); err != nil {
+	if _, err := d.CommitPage(ctx, pc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -519,4 +519,182 @@ INSERT INTO papers (hash, title, year, task_id) VALUES ('z', 'Z', 2020, 1);`)
 		return err
 	}
 	return closeErr
+}
+
+// TestCitationsStoredAsZeroNotNull: an article Scholar shows no "Cited by"
+// link for must land in the table as 0, not NULL, so callers can sum, average
+// and order on the column without special-casing absence.
+func TestCitationsStoredAsZeroNotNull(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	papers := []Paper{
+		{Hash: "uncited", Title: "Nobody cited this", Year: 2024},                            // HasCitations false
+		{Hash: "cited", Title: "This one was cited", Year: 2024, Citations: 42, HasCitations: true},
+	}
+	if _, err := d.SavePapers(ctx, papers); err != nil {
+		t.Fatalf("SavePapers: %v", err)
+	}
+
+	var nulls int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM papers WHERE citations IS NULL`).Scan(&nulls); err != nil {
+		t.Fatalf("count nulls: %v", err)
+	}
+	if nulls != 0 {
+		t.Errorf("%d rows have a NULL citation count, want 0", nulls)
+	}
+
+	for _, tc := range []struct {
+		hash string
+		want int
+	}{{"uncited", 0}, {"cited", 42}} {
+		var got int
+		if err := d.db.QueryRow(`SELECT citations FROM papers WHERE hash = ?`, tc.hash).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", tc.hash, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: citations = %d, want %d", tc.hash, got, tc.want)
+		}
+	}
+}
+
+// TestBackfillCitationZero: a database written by an older version still holds
+// NULLs in papers.citations. SQLite cannot add NOT NULL to a column in place,
+// so such a database keeps the nullable column forever — opening it must
+// normalize the values instead. The legacy shape is rebuilt here because the
+// current schema rejects the NULL outright (which is itself the proof that new
+// databases can no longer grow one).
+func TestBackfillCitationZero(t *testing.T) {
+	d := openTest(t)
+
+	if _, err := d.db.Exec(`DROP TABLE papers`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if _, err := d.db.Exec(`CREATE TABLE papers (
+		hash      TEXT PRIMARY KEY,
+		title     TEXT NOT NULL DEFAULT '',
+		citations INTEGER
+	)`); err != nil {
+		t.Fatalf("recreate legacy papers: %v", err)
+	}
+	if _, err := d.db.Exec(
+		`INSERT INTO papers (hash, title, citations) VALUES ('legacy', 'Old row', NULL), ('kept', 'Cited', 7)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := d.backfillCitationZero(); err != nil {
+		t.Fatalf("backfillCitationZero: %v", err)
+	}
+
+	for _, tc := range []struct {
+		hash string
+		want int
+	}{{"legacy", 0}, {"kept", 7}} {
+		var got int
+		if err := d.db.QueryRow(`SELECT citations FROM papers WHERE hash = ?`, tc.hash).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", tc.hash, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: citations = %d, want %d", tc.hash, got, tc.want)
+		}
+	}
+}
+
+// TestCommitPageReportsNewPapersForThisTask: the count CommitPage returns is
+// what tells the crawler a result set is exhausted, so it must be per-task.
+// A paper already in the table from the planning harvest is still new to the
+// task that just crawled it; counting it as a duplicate would end a crawl early.
+func TestCommitPageReportsNewPapersForThisTask(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "CONF", `"Conf"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := d.UpsertTask(ctx, &Task{ConferenceID: confID, Query: `"Conf"`, YearFrom: 2020, YearTo: 2020, Status: StatusPending})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Already known from planning: same hash, no task attached.
+	if _, err := d.SavePapers(ctx, []Paper{{Hash: "h1", Title: "Harvested", Year: 2020}}); err != nil {
+		t.Fatal(err)
+	}
+
+	page := func(n int, hashes ...string) int {
+		t.Helper()
+		var ps []Paper
+		for _, h := range hashes {
+			ps = append(ps, Paper{Hash: h, Title: h, Year: 2020, TaskID: taskID})
+		}
+		added, err := d.CommitPage(ctx, PageCommit{TaskID: taskID, PageNumber: n, HTML: "<html>", Papers: ps, NextPage: n + 1})
+		if err != nil {
+			t.Fatalf("CommitPage %d: %v", n, err)
+		}
+		return added
+	}
+
+	if got := page(1, "h1", "h2"); got != 2 {
+		t.Errorf("page 1 added %d, want 2 (the harvested paper counts — it is new to this task)", got)
+	}
+	if got := page(2, "h3"); got != 1 {
+		t.Errorf("page 2 added %d, want 1", got)
+	}
+	// Scholar recycling papers it already served on this task.
+	if got := page(3, "h1", "h2", "h3"); got != 0 {
+		t.Errorf("page 3 added %d, want 0 (all already collected by this task)", got)
+	}
+}
+
+// TestReplaceConferencePlanKeepsCrawledTasks: a task carrying committed pages
+// must survive a re-plan even when the new plan no longer names it. Deleting it
+// trips page_html's foreign key (no ON DELETE CASCADE, foreign_keys is on),
+// which rolls back the whole prune and fails the conference's plan outright —
+// and it would throw away collected work in any case.
+func TestReplaceConferencePlanKeepsCrawledTasks(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "CONF", `"Conf"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mk := func(q, status string) int64 {
+		id, err := d.UpsertTask(ctx, &Task{
+			ConferenceID: confID, Query: q, YearFrom: 2024, YearTo: 2024, Status: status,
+		})
+		if err != nil {
+			t.Fatalf("upsert %s: %v", q, err)
+		}
+		return id
+	}
+	crawled := mk(`"Conf" AND "walked"`, StatusNeedsSplit) // flagged AFTER being crawled
+	untouched := mk(`"Conf" AND "never"`, StatusNeedsSplit)
+
+	if _, err := d.CommitPage(ctx, PageCommit{
+		TaskID: crawled, PageNumber: 1, HTML: "<html>page</html>", NextPage: 2,
+	}); err != nil {
+		t.Fatalf("CommitPage: %v", err)
+	}
+
+	// A new plan that names neither task.
+	if err := d.ReplaceConferencePlan(ctx, confID, []string{
+		taskKey(`"Conf" AND "fresh"`, 2024, 2024, "[]"),
+	}); err != nil {
+		t.Fatalf("ReplaceConferencePlan: %v", err)
+	}
+
+	var n int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id = ?`, crawled).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("the crawled task was pruned; its pages are collected work and its deletion breaks the foreign key")
+	}
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id = ?`, untouched).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("the never-crawled task should still be pruned")
+	}
 }

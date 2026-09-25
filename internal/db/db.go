@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS papers (
     authors       TEXT NOT NULL DEFAULT '',
     year          INTEGER NOT NULL DEFAULT 0,
     snippet       TEXT NOT NULL DEFAULT '',
-    citations     INTEGER,                      -- NULL when Scholar shows no count
+    citations     INTEGER NOT NULL DEFAULT 0,   -- 0 when Scholar shows no "Cited by" link
     source_url    TEXT NOT NULL DEFAULT '',
     scholar_id    TEXT NOT NULL DEFAULT '',     -- Scholar result cluster id (data-cid)
     raw_html      TEXT NOT NULL DEFAULT '',     -- the parsed <div class="gs_r"> block
@@ -144,7 +144,19 @@ CREATE TABLE IF NOT EXISTS plan_harvest_pages (
 	if err := d.ensurePapersColumns(); err != nil {
 		return err
 	}
+	if err := d.backfillCitationZero(); err != nil {
+		return err
+	}
 	return d.backfillPaperConferences()
+}
+
+// backfillCitationZero rewrites the NULL citations left by older versions to 0.
+// The column keeps its original nullable type on an existing database (SQLite
+// cannot add NOT NULL to a column in place without rebuilding the table), so
+// this only normalizes the values; citationCount stops new NULLs being written.
+func (d *DB) backfillCitationZero() error {
+	_, err := d.db.Exec(`UPDATE papers SET citations = 0 WHERE citations IS NULL`)
+	return err
 }
 
 // ensurePapersColumns adds papers.conference_id and papers.sourced_from to a
@@ -425,6 +437,19 @@ func (d *DB) UpdateTaskPage(ctx context.Context, id int64, page int) error {
 	return err
 }
 
+// UpdateTaskEstimate overwrites a task's planned result count with what Scholar
+// reports when the crawl actually issues the search. The planner's figure is
+// read once, from page 1, possibly days earlier, and Scholar's "About N" for a
+// narrow conjunctive query is not stable over time — one ICRA bucket was
+// planned at 887 and crawled at 299, another at 163 and crawled at 1060. Since
+// TotalEstimate is what the shortfall check measures delivery against, a stale
+// figure makes that check meaningless in both directions.
+func (d *DB) UpdateTaskEstimate(ctx context.Context, id int64, estimate int) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE tasks SET total_results_estimate = ? WHERE id = ?`, estimate, id)
+	return err
+}
+
 // ---------------------------------------------------------------------------
 // Papers
 // ---------------------------------------------------------------------------
@@ -453,7 +478,7 @@ func (d *DB) SavePaper(ctx context.Context, p *Paper) (inserted bool, err error)
 		INSERT OR IGNORE INTO papers
 			(hash, title, authors, year, snippet, citations, source_url, scholar_id, raw_html, task_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationsOrNull(p),
+		p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationCount(p),
 		p.SourceURL, p.ScholarID, p.RawHTML, taskIDOrNull(p.TaskID))
 	if err != nil {
 		return false, err
@@ -505,7 +530,7 @@ func savePapersTx(ctx context.Context, tx *sql.Tx, papers []Paper) (int, error) 
 	for i := range papers {
 		p := &papers[i]
 		res, err := stmt.ExecContext(ctx,
-			p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationsOrNull(p),
+			p.Hash, p.Title, p.Authors, p.Year, p.Snippet, citationCount(p),
 			p.SourceURL, p.ScholarID, p.RawHTML, taskIDOrNull(p.TaskID),
 			conferenceOrNull(p), taskIDOrNull(p.TaskID), sourcedFromOf(p))
 		if err != nil {
@@ -659,49 +684,78 @@ type PageCommit struct {
 // CommitPage atomically saves a page: raw HTML, dedup'd papers and the task
 // pointer. It is the sole checkpoint primitive; the crawler calls it once per
 // page and everything durably lands together.
-func (d *DB) CommitPage(ctx context.Context, pc PageCommit) error {
+// It returns how many papers the page added to THIS task — papers now carrying
+// this task_id that were not already doing so. Scholar keeps serving "Next"
+// well past its own stated result count, recycling papers it has already shown
+// (one ICRA bucket served ~700 rows across 35 pages for 299 real results), so
+// the caller uses this to detect a result set that is exhausted whatever the
+// pagination claims. Counting per-task rather than globally matters: a paper
+// already in the table from the planning harvest is still new to this task, and
+// treating it as a duplicate would end the crawl early.
+func (d *DB) CommitPage(ctx context.Context, pc PageCommit) (int, error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback() // no-op after Commit
+
+	var before int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM papers WHERE task_id = ?`, pc.TaskID).Scan(&before); err != nil {
+		return 0, err
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO page_html (task_id, page_number, html) VALUES (?, ?, ?)`,
 		pc.TaskID, pc.PageNumber, pc.HTML); err != nil {
-		return err
+		return 0, err
 	}
 
 	if _, err := savePapersTx(ctx, tx, pc.Papers); err != nil {
-		return err
+		return 0, err
+	}
+
+	var after int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM papers WHERE task_id = ?`, pc.TaskID).Scan(&after); err != nil {
+		return 0, err
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE tasks SET page = ? WHERE id = ?`, pc.NextPage, pc.TaskID); err != nil {
-		return err
+		return 0, err
 	}
 
 	if pc.Final {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE tasks SET status = 'completed' WHERE id = ?`, pc.TaskID); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if pc.ErrMsg != "" {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE tasks SET status = 'error', error = ? WHERE id = ?`, pc.ErrMsg, pc.TaskID); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return after - before, nil
 }
 
-func citationsOrNull(p *Paper) any {
+// citationCount is what goes into papers.citations. Scholar simply omits the
+// "Cited by" link on an article nobody has cited, so "no count on the page"
+// means zero citations, not an unknown quantity — storing NULL for it forced
+// every consumer to special-case the absence and made SUM/AVG/ORDER BY behave
+// oddly. HasCitations still records whether Scholar printed a figure, for
+// callers that care about the distinction.
+func citationCount(p *Paper) int {
 	if p.HasCitations {
 		return p.Citations
 	}
-	return nil
+	return 0
 }
 
 func taskIDOrNull(id int64) any {
@@ -725,9 +779,23 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 	for _, k := range keepKeys {
 		keep[k] = true
 	}
+	// A task that has committed pages is never pruned, whatever its status.
+	//
+	// The status filter alone was not enough. A needs_split task can be one the
+	// crawl already walked — ICRA 2024's "network AND learning AND train" bucket
+	// was flagged after 52 pages — and page_html.task_id references tasks(id)
+	// with no ON DELETE CASCADE under foreign_keys(1), so deleting it raises
+	// SQLITE_CONSTRAINT_FOREIGNKEY and rolls back the whole prune. The planner
+	// then reports "constraint failed: FOREIGN KEY constraint failed (787)" and
+	// the conference is left holding both its old tasks and the new ones.
+	//
+	// Beyond the crash, deleting such a row would be wrong on its own terms: its
+	// pages are collected work, and the papers behind them would be orphaned
+	// from the task that found them.
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT id, query, year_from, year_to, keywords FROM tasks
-		 WHERE conference_id = ? AND status IN ('needs_split', 'pending')`, conferenceID)
+		 WHERE conference_id = ? AND status IN ('needs_split', 'pending')
+		   AND NOT EXISTS (SELECT 1 FROM page_html h WHERE h.task_id = tasks.id)`, conferenceID)
 	if err != nil {
 		return err
 	}
