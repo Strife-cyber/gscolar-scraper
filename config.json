@@ -77,7 +77,13 @@
     { "name": "AAMAS",      "query": "\"International Conference on Autonomous Agents and Multiagent Systems\"" },
     { "name": "ICDM",       "query": "\"IEEE International Conference on Data Mining\"" },
     { "name": "NeurIPS",    "query": "\"Conference on Neural Information Processing Systems\"" },
+
     { "name": "CHI",        "query": "\"CHI Conference on Human Factors in Computing Systems\"" },
-    { "name": "ICASSP",     "query": "\"IEEE International Conference on Acoustics, Speech and Signal Processing\"" }
+    { "name": "ICASSP",     "query": "\"IEEE International Conference on Acoustics, Speech and Signal Processing\"" },
+    { "name": "Neurocomputing", "query": "\"Neurocomputing\"" },
+    { "name": "AIReview",       "query": "\"Artificial Intelligence Review\"" },
+    { "name": "ASC",            "query": "\"Applied Soft Computing\"" },
+    { "name": "JMLR",           "query": "\"Journal of Machine Learning Research\"" },
+    { "name": "UAI",        "query": "\"Conference on Uncertainty in Artificial Intelligence\""}
   ]
 }
