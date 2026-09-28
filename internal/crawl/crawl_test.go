@@ -1681,3 +1681,55 @@ func TestVerifiedRootKeywordsKeepsAnAgreeingRoot(t *testing.T) {
 		t.Errorf("%d probes spent, want exactly 1 — only the finalist is measured", probes)
 	}
 }
+
+// TestOfflineDocLimitIsDrivenByScholarNotCorpusSize: the partitioner counts
+// documents while max_results counts Scholar results. Mixing the two made the
+// bucket count follow the corpus, so it grew with every venue crawled — CHI
+// 2016 drew six buckets from 2901 mostly-unrelated documents for a year of
+// 1150 that needs two.
+func TestOfflineDocLimitIsDrivenByScholarNotCorpusSize(t *testing.T) {
+	const maxResults, headroom = 1000, 0.9 // 900 results per bucket
+
+	groups := func(corpus, trueCount int) int {
+		lim := offlineDocLimit(maxResults, headroom, corpus, trueCount)
+		return (corpus + lim - 1) / lim // ceil
+	}
+
+	// CHI 2016, as observed.
+	if got := groups(2901, 1150); got != 2 {
+		t.Errorf("CHI 2016 (D=2901, N=1150) -> %d buckets, want 2", got)
+	}
+
+	// The same year once four more venues have been crawled: the corpus
+	// quadruples, the answer must not move.
+	for _, corpus := range []int{2901, 6000, 12000, 40000} {
+		if got := groups(corpus, 1150); got != 2 {
+			t.Errorf("D=%d, N=1150 -> %d buckets, want 2 regardless of corpus size", corpus, got)
+		}
+	}
+
+	// A year that genuinely needs four.
+	if got := groups(3000, 3480); got != 4 {
+		t.Errorf("N=3480 -> %d buckets, want 4", got)
+	}
+
+	// A year already under the budget needs exactly one.
+	if got := groups(2901, 800); got != 1 {
+		t.Errorf("N=800 -> %d buckets, want 1", got)
+	}
+}
+
+// TestOfflineDocLimitFallsBackWithoutACount: with no usable count there is no
+// ratio to scale by, so the raw result budget stands rather than a number
+// derived from a division by zero.
+func TestOfflineDocLimitFallsBackWithoutACount(t *testing.T) {
+	for _, tc := range []struct{ corpus, trueCount int }{{2901, 0}, {2901, -1}, {0, 1150}} {
+		if got := offlineDocLimit(1000, 0.9, tc.corpus, tc.trueCount); got != 900 {
+			t.Errorf("offlineDocLimit(corpus=%d, count=%d) = %d, want the raw 900",
+				tc.corpus, tc.trueCount, got)
+		}
+	}
+	if got := offlineDocLimit(1000, 0.9, 1, 100000); got < 1 {
+		t.Errorf("limit = %d, must never fall below 1", got)
+	}
+}

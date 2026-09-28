@@ -452,6 +452,38 @@ func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 	return c.bgTexts
 }
 
+// offlineDocLimit converts the crawl's result-count budget into the document
+// budget the offline partitioner actually works in.
+//
+// PartitionOpts splits until every group holds at most `limit` DOCUMENTS of the
+// known corpus, and that limit used to be max_results*headroom — a number of
+// SCHOLAR RESULTS. Two different units, and the error grew with the project:
+// the corpus is every paper of that year across ALL venues, so CHI 2016 was
+// partitioned against 2901 documents that are mostly ICRA and IROS. At a limit
+// of 900 documents that forced six buckets — one of them four results wide —
+// for a year Scholar reports at 1150, which needs two. Crawling more venues
+// would have kept inflating it.
+//
+// A group of d documents stands for about d*N/D results, where D is the corpus
+// size and N the year's real count. Asking for at most `budget` results per
+// group therefore means at most budget*D/N documents, and the group count comes
+// out at D/(budget*D/N) = N/budget — driven by Scholar, invariant to how much
+// has been crawled.
+//
+// This scales the buckets; it does not make the corpus representative. The
+// keywords are still chosen from papers that largely belong to other venues,
+// and the sizes are still estimates that each bucket's verification probe may
+// contradict.
+func offlineDocLimit(maxResults int, headroom float64, corpusSize, trueCount int) int {
+	budget := float64(maxResults) * headroom
+	// No usable count: fall back to the raw result budget rather than scaling
+	// by a ratio we cannot compute.
+	if trueCount <= 0 || corpusSize <= 0 {
+		return max(int(budget), 1)
+	}
+	return max(int(budget*float64(corpusSize)/float64(trueCount)), 1)
+}
+
 // maxRootFraction is the share of a year a root splitter may cover before it
 // is judged useless. It mirrors split.resolveNode's own "neither side above
 // 75% of the node" bar, applied one level earlier — to the keyword the entire
@@ -637,7 +669,7 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 			p := byHash[d.Hash]
 			return p.Title + " " + p.Snippet
 		}
-		limit := max(int(float64(c.cfg.MaxResults)*c.cfg.Headroom), 1)
+		limit := offlineDocLimit(c.cfg.MaxResults, c.cfg.Headroom, len(docs), trueCount)
 
 		// The offline partition scores candidates on the known corpus — titles
 		// and short snippets — while Scholar matches full text, and for some
