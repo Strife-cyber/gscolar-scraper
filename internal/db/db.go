@@ -29,6 +29,14 @@ const (
 	// means "never even started, still over the cap") and from error (which
 	// means the crawl itself broke). -rerun-shortfall re-queues it to pending.
 	StatusIncomplete = "incomplete"
+	// StatusSuperseded marks a 'pending' or 'needs_split' task that a re-plan
+	// no longer emits but that already has committed pages, so it cannot be
+	// deleted (page_html references it, and its pages are collected work).
+	// Left 'pending' it would still be crawled, overlapping the new plan's
+	// leaves — ICML's stale "neural" 2022 bucket (~3,060 results) was. The
+	// crawler ignores it; a later plan that emits the same leaf again
+	// re-adopts it through UpsertTask, resuming at its page pointer.
+	StatusSuperseded = "superseded"
 )
 
 // Open opens (creating if needed) the SQLite database at path and runs
@@ -773,13 +781,15 @@ func taskIDOrNull(id int64) any {
 // differently-shaped plan (a whole-range task superseded by 2-year windows, a
 // chain leaf that the empty-bucket optimization no longer emits, …). The plan
 // is authoritative: anything not in keepKeys and not yet completed/errored is
-// removed so the crawl never re-runs an obsolete query.
+// removed so the crawl never re-runs an obsolete query — or, when it already
+// has committed pages, marked 'superseded' (see StatusSuperseded).
 func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keepKeys []string) error {
 	keep := map[string]bool{}
 	for _, k := range keepKeys {
 		keep[k] = true
 	}
-	// A task that has committed pages is never pruned, whatever its status.
+	// A task that has committed pages is never deleted, whatever its status;
+	// a stale one is marked superseded instead.
 	//
 	// The status filter alone was not enough. A needs_split task can be one the
 	// crawl already walked — ICRA 2024's "network AND learning AND train" bucket
@@ -793,28 +803,31 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 	// pages are collected work, and the papers behind them would be orphaned
 	// from the task that found them.
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT id, query, year_from, year_to, keywords FROM tasks
-		 WHERE conference_id = ? AND status IN ('needs_split', 'pending')
-		   AND NOT EXISTS (SELECT 1 FROM page_html h WHERE h.task_id = tasks.id)`, conferenceID)
+		`SELECT id, query, year_from, year_to, keywords,
+		        EXISTS (SELECT 1 FROM page_html h WHERE h.task_id = tasks.id)
+		 FROM tasks
+		 WHERE conference_id = ? AND status IN ('needs_split', 'pending')`, conferenceID)
 	if err != nil {
 		return err
 	}
 	type stale struct {
-		id  int64
-		key string
+		id       int64
+		key      string
+		hasPages bool
 	}
 	var stales []stale
 	for rows.Next() {
 		var id int64
 		var q, kw string
 		var yf, yt int
-		if err := rows.Scan(&id, &q, &yf, &yt, &kw); err != nil {
+		var hasPages bool
+		if err := rows.Scan(&id, &q, &yf, &yt, &kw, &hasPages); err != nil {
 			rows.Close()
 			return err
 		}
 		key := taskKey(q, yf, yt, kw)
 		if !keep[key] {
-			stales = append(stales, stale{id: id, key: key})
+			stales = append(stales, stale{id: id, key: key, hasPages: hasPages})
 		}
 	}
 	rows.Close()
@@ -828,6 +841,14 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 	}
 	defer tx.Rollback()
 	for _, s := range stales {
+		if s.hasPages {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE tasks SET status = 'superseded', error = 'not in the current plan' WHERE id = ?`,
+				s.id); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE papers SET task_id = NULL WHERE task_id = ?`, s.id); err != nil {
 			return err
@@ -989,6 +1010,7 @@ type Stats struct {
 	Completed   int
 	NeedsSplit  int
 	Incomplete  int
+	Superseded  int
 	Papers      int
 	Pages       int
 }
@@ -1015,6 +1037,9 @@ func (d *DB) GetStats(ctx context.Context) (Stats, error) {
 		return s, err
 	}
 	if err := count(`SELECT COUNT(*) FROM tasks WHERE status='incomplete'`, &s.Incomplete); err != nil {
+		return s, err
+	}
+	if err := count(`SELECT COUNT(*) FROM tasks WHERE status='superseded'`, &s.Superseded); err != nil {
 		return s, err
 	}
 	if err := count(`SELECT COUNT(*) FROM papers`, &s.Papers); err != nil {

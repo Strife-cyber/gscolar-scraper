@@ -131,8 +131,11 @@ func planRange(baseQuery string, ylo, yhi, limit int, keywords []string, count C
 }
 
 // planWindow plans one base window of one or two years. A window under the cap
-// (or whose count could not be read) is a single leaf; a 2-year window over the
-// cap narrows to its two single years, each planned recursively.
+// is a single pending leaf; a window whose count could not be read is a single
+// needs_split leaf (an unknown size is not crawlable work — ICML 2020-2021 was
+// emitted pending with count 0 when the probe budget ran out, and the crawl
+// then walked a ~7,500-result window); a 2-year window over the cap narrows to
+// its two single years, each planned recursively.
 func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count CountFunc, maxKeywords, maxProbes int, minBalance float64) ([]Leaf, error) {
 	n, ok := count(baseQuery, ylo, yhi)
 	if !ok || n <= limit {
@@ -142,7 +145,7 @@ func planWindow(baseQuery string, ylo, yhi, limit int, keywords []string, count 
 			YearTo:     yhi,
 			Count:      n,
 			HasCount:   ok,
-			NeedsSplit: ok && n > limit,
+			NeedsSplit: !ok,
 		}}, nil
 	}
 

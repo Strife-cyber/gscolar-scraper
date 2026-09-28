@@ -117,6 +117,29 @@ The shipped `config.example.json` already lists all 20 conferences.
 Run `-plan -crawl` repeatedly: each pass clears completed tasks and re-splits
 what `needs_split` flagged until the TODOs are gone.
 
+A task Scholar reports as over the 1,000-result cap is never crawled: it is
+flagged `needs_split` before its first page (from its estimate, the count cache,
+or the live "About N results"), and the next `-plan` splits it. A pending task a
+re-plan no longer emits but that already has pages becomes `superseded` (kept,
+not crawled).
+
+### Scraping on several machines
+
+Each machine keeps its own `scholar.db`. Give each machine different
+conferences (`-conference NAME`) so they don't search the same things, then
+fold the databases together with `-merge` (no browser; stop the scraper on both
+files first and copy the whole `.db` file):
+
+```powershell
+.\bin\gscolar.exe -config config.json -merge D:\from-laptop\scholar.db -status
+```
+
+Tasks are matched by content (conference + query + years + keywords), not by
+id; papers dedup on their hash; for a task both machines touched the
+furthest-along status wins (completed > incomplete > needs_split > error >
+superseded > pending). Merging is idempotent, so re-merging a newer copy only
+adds what's new, and machines can merge each other's files both ways.
+
 ---
 
 ## Data

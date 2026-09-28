@@ -10,6 +10,7 @@
 //	gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
 //	gscolar -config config.json -gen-tasks       # build tasks from the DB only (no browser)
 //	gscolar -config config.json -rerun-shortfall -crawl -conference ICML  # retry under-delivered tasks
+//	gscolar -config config.json -merge laptop.db -merge desktop.db   # fold other machines' DBs in
 //
 // -plan and -crawl both drive the real browser and are resumable: re-running
 // them continues from the database's checkpoints (every page is committed
@@ -19,6 +20,8 @@
 // -rerun-shortfall re-queues 'incomplete' and 'error' tasks to 'pending'
 // (no browser) so a following -crawl retries them from their checkpoint;
 // a 'needs_split' task is instead retried by re-running -plan.
+// -merge folds another machine's database into this one (no browser); it is
+// idempotent, so re-merging an updated copy only adds what is new.
 package main
 
 import (
@@ -44,6 +47,11 @@ func main() {
 	doGen := flag.Bool("gen-tasks", false, "build tasks from the DB only (no browser)")
 	doRerunShortfall := flag.Bool("rerun-shortfall", false, "re-queue incomplete/error tasks to pending (no browser)")
 	doStatus := flag.Bool("status", false, "print progress statistics and exit")
+	var mergePaths []string
+	flag.Func("merge", "merge another machine's database into this one (repeatable, no browser)", func(p string) error {
+		mergePaths = append(mergePaths, p)
+		return nil
+	})
 	confName := flag.String("conference", "", "restrict -plan/-crawl/-gen-tasks/-rerun-shortfall to one conference by name")
 	flag.Usage = usage
 	flag.Parse()
@@ -77,6 +85,19 @@ func main() {
 	if err := seedConferences(ctx, d, cfg.Conferences); err != nil {
 		logger.Error("seed conferences", "err", err)
 		os.Exit(1)
+	}
+
+	for _, p := range mergePaths {
+		st, err := d.Merge(ctx, cfg.Database, p)
+		if err != nil {
+			logger.Error("merge", "db", p, "err", err)
+			os.Exit(1)
+		}
+		logger.Info(fmt.Sprintf("merged %s: %d papers, %d pages, %d tasks added (%d updated), %d conferences, %d counts, %d harvest pages",
+			p, st.Papers, st.Pages, st.TasksAdded, st.TasksUpdated, st.Conferences, st.Counts, st.HarvestPages))
+	}
+	if len(mergePaths) > 0 && !*doStatus && !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
+		return
 	}
 
 	if *doStatus {
@@ -234,8 +255,8 @@ func printStatus(ctx context.Context, d *db.DB) {
 	fmt.Printf("conferences:  %d\n", s.Conferences)
 	fmt.Printf("papers:       %d unique\n", s.Papers)
 	fmt.Printf("pages:        %d raw pages stored\n", s.Pages)
-	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split, %d incomplete\n",
-		s.Pending, s.Running, s.Completed, s.NeedsSplit, s.Incomplete)
+	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split, %d incomplete, %d superseded\n",
+		s.Pending, s.Running, s.Completed, s.NeedsSplit, s.Incomplete, s.Superseded)
 }
 
 func usage() {
@@ -256,6 +277,8 @@ Flags:
   -conference name restrict -plan/-crawl/-gen-tasks/-rerun-shortfall to one
                     conference (e.g. ICML)
   -status          print progress statistics
+  -merge path      merge another machine's database into this one (repeatable;
+                    no browser). Run it while no scraper is using either file.
 
 A task is marked 'incomplete' when Scholar's own pagination ends a crawl (no
 next page) far short of the task's planned result estimate — Scholar

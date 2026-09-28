@@ -141,7 +141,7 @@ func setup(t *testing.T, page int, fb *fakeBrowser) (*db.DB, *Crawler) {
 		// reconciles tasks.page against MAX(page_number)+1, so a bare pointer
 		// without committed pages would be reset to 1 before the task runs.
 		for p := 1; p < page; p++ {
-			if err := d.CommitPage(ctx, db.PageCommit{
+			if _, err := d.CommitPage(ctx, db.PageCommit{
 				TaskID: tasks[0].ID, PageNumber: p, HTML: "seed", NextPage: p + 1,
 			}); err != nil {
 				t.Fatalf("seed page %d: %v", p, err)
@@ -1241,5 +1241,84 @@ func TestViableKeywords(t *testing.T) {
 	deduped := dedupSubstringKeywords([]string{"networks", "network", "graph"})
 	if len(deduped) != 2 || deduped[0] != "networks" || deduped[1] != "graph" {
 		t.Fatalf("dedupSubstringKeywords = %v, want [networks graph]", deduped)
+	}
+}
+
+// seedTask inserts one pending task with the given estimate into a fresh DB and
+// returns the DB and a crawler over fb (the shape of the real ICML task 91).
+func seedTask(t *testing.T, estimate int, fb *fakeBrowser) (*db.DB, *Crawler) {
+	t.Helper()
+	ctx := context.Background()
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	confID, err := d.UpsertConference(ctx, "TEST", `"test conf"`)
+	if err != nil {
+		t.Fatalf("upsert conference: %v", err)
+	}
+	if _, err := d.UpsertTask(ctx, &db.Task{
+		ConferenceID: confID, Query: `"test conf"`, YearFrom: 2020, YearTo: 2021, TotalEstimate: estimate,
+	}); err != nil {
+		t.Fatalf("upsert task: %v", err)
+	}
+	cfg := &config.Config{MaxResults: 1000, StartYear: 2000}
+	return d, New(cfg, d, fb, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// TestCrawlSkipsOverCapEstimate: a pending task whose stored estimate already
+// exceeds max_results is flagged needs_split without a single search.
+func TestCrawlSkipsOverCapEstimate(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{mkScholarPage([]string{"AAA"}, true)}}
+	d, c := seedTask(t, 3060, fb)
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusNeedsSplit || fb.searchCalls != 0 {
+		t.Fatalf("expected needs_split with no search, got %+v (searches=%d)", task, fb.searchCalls)
+	}
+}
+
+// TestCrawlSkipsOverCapCachedCount: a task planned with no count (estimate 0)
+// whose window count_cache now knows to be over the cap is flagged without a
+// search.
+func TestCrawlSkipsOverCapCachedCount(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{mkScholarPage([]string{"AAA"}, true)}}
+	d, c := seedTask(t, 0, fb)
+	if err := d.SetCachedCount(context.Background(), `"test conf"`, 2020, 2021, 7490); err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusNeedsSplit || fb.searchCalls != 0 {
+		t.Fatalf("expected needs_split with no search, got %+v (searches=%d)", task, fb.searchCalls)
+	}
+}
+
+// TestCrawlLiveCountOverCap: a task with no usable estimate whose first page
+// reports more than max_results is flagged needs_split before any page is
+// committed, and the live count is cached for the next plan.
+func TestCrawlLiveCountOverCap(t *testing.T) {
+	page := strings.Replace(mkScholarPage([]string{"AAA", "BBB"}, true),
+		"Page 1 of about 6 results", "About 7,490 results", 1)
+	fb := &fakeBrowser{contents: []string{page, page}}
+	d, c := seedTask(t, 0, fb)
+	ctx := context.Background()
+	if err := c.CrawlConference(ctx, 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusNeedsSplit {
+		t.Fatalf("expected needs_split, got %+v", task)
+	}
+	if next, _ := d.ReconcileTaskPage(ctx, task.ID); next > 1 {
+		t.Errorf("expected no committed pages, reconcile says next page %d", next)
+	}
+	if n, ok, _ := d.GetCachedCount(ctx, `"test conf"`, 2020, 2021); !ok || n != 7490 {
+		t.Errorf("expected cached count 7490, got %d ok=%v", n, ok)
 	}
 }

@@ -145,7 +145,10 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	// CAPTCHA allowance.
 	var resolved []split.Leaf
 	for _, l := range leaves {
-		if !l.NeedsSplit || l.YearFrom != l.YearTo {
+		// A leaf with no readable count cannot be resolved (there is no true
+		// total to partition against); it stays a needs_split TODO for the next
+		// plan run, once the count is probed or cached.
+		if !l.NeedsSplit || !l.HasCount || l.YearFrom != l.YearTo {
 			resolved = append(resolved, l)
 			continue
 		}
@@ -190,8 +193,11 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 		if l.NeedsSplit {
 			// Record why this leaf is a TODO (over max_results), self-documenting
 			// the flag the same way the crawl-time page-cap backstop does.
-			_ = c.db.SetTaskNeedsSplit(ctx, id,
-				fmt.Sprintf("estimate %d exceeds the %d-result cap", l.Count, c.cfg.MaxResults))
+			reason := fmt.Sprintf("estimate %d exceeds the %d-result cap", l.Count, c.cfg.MaxResults)
+			if !l.HasCount {
+				reason = "result count unavailable at plan time; re-plan to probe it"
+			}
+			_ = c.db.SetTaskNeedsSplit(ctx, id, reason)
 		}
 		keepKeys = append(keepKeys, t.Key())
 		if l.NeedsSplit {
@@ -826,7 +832,10 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 
 	var resolved []split.Leaf
 	for _, l := range leaves {
-		if !l.NeedsSplit || l.YearFrom != l.YearTo {
+		// A leaf with no readable count cannot be resolved (there is no true
+		// total to partition against); it stays a needs_split TODO for the next
+		// plan run, once the count is probed or cached.
+		if !l.NeedsSplit || !l.HasCount || l.YearFrom != l.YearTo {
 			resolved = append(resolved, l)
 			continue
 		}
@@ -988,6 +997,13 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			c.log.Info(fmt.Sprintf("conference %d: shutdown requested, stopping before task %d", confID, t.ID))
 			return err
 		}
+		if reason, over := c.overCap(ctx, *t); over {
+			if err := c.db.SetTaskNeedsSplit(ctx, t.ID, reason); err != nil {
+				return err
+			}
+			c.log.Info(fmt.Sprintf("task %d: %s -> needs_split (not crawled)", t.ID, reason))
+			continue
+		}
 		c.br.PauseBetweenSearches()
 		if err := c.crawlTask(ctx, *t); err != nil {
 			c.log.Info(fmt.Sprintf("task %d failed: %v", t.ID, err))
@@ -997,6 +1013,23 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 		}
 	}
 	return nil
+}
+
+// overCap reports whether a pending task is known to exceed max_results before
+// any search is spent on it: by its stored estimate, or — when the planner never
+// read one (estimate 0) — by the count_cache entry for the same query and years.
+// Such a task can only ever yield the first ~1,000 of its results, so crawling
+// it is wasted pages; it belongs back in the planner as a needs_split TODO.
+func (c *Crawler) overCap(ctx context.Context, t db.Task) (string, bool) {
+	if t.TotalEstimate > c.cfg.MaxResults {
+		return fmt.Sprintf("estimate %d exceeds the %d-result cap", t.TotalEstimate, c.cfg.MaxResults), true
+	}
+	if t.TotalEstimate <= 0 {
+		if n, ok, err := c.db.GetCachedCount(ctx, t.Query, t.YearFrom, t.YearTo); err == nil && ok && n > c.cfg.MaxResults {
+			return fmt.Sprintf("cached count %d exceeds the %d-result cap", n, c.cfg.MaxResults), true
+		}
+	}
+	return "", false
 }
 
 // RerunShortfall re-queues a conference's 'incomplete' and 'error' tasks back
@@ -1050,6 +1083,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	maxPages := (c.cfg.MaxResults+scholarPageSize-1)/scholarPageSize + 2
 	emptyRuns := 0
 	prevKey := "" // fingerprint of the previous page's results, for stall detection
+	first := true // live cap check pending (see below)
 
 	for {
 		if c.br.IsBlocked() {
@@ -1077,6 +1111,21 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		// re-committed the same page until the cap flagged the task — the crawl
 		// looked "stuck"). Flag it instead of committing a duplicate. Empty pages
 		// return "" from itemsKey, so the sparse/end handlers below own those.
+		// Live cap check, on the first page this run reads: Scholar's own count
+		// is authoritative over the planner's (possibly missing or stale) figure.
+		// An over-cap task is flagged before anything is committed, and the count
+		// is cached so the next -plan splits this window instead of re-probing it.
+		if first && p.HasCount && !p.Blocked {
+			first = false
+			if p.Count > c.cfg.MaxResults {
+				_ = c.db.SetCachedCount(ctx, task.Query, task.YearFrom, task.YearTo, p.Count)
+				_ = c.db.SetTaskNeedsSplit(ctx, task.ID,
+					fmt.Sprintf("live count %d exceeds the %d-result cap", p.Count, c.cfg.MaxResults))
+				c.log.Info(fmt.Sprintf("task %d: live count %d > cap %d -> needs_split", task.ID, p.Count, c.cfg.MaxResults))
+				return nil
+			}
+		}
+
 		curKey := itemsKey(p.Items)
 		if curKey != "" && curKey == prevKey {
 			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError,
@@ -1098,7 +1147,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			// The "vanish" case: a results page with zero rows but a live Next
 			// link. Retry a few pages; if it persists, flag for re-split.
 			pc.NextPage = page // do not advance the resume pointer
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			if _, err := c.db.CommitPage(ctx, pc); err != nil {
 				return err
 			}
 			emptyRuns++
@@ -1117,7 +1166,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			// to override if Scholar under-delivered.
 			pc.NextPage = page
 			pc.Final = true
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			if _, err := c.db.CommitPage(ctx, pc); err != nil {
 				return err
 			}
 			if err := c.flagIfShortfall(ctx, task); err != nil {
@@ -1128,7 +1177,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 
 		default:
 			pc.NextPage = page + 1
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			if _, err := c.db.CommitPage(ctx, pc); err != nil {
 				return err
 			}
 			emptyRuns = 0
