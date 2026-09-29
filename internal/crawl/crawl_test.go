@@ -801,6 +801,22 @@ func seedConfPapers(t *testing.T, d *db.DB, confID int64, nFoo, nBar int) {
 
 // cacheCount returns a CountFunc that answers only from the count_cache (a
 // test stand-in for a fully-cached, budgeted live count; no browser).
+// seedNamedPapers files n papers under one conference, all sharing a title
+// stem, for corpora that must be distinguishable from seedConfPapers' foo/bar.
+func seedNamedPapers(t *testing.T, d *db.DB, confID int64, prefix, title string, n int) {
+	t.Helper()
+	var papers []db.Paper
+	for i := 0; i < n; i++ {
+		papers = append(papers, db.Paper{
+			Hash: fmt.Sprintf("%s-%d", prefix, i), Title: fmt.Sprintf("%s %d", title, i),
+			Year: 2020, ConferenceID: confID, SourcedFrom: "crawl",
+		})
+	}
+	if _, err := d.SavePapers(context.Background(), papers); err != nil {
+		t.Fatalf("seed papers: %v", err)
+	}
+}
+
 func cacheCount(d *db.DB) split.CountFunc {
 	return func(query string, yFrom, yTo int) (int, bool) {
 		n, ok, err := d.GetCachedCount(context.Background(), query, yFrom, yTo)
@@ -1021,29 +1037,45 @@ func TestResolveYearThinCorpusFallsBack(t *testing.T) {
 // TestResolveYearUsesCrossConferenceCorpus: the year's partition corpus is
 // every known paper in that year, not only this conference's. A conference
 // whose own corpus is below the trust floor still resolves when papers crawled
-// under other venues fill out the year.
-func TestResolveYearUsesCrossConferenceCorpus(t *testing.T) {
+// TestResolveYearIgnoresOtherVenuesCorpus: the offline partition is built from
+// THIS conference's papers, not from everything known about the year.
+//
+// Measured on the real database: of 3593 papers known for 2020, 81% were
+// ICRA/IROS and only 107 were ICASSP. "speech" covers 1.6% of that pool and
+// 41.7% of ICASSP — pooling venues both hides the words that divide this one
+// and promotes words ("robots", 12.2% of the pool, 0.8% of ICASSP) that divide
+// nothing here.
+func TestResolveYearIgnoresOtherVenuesCorpus(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	ctx := context.Background()
-	// This conference alone: 8 papers < MinPapersToTrust — would bail offline.
-	seedConfPapers(t, d, conf.ID, 4, 4)
-	// Another conference's papers in the same year fill out the corpus: the
-	// widened pool of 128 papers partitions foo/¬foo under the 80-doc offline
-	// cap and each bucket verifies under the 100-result crawl cap.
-	otherID, err := d.UpsertConference(ctx, "OTHER", `"Other"`)
-	if err != nil {
-		t.Fatalf("upsert other conference: %v", err)
-	}
-	seedConfPapers(t, d, otherID, 60, 60)
 	base := `"Conf"`
 	for _, q := range []string{base + ` AND "foo"`, base + ` -"foo"`} {
 		if err := d.SetCachedCount(ctx, q, 2020, 2020, 60); err != nil {
 			t.Fatal(err)
 		}
 	}
+	otherID, err := d.UpsertConference(ctx, "OTHER", `"Other"`)
+	if err != nil {
+		t.Fatalf("upsert other conference: %v", err)
+	}
+
+	// Thin venue: 8 papers, under MinPapersToTrust. Another venue's 120 papers
+	// in the same year must NOT make up the difference — a partition drawn from
+	// them describes that venue, so resolveYear declines and the year stays a
+	// needs_split TODO for an online split.
+	seedConfPapers(t, d, conf.ID, 4, 4)
+	seedNamedPapers(t, d, otherID, "zoo", "Zoo Qux", 120)
+	if _, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false); ok {
+		t.Fatal("resolveYear resolved a thin venue on another venue's corpus, want ok=false")
+	}
+
+	// Same year, this venue now has its own 120 papers. The foreign 120 are
+	// still there and must not dilute the split: "foo" divides this venue 60/60
+	// and the year resolves into two verified leaves.
+	seedConfPapers(t, d, conf.ID, 60, 60)
 	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false)
 	if !ok {
-		t.Fatal("resolveYear must partition the cross-conference corpus, not just this venue's papers")
+		t.Fatal("resolveYear failed on a venue with its own corpus, want ok")
 	}
 	if len(leaves) != 2 {
 		t.Fatalf("leaves = %d, want 2", len(leaves))

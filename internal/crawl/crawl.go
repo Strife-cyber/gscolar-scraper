@@ -317,7 +317,17 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 // to rank high, so generic vocabulary can never masquerade as a splitter.
 // Mined keywords come first so the partition sees the best splitters first.
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
-	mined := c.minedKeywords(ctx)
+	// Candidates are mined from THIS conference's papers, every year of them.
+	//
+	// The venue's own vocabulary is what divides the venue; another venue's
+	// promotes words that match none of it. Pooling years is what makes this
+	// affordable: planning harvests a page of results per count probe, so a
+	// conference accumulates its own corpus while being planned — ICASSP had
+	// 1765 papers of its own before a single crawl ran, against 107 for the one
+	// year being planned. A term's frequency does drift between 2000 and 2024,
+	// which is why this list is only the POOL; corpusRank re-scores it per
+	// branch on the year's own papers before anything is probed.
+	mined := c.minedKeywordsFor(ctx, conf)
 	seen := map[string]bool{}
 	var kws []string
 	for _, w := range append(mined, c.cfg.Keywords...) {
@@ -331,7 +341,15 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 	// covering 0 known papers or >75% of them can never produce a clean split,
 	// and plural/substring variants ("network" vs "networks") probe the same
 	// coverage twice.
-	kws = viableKeywords(c.backgroundTexts(ctx), dedupSubstringKeywords(kws))
+	// Viability is judged on the venue too: "speech" covers 1.6% of the 2020
+	// all-venue corpus and would be culled as too rare, while covering 41.7% of
+	// ICASSP. Falling back to the whole corpus when the venue is still unknown
+	// keeps a first-ever plan from having no candidates at all.
+	texts := c.conferenceTexts(ctx, conf)
+	if len(texts) < c.cfg.MinPapersToTrust {
+		texts = c.backgroundTexts(ctx)
+	}
+	kws = viableKeywords(texts, dedupSubstringKeywords(kws))
 	return split.DropDegenerateKeywords(conf.Query, kws)
 }
 
@@ -440,6 +458,51 @@ func (c *Crawler) minedKeywords(ctx context.Context) []string {
 // backgroundTexts returns every stored paper's text, fetched once per Crawler
 // and reused for the IDF denominator of every mining pass. A load failure
 // degrades gracefully to plain Balance ranking (empty background → IDF 1.0).
+// conferenceTexts is every known paper of one conference, all years, as
+// title+snippet. Unlike backgroundTexts it is not cached on the Crawler: a plan
+// run walks several conferences and each needs its own.
+func (c *Crawler) conferenceTexts(ctx context.Context, conf db.Conference) []string {
+	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
+	if err != nil {
+		c.log.Info(fmt.Sprintf("load %s corpus: %v", conf.Name, err))
+		return nil
+	}
+	out := make([]string, 0, len(papers))
+	for _, p := range papers {
+		out = append(out, p.Title+" "+p.Snippet)
+	}
+	return out
+}
+
+// minedKeywordsFor mines splitter candidates from one conference's corpus,
+// falling back to the whole database while that conference is still unknown.
+// The whole-DB ranking stays cached on the Crawler; a per-conference one is
+// computed fresh, since a plan run visits several conferences in turn.
+func (c *Crawler) minedKeywordsFor(ctx context.Context, conf db.Conference) []string {
+	texts := c.conferenceTexts(ctx, conf)
+	if len(texts) < c.cfg.MinPapersToTrust {
+		return c.minedKeywords(ctx)
+	}
+	opts := mine.DefaultOptions()
+	opts.MinBalance = c.cfg.MinBalance
+	opts.MaxNGram = c.cfg.MineMaxNGram
+	if c.cfg.MineBigrams && opts.MaxNGram < 2 {
+		opts.MaxNGram = 2
+	}
+	opts.PhraseBoost = c.cfg.MinePhraseBoost
+	opts.MaxCandidates = c.cfg.MaxMinedKeywords
+	mp := make([]mine.Paper, 0, len(texts))
+	for i, t := range texts {
+		mp = append(mp, mine.Paper{Hash: fmt.Sprintf("%s-%d", conf.Name, i), Title: t})
+	}
+	cands := mine.MineIDF(mp, texts, opts)
+	kws := make([]string, 0, len(cands))
+	for _, cd := range cands {
+		kws = append(kws, cd.Keyword)
+	}
+	return kws
+}
+
 func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 	c.bgOnce.Do(func() {
 		texts, err := c.db.AllPaperTexts(ctx)
@@ -625,13 +688,24 @@ func dropKeyword(keywords []string, drop string) []string {
 // explode (each count() is an expensive Scholar search), so instead of trusting
 // a biased sample we bail to the bounded count-probe chain.
 func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, trueCount int, keywords []string, count split.CountFunc, budget *probeBudget, offline bool) ([]split.Leaf, bool) {
-	// The corpus is every known paper in this year across ALL conferences, not
-	// just this venue's: a keyword that divides the year's result space is
-	// equally evidenced by papers crawled under other venues, and restricting
-	// to this conference's rows alone would leave most years too thin to
-	// partition. Buckets are still verified against this conference's query, so
-	// an over-broad corpus can only over-estimate a bucket — never under-count.
-	papers, err := c.db.PapersInYears(ctx, year, year)
+	// The corpus is THIS conference's papers for THIS year, and nothing else.
+	//
+	// It used to be every paper of the year across all venues, on the argument
+	// that a keyword dividing the result space is as well evidenced by one
+	// venue as another. ICASSP disproved that. Of the 3593 papers known for
+	// 2020, 81% are ICRA and IROS and only 107 are ICASSP, and the ranking that
+	// came out was not merely noisy but inverted:
+	//
+	//	         all venues 2020   ICASSP
+	//	speech        1.6%          41.7%   best splitter there is — vetoed as too rare
+	//	robots       12.2%           0.8%   ranked highly, matches nothing
+	//	robotic      11.4%           0.6%
+	//
+	// Planning ICASSP 2020 duly produced buckets of 0 and 2 results on
+	// "robotic" and "robots". A corpus made of other venues does not just add
+	// noise, it promotes the words that cannot work and buries the one that
+	// can.
+	papers, err := c.db.PapersForConference(ctx, conf.ID, year, year)
 	if err != nil {
 		return nil, false
 	}
@@ -646,6 +720,10 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
 	}
 	veto := corpusVeto(yearTexts, nil, nil)
+	// Coverage is now this venue's share of its own year, which is what decides
+	// whether an offline split can be trusted. Measured against every venue's
+	// papers it read 3593/1860 — capped to 1.0, "we know this year completely" —
+	// while the planner in fact knew 5.8% of ICASSP 2020.
 	coverage := 1.0
 	if trueCount > len(papers) {
 		coverage = float64(len(papers)) / float64(trueCount)
