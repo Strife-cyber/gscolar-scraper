@@ -1394,7 +1394,17 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		err := c.br.ClickNext()
 		if err != nil {
 			if _, ok := errors.AsType[*rod.ElementNotFoundError](err); ok {
+				// The result set ended before the pointer did. That is a
+				// completion like any other, so it is judged like any other:
+				// without this check the path was the one way a task could be
+				// marked completed holding almost nothing. CHI 2018's
+				// -"learning" bucket sat at 'completed' against an estimate of
+				// 502 having kept nothing at all, purely because it exited
+				// here.
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
+				if ferr := c.flagIfShortfall(ctx, task); ferr != nil {
+					return ferr
+				}
 				c.log.Info(fmt.Sprintf("task %d: resume pointer %d past end -> completed", task.ID, page))
 				return nil
 			}
@@ -1664,6 +1674,96 @@ func (c *Crawler) refreshEstimate(ctx context.Context, task *db.Task) {
 	c.log.Info(fmt.Sprintf("task %d: estimate refreshed %d -> %d (Scholar's count now)",
 		task.ID, task.TotalEstimate, p.Count))
 	task.TotalEstimate = p.Count
+}
+
+// BackfillPaperTasks rebuilds the task <-> paper relation from the archived
+// pages, then re-judges every completed task against it.
+//
+// Two things made the old per-task count unusable, and both are repaired here.
+// papers.task_id named an owner and the owner moved: the last task to see a
+// paper took it from the first, so a bucket's figure kept changing after the
+// bucket was finished. And flagIfShortfall judged delivery on that moving
+// figure, which is why fifteen tasks sat at 'completed' holding under half
+// their estimate while only one was ever flagged.
+//
+// page_html is the record of what each task actually saw, so the relation is
+// replayed from it rather than guessed from the current ownership. Pages are
+// streamed one at a time: page_html is the bulk of the database.
+//
+// Re-judging is the point of the exercise and is deliberately two-way — a task
+// the corrected count now shows as well delivered keeps its 'completed'.
+func (c *Crawler) BackfillPaperTasks(ctx context.Context) error {
+	empty, err := c.db.PaperTasksEmpty(ctx)
+	if err != nil {
+		return err
+	}
+	if empty {
+		c.log.Info("paper_tasks is empty: rebuilding it from the archived pages")
+	} else {
+		c.log.Info("paper_tasks already holds rows: replaying the archived pages to complete it")
+	}
+
+	ids, err := c.db.ArchivedPageIDs(ctx)
+	if err != nil {
+		return err
+	}
+	c.log.Info(fmt.Sprintf("backfill: %d archived pages to replay", len(ids)))
+
+	var pages, links, unparsed int
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ap, aerr := c.db.ArchivedPage(ctx, id)
+		if aerr != nil {
+			return aerr
+		}
+		pages++
+		p, perr := parse.Parse(ap.HTML)
+		if perr != nil || len(p.Items) == 0 {
+			unparsed++
+			continue
+		}
+		hashes := make([]string, 0, len(p.Items))
+		for _, it := range p.Items {
+			hashes = append(hashes, hash.PaperHash(it.Title, it.Year, it.Authors))
+		}
+		n, lerr := c.db.LinkPapersToTask(ctx, ap.TaskID, hashes)
+		if lerr != nil {
+			return lerr
+		}
+		links += n
+		if pages%200 == 0 {
+			c.log.Info(fmt.Sprintf("backfill: %d/%d pages replayed, %d links written", pages, len(ids), links))
+		}
+	}
+	c.log.Info(fmt.Sprintf("backfill: %d pages replayed, %d links written, %d pages held no parsable result",
+		pages, links, unparsed))
+
+	tasks, err := c.db.CompletedTasks(ctx)
+	if err != nil {
+		return err
+	}
+	flagged := 0
+	for _, t := range tasks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		before := t.Status
+		if err := c.flagIfShortfall(ctx, t); err != nil {
+			return err
+		}
+		if before == db.StatusCompleted {
+			got, cerr := c.db.CountPapersForTask(ctx, t.ID)
+			if cerr == nil && t.TotalEstimate > 0 &&
+				float64(got) < float64(t.TotalEstimate)*c.cfg.MinCompletionRatio {
+				flagged++
+			}
+		}
+	}
+	c.log.Info(fmt.Sprintf("requalification: %d completed tasks re-judged, %d moved to incomplete",
+		len(tasks), flagged))
+	return nil
 }
 
 // flagIfShortfall overrides a just-completed task's status to 'incomplete'

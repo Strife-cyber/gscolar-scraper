@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS page_html (
     UNIQUE(task_id, page_number)
 );
 
+-- paper_tasks records every task that served a given paper, independently of
+-- papers.task_id. It exists because task_id names an owner, and an owner can
+-- only be one task: when two buckets of the same year overlap -- Scholar's
+-- -"term" exclusion is not reliable -- the second task to see a paper used to
+-- take it from the first, emptying out the first task's count after the fact.
+-- CHI 2018 showed it plainly: task 211 walked its page, kept nothing it could
+-- call its own, and its sibling 210 finished hours later holding exactly the
+-- 640 papers its 32 pages could hold. Coverage has to be a relation, not a
+-- column.
+CREATE TABLE IF NOT EXISTS paper_tasks (
+    hash    TEXT NOT NULL,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    PRIMARY KEY (hash, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_tasks_task ON paper_tasks(task_id);
+
 CREATE TABLE IF NOT EXISTS count_cache (
     query     TEXT NOT NULL,
     year_from INTEGER NOT NULL,
@@ -389,6 +405,19 @@ func scanTasks(rows *sql.Rows) ([]Task, error) {
 // A 'running' status only exists while the process is alive; seeing one at the
 // start of a crawl means a previous run crashed mid-task, so it must be
 // re-queued (its page pointer resumes where it stopped).
+// CompletedTasks returns every task marked completed, across all
+// conferences, for a pass that re-judges their delivery.
+func (d *DB) CompletedTasks(ctx context.Context) ([]Task, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT id, conference_id, query, year_from, year_to, keywords, page, status, total_results_estimate, error
+		FROM tasks WHERE status = 'completed' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTasks(rows)
+}
+
 func (d *DB) ResetStaleRunning(ctx context.Context, conferenceID int64) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE tasks SET status = 'pending' WHERE conference_id = ? AND status = 'running'`,
@@ -517,10 +546,16 @@ func savePapersTx(ctx context.Context, tx *sql.Tx, papers []Paper) (int, error) 
 			 task_id, conference_id, sourced_from)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		        COALESCE(?, (SELECT conference_id FROM tasks WHERE id = ?)), ?)
+		-- The first task to find a paper keeps it. The reverse order handed
+		-- ownership to whichever task saw it last, so a bucket's count kept
+		-- changing after the bucket was done -- see paper_tasks' comment.
+		-- A paper harvested during planning has no task_id yet, so the first
+		-- crawl that reaches it still claims it, and sourced_from follows.
 		ON CONFLICT(hash) DO UPDATE SET
-			task_id       = COALESCE(excluded.task_id, papers.task_id),
-			conference_id = COALESCE(excluded.conference_id, papers.conference_id),
-			sourced_from  = CASE WHEN excluded.task_id IS NOT NULL THEN 'crawl' ELSE papers.sourced_from END`)
+			task_id       = COALESCE(papers.task_id, excluded.task_id),
+			conference_id = COALESCE(papers.conference_id, excluded.conference_id),
+			sourced_from  = CASE WHEN papers.task_id IS NULL AND excluded.task_id IS NOT NULL
+			                     THEN 'crawl' ELSE papers.sourced_from END`)
 	if err != nil {
 		return 0, err
 	}
@@ -661,7 +696,8 @@ func (d *DB) PaperCount(ctx context.Context) (int, error) {
 // task, used to detect Scholar under-delivering relative to TotalEstimate.
 func (d *DB) CountPapersForTask(ctx context.Context, taskID int64) (int, error) {
 	var n int
-	err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM papers WHERE task_id = ?`, taskID).Scan(&n)
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM paper_tasks WHERE task_id = ?`, taskID).Scan(&n)
 	return n, err
 }
 
@@ -701,7 +737,7 @@ func (d *DB) CommitPage(ctx context.Context, pc PageCommit) (int, error) {
 
 	var before int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM papers WHERE task_id = ?`, pc.TaskID).Scan(&before); err != nil {
+		`SELECT COUNT(*) FROM paper_tasks WHERE task_id = ?`, pc.TaskID).Scan(&before); err != nil {
 		return 0, err
 	}
 
@@ -715,9 +751,14 @@ func (d *DB) CommitPage(ctx context.Context, pc PageCommit) (int, error) {
 		return 0, err
 	}
 
+	// Record that this task served these papers, whoever ends up owning them.
+	if err := linkPapersToTaskTx(ctx, tx, pc.TaskID, pc.Papers); err != nil {
+		return 0, err
+	}
+
 	var after int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM papers WHERE task_id = ?`, pc.TaskID).Scan(&after); err != nil {
+		`SELECT COUNT(*) FROM paper_tasks WHERE task_id = ?`, pc.TaskID).Scan(&after); err != nil {
 		return 0, err
 	}
 
@@ -743,6 +784,110 @@ func (d *DB) CommitPage(ctx context.Context, pc PageCommit) (int, error) {
 		return 0, err
 	}
 	return after - before, nil
+}
+
+// linkPapersToTaskTx records the task <-> paper relation for one page. Rows
+// already present are left alone, so re-committing a page is idempotent and
+// the "new to this task" delta the caller reads stays honest.
+func linkPapersToTaskTx(ctx context.Context, tx *sql.Tx, taskID int64, papers []Paper) error {
+	if taskID == 0 || len(papers) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT OR IGNORE INTO paper_tasks (hash, task_id) VALUES (?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for i := range papers {
+		if _, err := stmt.ExecContext(ctx, papers[i].Hash, taskID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LinkPapersToTask records a task <-> paper relation outside a page commit.
+// Used by the backfill, which replays archived pages.
+func (d *DB) LinkPapersToTask(ctx context.Context, taskID int64, hashes []string) (int, error) {
+	if taskID == 0 || len(hashes) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT OR IGNORE INTO paper_tasks (hash, task_id) VALUES (?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, h := range hashes {
+		res, err := stmt.ExecContext(ctx, h, taskID)
+		if err != nil {
+			stmt.Close()
+			return 0, err
+		}
+		a, _ := res.RowsAffected()
+		n += int(a)
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ArchivedPage is one stored results page, for replay.
+type ArchivedPage struct {
+	TaskID     int64
+	PageNumber int
+	HTML       string
+}
+
+// PaperTasksEmpty reports whether the relation has never been populated, so a
+// one-off backfill can be offered rather than forced.
+func (d *DB) PaperTasksEmpty(ctx context.Context) (bool, error) {
+	var n int
+	err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paper_tasks LIMIT 1`).Scan(&n)
+	return n == 0, err
+}
+
+// ArchivedPageIDs lists every stored results page, in task order, as ids only.
+//
+// The caller then fetches one page at a time with ArchivedPage. Streaming the
+// HTML from a single open cursor instead would deadlock: the pool is capped at
+// one connection (see Open), so a write issued while a result set is still
+// open waits for a connection that the cursor itself is holding. Ids are small
+// enough to hold all at once -- a few thousand integers against a page_html
+// that is most of the database.
+func (d *DB) ArchivedPageIDs(ctx context.Context) ([]int64, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT id FROM page_html ORDER BY task_id, page_number`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ArchivedPage returns one stored results page by id.
+func (d *DB) ArchivedPage(ctx context.Context, id int64) (ArchivedPage, error) {
+	var p ArchivedPage
+	err := d.db.QueryRowContext(ctx,
+		`SELECT task_id, page_number, html FROM page_html WHERE id = ?`, id).
+		Scan(&p.TaskID, &p.PageNumber, &p.HTML)
+	return p, err
 }
 
 // citationCount is what goes into papers.citations. Scholar simply omits the
