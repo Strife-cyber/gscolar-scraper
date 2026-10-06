@@ -16,6 +16,7 @@ import (
 	"gscolar-scraper/internal/config"
 	"gscolar-scraper/internal/db"
 	"gscolar-scraper/internal/hash"
+	"gscolar-scraper/internal/partition"
 	"gscolar-scraper/internal/split"
 )
 
@@ -34,6 +35,7 @@ type fakeBrowser struct {
 	blocked        bool  // IsBlocked() return value (cleared by a successful CAPTCHA wait)
 	captchaErr     error // returned by WaitForCaptchaResolved
 	captchaWaits   int   // how many times WaitForCaptchaResolved was called
+	nextCalls      int   // how many times ClickNext was called (resume-walk cost)
 
 	// cancel, if set, is invoked from PauseBetweenPages (right after a page has
 	// been committed, mirroring where crawlTask checks ctx.Err()) to simulate a
@@ -62,6 +64,7 @@ func (f *fakeBrowser) Content() (string, error) {
 	return f.contents[f.idx], nil
 }
 func (f *fakeBrowser) ClickNext() error {
+	f.nextCalls++
 	if f.clickNextErr != nil {
 		return f.clickNextErr
 	}
@@ -141,7 +144,7 @@ func setup(t *testing.T, page int, fb *fakeBrowser) (*db.DB, *Crawler) {
 		// reconciles tasks.page against MAX(page_number)+1, so a bare pointer
 		// without committed pages would be reset to 1 before the task runs.
 		for p := 1; p < page; p++ {
-			if err := d.CommitPage(ctx, db.PageCommit{
+			if _, err := d.CommitPage(ctx, db.PageCommit{
 				TaskID: tasks[0].ID, PageNumber: p, HTML: "seed", NextPage: p + 1,
 			}); err != nil {
 				t.Fatalf("seed page %d: %v", p, err)
@@ -324,9 +327,18 @@ func TestCrawlTaskCaptchaMidCrawlUnresolvable(t *testing.T) {
 
 // mkScholarPage renders a minimal results page with the given titles. Items are
 // keyed by (title, year, author), so pages sharing titles share papers.
+// mkScholarPage builds a fake results page announcing 6 results.
 func mkScholarPage(items []string, withNext bool) string {
+	return mkScholarPageCount(items, withNext, 6)
+}
+
+// mkScholarPageCount is mkScholarPage with an explicit "About N results"
+// header. The crawl now reads that header back and overwrites the task's
+// planned estimate with it (refreshEstimate), so a test about under-delivery
+// has to be able to say what Scholar claims, not just what it serves.
+func mkScholarPageCount(items []string, withNext bool, count int) string {
 	var sb strings.Builder
-	sb.WriteString(`<html><body><div id="gs_ab_md">Page 1 of about 6 results</div>`)
+	fmt.Fprintf(&sb, `<html><body><div id="gs_ab_md">Page 1 of about %d results</div>`, count)
 	for i, title := range items {
 		fmt.Fprintf(&sb,
 			`<div class="gs_r gs_or" data-cid="c%d"><div class="gs_ri">`+
@@ -606,9 +618,12 @@ func TestCrawlTaskShortfallAtEmptyPage(t *testing.T) {
 // TotalEstimate is flagged incomplete, reproducing the real IJCAI 2022-2023
 // case (About 371 results, 17 papers committed, no gs_n pagination at all).
 func TestCrawlTaskShortfallAtNoNextPage(t *testing.T) {
-	pageA := mkScholarPage([]string{"AAA", "BBB", "CCC"}, false) // no next link
+	// Scholar claims 1000 and serves 3, with no next link: genuine
+	// under-delivery. The claim has to be in the page, not only in the stored
+	// task, because refreshEstimate now trusts the page over the plan.
+	pageA := mkScholarPageCount([]string{"AAA", "BBB", "CCC"}, false, 1000)
 	fb := &fakeBrowser{contents: []string{pageA}}
-	d, c := setupWithRatio(t, 1, fb, 0.5) // 3 papers vs TotalEstimate 1000
+	d, c := setupWithRatio(t, 1, fb, 0.5) // 3 papers vs 1000 claimed
 
 	if err := c.CrawlConference(context.Background(), 1); err != nil {
 		t.Fatalf("crawl: %v", err)
@@ -659,7 +674,12 @@ func TestCrawlTaskNoShortfallWithoutEstimate(t *testing.T) {
 		t.Fatalf("upsert task: %v", err)
 	}
 
-	fb := &fakeBrowser{contents: []string{readSample(t, "empty")}}
+	// A results page carrying no "About N" header at all. samples/empty.html
+	// cannot serve here any more: it announces 730 results while serving none,
+	// so refreshEstimate rightly gives the task an estimate and the shortfall
+	// check rightly fires. What still needs covering is flagIfShortfall's guard
+	// for when no count can be known at all.
+	fb := &fakeBrowser{contents: []string{`<html><body><div id="gs_res_ccl"></div></body></html>`}}
 	cfg := &config.Config{MaxResults: 1000, StartYear: 2000, Keywords: []string{"learning"}, MinCompletionRatio: 0.9}
 	c := New(cfg, d, fb, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -781,6 +801,22 @@ func seedConfPapers(t *testing.T, d *db.DB, confID int64, nFoo, nBar int) {
 
 // cacheCount returns a CountFunc that answers only from the count_cache (a
 // test stand-in for a fully-cached, budgeted live count; no browser).
+// seedNamedPapers files n papers under one conference, all sharing a title
+// stem, for corpora that must be distinguishable from seedConfPapers' foo/bar.
+func seedNamedPapers(t *testing.T, d *db.DB, confID int64, prefix, title string, n int) {
+	t.Helper()
+	var papers []db.Paper
+	for i := 0; i < n; i++ {
+		papers = append(papers, db.Paper{
+			Hash: fmt.Sprintf("%s-%d", prefix, i), Title: fmt.Sprintf("%s %d", title, i),
+			Year: 2020, ConferenceID: confID, SourcedFrom: "crawl",
+		})
+	}
+	if _, err := d.SavePapers(context.Background(), papers); err != nil {
+		t.Fatalf("seed papers: %v", err)
+	}
+}
+
 func cacheCount(d *db.DB) split.CountFunc {
 	return func(query string, yFrom, yTo int) (int, bool) {
 		n, ok, err := d.GetCachedCount(context.Background(), query, yFrom, yTo)
@@ -901,7 +937,7 @@ func TestResolveYearPartitionsOverCapYear(t *testing.T) {
 		}
 	}
 
-	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget())
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false)
 	if !ok {
 		t.Fatalf("resolveYear failed, want ok")
 	}
@@ -968,7 +1004,7 @@ func TestResolveYearOfflineUndercountFallsBackToResolveOverCap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget())
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false)
 	if !ok {
 		t.Fatalf("resolveYear failed, want ok")
 	}
@@ -993,7 +1029,7 @@ func TestResolveYearOfflineUndercountFallsBackToResolveOverCap(t *testing.T) {
 func TestResolveYearThinCorpusFallsBack(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	seedConfPapers(t, d, conf.ID, 4, 4) // 8 papers < MinPapersToTrust (10)
-	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget()); ok {
+	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false); ok {
 		t.Fatal("resolveYear succeeded on a thin corpus, want fallback (ok=false)")
 	}
 }
@@ -1001,29 +1037,45 @@ func TestResolveYearThinCorpusFallsBack(t *testing.T) {
 // TestResolveYearUsesCrossConferenceCorpus: the year's partition corpus is
 // every known paper in that year, not only this conference's. A conference
 // whose own corpus is below the trust floor still resolves when papers crawled
-// under other venues fill out the year.
-func TestResolveYearUsesCrossConferenceCorpus(t *testing.T) {
+// TestResolveYearIgnoresOtherVenuesCorpus: the offline partition is built from
+// THIS conference's papers, not from everything known about the year.
+//
+// Measured on the real database: of 3593 papers known for 2020, 81% were
+// ICRA/IROS and only 107 were ICASSP. "speech" covers 1.6% of that pool and
+// 41.7% of ICASSP — pooling venues both hides the words that divide this one
+// and promotes words ("robots", 12.2% of the pool, 0.8% of ICASSP) that divide
+// nothing here.
+func TestResolveYearIgnoresOtherVenuesCorpus(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	ctx := context.Background()
-	// This conference alone: 8 papers < MinPapersToTrust — would bail offline.
-	seedConfPapers(t, d, conf.ID, 4, 4)
-	// Another conference's papers in the same year fill out the corpus: the
-	// widened pool of 128 papers partitions foo/¬foo under the 80-doc offline
-	// cap and each bucket verifies under the 100-result crawl cap.
-	otherID, err := d.UpsertConference(ctx, "OTHER", `"Other"`)
-	if err != nil {
-		t.Fatalf("upsert other conference: %v", err)
-	}
-	seedConfPapers(t, d, otherID, 60, 60)
 	base := `"Conf"`
 	for _, q := range []string{base + ` AND "foo"`, base + ` -"foo"`} {
 		if err := d.SetCachedCount(ctx, q, 2020, 2020, 60); err != nil {
 			t.Fatal(err)
 		}
 	}
-	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget())
+	otherID, err := d.UpsertConference(ctx, "OTHER", `"Other"`)
+	if err != nil {
+		t.Fatalf("upsert other conference: %v", err)
+	}
+
+	// Thin venue: 8 papers, under MinPapersToTrust. Another venue's 120 papers
+	// in the same year must NOT make up the difference — a partition drawn from
+	// them describes that venue, so resolveYear declines and the year stays a
+	// needs_split TODO for an online split.
+	seedConfPapers(t, d, conf.ID, 4, 4)
+	seedNamedPapers(t, d, otherID, "zoo", "Zoo Qux", 120)
+	if _, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false); ok {
+		t.Fatal("resolveYear resolved a thin venue on another venue's corpus, want ok=false")
+	}
+
+	// Same year, this venue now has its own 120 papers. The foreign 120 are
+	// still there and must not dilute the split: "foo" divides this venue 60/60
+	// and the year resolves into two verified leaves.
+	seedConfPapers(t, d, conf.ID, 60, 60)
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false)
 	if !ok {
-		t.Fatal("resolveYear must partition the cross-conference corpus, not just this venue's papers")
+		t.Fatal("resolveYear failed on a venue with its own corpus, want ok")
 	}
 	if len(leaves) != 2 {
 		t.Fatalf("leaves = %d, want 2", len(leaves))
@@ -1049,7 +1101,7 @@ func TestResolveYearInfeasibleCore(t *testing.T) {
 	if _, err := d.SavePapers(ctx, papers); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget()); ok {
+	if _, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), bigBudget(), false); ok {
 		t.Fatal("resolveYear resolved an infeasible core, want ok=false (needs_split)")
 	}
 }
@@ -1059,7 +1111,7 @@ func TestResolveYearInfeasibleCore(t *testing.T) {
 func TestResolveYearRequiresMinedKeywords(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	seedConfPapers(t, d, conf.ID, 60, 60)
-	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, nil, cacheCount(d), bigBudget()); ok {
+	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, nil, cacheCount(d), bigBudget(), false); ok {
 		t.Fatal("resolveYear with no keywords resolved, want ok=false")
 	}
 }
@@ -1120,7 +1172,7 @@ func TestResolveYearEscalatesUnresolvedGroupToFreshMining(t *testing.T) {
 		}
 	}
 
-	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"neural"}, cacheCount(d), bigBudget())
+	leaves, ok := c.resolveYear(ctx, conf, 2020, 0, []string{"neural"}, cacheCount(d), bigBudget(), false)
 	if !ok {
 		t.Fatalf("resolveYear failed even after escalating to fresh phrase mining, want ok=true")
 	}
@@ -1157,7 +1209,7 @@ func TestResolveYearLowCoverageFallsBack(t *testing.T) {
 		calls++
 		return cacheCount(d)(q, yf, yt)
 	}
-	if _, ok := c.resolveYear(context.Background(), conf, 2020, 1000, []string{"foo", "bar"}, count, bigBudget()); ok {
+	if _, ok := c.resolveYear(context.Background(), conf, 2020, 1000, []string{"foo", "bar"}, count, bigBudget(), false); ok {
 		t.Fatal("resolveYear succeeded on a low-coverage corpus, want fallback (ok=false)")
 	}
 	if calls != 0 {
@@ -1172,7 +1224,7 @@ func TestResolveYearRespectsSharedBudget(t *testing.T) {
 	d, c, conf := planCrawler(t)
 	seedConfPapers(t, d, conf.ID, 60, 60)
 	exhausted := &probeBudget{left: 0}
-	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), exhausted); ok {
+	if _, ok := c.resolveYear(context.Background(), conf, 2020, 0, []string{"foo", "bar"}, cacheCount(d), exhausted, false); ok {
 		t.Fatal("resolveYear succeeded with an exhausted budget, want ok=false")
 	}
 }
@@ -1241,5 +1293,475 @@ func TestViableKeywords(t *testing.T) {
 	deduped := dedupSubstringKeywords([]string{"networks", "network", "graph"})
 	if len(deduped) != 2 || deduped[0] != "networks" || deduped[1] != "graph" {
 		t.Fatalf("dedupSubstringKeywords = %v, want [networks graph]", deduped)
+	}
+}
+
+// upsertYearTasks stores a ready-made partition of one year, the way a previous
+// -plan would have left it.
+func upsertYearTasks(t *testing.T, d *db.DB, confID int64, year int, status string, ests ...int) {
+	t.Helper()
+	for i, e := range ests {
+		if _, err := d.UpsertTask(context.Background(), &db.Task{
+			ConferenceID: confID, Query: `"Conf"`, YearFrom: year, YearTo: year,
+			Keywords: []string{fmt.Sprintf("kw%d", i)}, Status: status, TotalEstimate: e,
+		}); err != nil {
+			t.Fatalf("upsert task: %v", err)
+		}
+	}
+}
+
+// TestExistingPartitionReusedWhenComplete: a year already split into buckets
+// that are all under the cap and add back up to its count is kept as-is, so a
+// re-plan spends no probe on it and its task keys stay stable.
+func TestExistingPartitionReusedWhenComplete(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	upsertYearTasks(t, d, conf.ID, 2016, db.StatusPending, 90, 60, 50) // sums to 200
+
+	year := split.Leaf{Query: `"Conf"`, YearFrom: 2016, YearTo: 2016, Count: 200, HasCount: true, NeedsSplit: true}
+	sub, ok := c.existingPartition(context.Background(), conf.ID, year)
+	if !ok {
+		t.Fatal("existingPartition = false, want the stored split to be reused")
+	}
+	if len(sub) != 3 {
+		t.Errorf("got %d leaves, want 3", len(sub))
+	}
+	total := 0
+	for _, l := range sub {
+		total += l.Count
+		if l.YearFrom != 2016 || l.YearTo != 2016 {
+			t.Errorf("leaf covers %d-%d, want 2016-2016", l.YearFrom, l.YearTo)
+		}
+	}
+	if total != 200 {
+		t.Errorf("reused buckets sum to %d, want 200", total)
+	}
+}
+
+// TestExistingPartitionRejected covers every way a stored split must NOT be
+// trusted. The shortfall case is the one that matters most: reusing a partition
+// whose buckets no longer cover the year would silently drop the missing
+// bucket's papers from the crawl.
+func TestExistingPartitionRejected(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		ests   []int
+		count  int
+	}{
+		{"buckets no longer cover the year", db.StatusPending, []int{40, 40}, 500},
+		{"a single task cannot be a split", db.StatusPending, []int{90}, 90},
+		{"no stored tasks at all", db.StatusPending, nil, 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, c, conf := planCrawler(t) // MaxResults is 100 here
+			upsertYearTasks(t, d, conf.ID, 2016, tt.status, tt.ests...)
+			year := split.Leaf{Query: `"Conf"`, YearFrom: 2016, YearTo: 2016, Count: tt.count, HasCount: true, NeedsSplit: true}
+			if _, ok := c.existingPartition(context.Background(), conf.ID, year); ok {
+				t.Error("existingPartition = true, want the year to be re-split")
+			}
+		})
+	}
+}
+
+// TestExistingPartitionIgnoresOtherYears: tasks stored for a neighbouring year
+// must never be mistaken for this year's split.
+func TestExistingPartitionIgnoresOtherYears(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	upsertYearTasks(t, d, conf.ID, 2015, db.StatusPending, 90, 60, 50)
+
+	year := split.Leaf{Query: `"Conf"`, YearFrom: 2016, YearTo: 2016, Count: 200, HasCount: true, NeedsSplit: true}
+	if _, ok := c.existingPartition(context.Background(), conf.ID, year); ok {
+		t.Error("existingPartition = true for 2016, but only 2015 has stored tasks")
+	}
+}
+
+// TestRefreshEstimateOverwritesStalePlan: the planner's figure is read once, on
+// page 1, whenever the conference was last planned, and Scholar's "About N" for
+// a narrow query does not hold over time — one ICRA bucket was planned at 887
+// and reported 299 at crawl time. The crawl must adopt the live figure before
+// collecting, so the shortfall check judges delivery against what Scholar
+// actually promised on this search.
+func TestRefreshEstimateOverwritesStalePlan(t *testing.T) {
+	// Claims 299, serves 3, no next link. Planned estimate is 1000 (see setup).
+	page := mkScholarPageCount([]string{"AAA", "BBB", "CCC"}, false, 299)
+	fb := &fakeBrowser{contents: []string{page}}
+	d, c := setupWithRatio(t, 1, fb, 0.5)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.TotalEstimate != 299 {
+		t.Errorf("TotalEstimate = %d, want 299 (the count Scholar showed at crawl time)", task.TotalEstimate)
+	}
+}
+
+// TestRefreshEstimateKeepsPlanWhenPageHasNoCount: no count on the page means
+// nothing better to believe, so the planned figure must survive untouched.
+func TestRefreshEstimateKeepsPlanWhenPageHasNoCount(t *testing.T) {
+	fb := &fakeBrowser{contents: []string{`<html><body><div id="gs_res_ccl"></div></body></html>`}}
+	d, c := setupWithRatio(t, 1, fb, 0.5)
+
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.TotalEstimate != 1000 {
+		t.Errorf("TotalEstimate = %d, want the planned 1000 left in place", task.TotalEstimate)
+	}
+}
+
+// TestAlreadyCompleteSkipsResume: a task whose stored papers already cover the
+// count Scholar reports must finish without walking its stale page pointer
+// forward. ICRA 2014's "control" bucket sat at page 36 on a fifteen-page result
+// set, so resuming meant thirty-five paced "Next" clicks to learn what the
+// database already knew.
+func TestAlreadyCompleteSkipsResume(t *testing.T) {
+	ctx := context.Background()
+	// The page reports 3 results; the task will already hold 3.
+	fb := &fakeBrowser{contents: []string{mkScholarPageCount([]string{"AAA", "BBB", "CCC"}, true, 3)}}
+	d, c := setup(t, 1, fb)
+
+	// First pass collects the three papers and leaves the pointer past page 1.
+	if err := c.CrawlConference(ctx, 1); err != nil {
+		t.Fatalf("first crawl: %v", err)
+	}
+
+	// Re-queue it with an absurd pointer, as an over-paginated task ends up.
+	if err := d.UpdateTaskPage(ctx, 1, 36); err != nil {
+		t.Fatalf("UpdateTaskPage: %v", err)
+	}
+	if err := d.SetTaskStatus(ctx, 1, db.StatusPending, ""); err != nil {
+		t.Fatalf("SetTaskStatus: %v", err)
+	}
+
+	fb.contents = []string{mkScholarPageCount([]string{"AAA", "BBB", "CCC"}, true, 3)}
+	fb.nextCalls = 0
+	if err := c.CrawlConference(ctx, 1); err != nil {
+		t.Fatalf("second crawl: %v", err)
+	}
+
+	if fb.nextCalls != 0 {
+		t.Errorf("ClickNext called %d times, want 0 — the pointer should not have been walked", fb.nextCalls)
+	}
+	if task := firstTask(t, d); task.Status != db.StatusCompleted {
+		t.Errorf("status = %s, want completed", task.Status)
+	}
+}
+
+// pageCapCrawler wires a task with a chosen estimate against a browser that
+// never runs out of "Next" links, so the crawl always reaches the page cap.
+func pageCapCrawler(t *testing.T, estimate int) (*db.DB, *Crawler) {
+	t.Helper()
+	ctx := context.Background()
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	confID, err := d.UpsertConference(ctx, "TEST", `"test conf"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.UpsertTask(ctx, &db.Task{
+		ConferenceID: confID, Query: `"test conf"`, YearFrom: 2008, YearTo: 2008,
+		Status: db.StatusPending, TotalEstimate: estimate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every page carries a next link and fresh titles, so neither the stall
+	// guard nor the exhaustion guard fires before the cap.
+	pages := make([]string, 60)
+	for i := range pages {
+		pages[i] = mkScholarPageCount([]string{
+			fmt.Sprintf("T%da", i), fmt.Sprintf("T%db", i), fmt.Sprintf("T%dc", i),
+		}, true, estimate)
+	}
+	fb := &fakeBrowser{contents: pages}
+	cfg := &config.Config{MaxResults: 1000, StartYear: 2000, Keywords: []string{"learning"}, MinCompletionRatio: 0.5}
+	return d, New(cfg, d, fb, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// TestPageCapUnderCapIsNotASplitProblem: a bucket Scholar reports as fitting
+// under max_results cannot be fixed by splitting it — the cap was reached
+// because Scholar kept paginating over papers it had already served. Flagging
+// needs_split there also blocks existingPartition from reusing the year.
+func TestPageCapUnderCapIsNotASplitProblem(t *testing.T) {
+	d, c := pageCapCrawler(t, 699) // the IROS 2008 shape
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status == db.StatusNeedsSplit {
+		t.Errorf("status = needs_split for a %d-result bucket; want completed or incomplete", task.TotalEstimate)
+	}
+}
+
+// TestPageCapOverCapStillNeedsSplit: the original behaviour must survive for a
+// bucket that really is larger than Scholar will serve.
+func TestPageCapOverCapStillNeedsSplit(t *testing.T) {
+	d, c := pageCapCrawler(t, 4200)
+	if err := c.CrawlConference(context.Background(), 1); err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	task := firstTask(t, d)
+	if task.Status != db.StatusNeedsSplit {
+		t.Errorf("status = %s for a 4200-result bucket; want needs_split", task.Status)
+	}
+}
+
+// TestExistingPartitionSurvivesOneOverCapBucket: a year whose buckets still
+// cover it is reused even when one of them overflowed at crawl time. Rejecting
+// the whole year sent the planner re-splitting all of ICRA 2024 over a single
+// bad bucket, and the prune that followed hit page_html's foreign key.
+func TestExistingPartitionSurvivesOneOverCapBucket(t *testing.T) {
+	d, c, conf := planCrawler(t) // MaxResults is 100 here
+	ctx := context.Background()
+
+	// Three healthy buckets plus one over the cap; together they cover the year.
+	upsertYearTasks(t, d, conf.ID, 2024, db.StatusCompleted, 90, 60)
+	if _, err := d.UpsertTask(ctx, &db.Task{
+		ConferenceID: conf.ID, Query: `"Conf" AND "over"`, YearFrom: 2024, YearTo: 2024,
+		Keywords: []string{"over"}, Status: db.StatusNeedsSplit, TotalEstimate: 130,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	year := split.Leaf{Query: `"Conf"`, YearFrom: 2024, YearTo: 2024, Count: 280, HasCount: true, NeedsSplit: true}
+	sub, ok := c.existingPartition(ctx, conf.ID, year)
+	if !ok {
+		t.Fatal("existingPartition = false; the year is covered and must be reused")
+	}
+	if len(sub) != 3 {
+		t.Fatalf("got %d leaves, want 3", len(sub))
+	}
+	flagged := 0
+	for _, l := range sub {
+		if l.NeedsSplit {
+			flagged++
+			if l.Count != 130 {
+				t.Errorf("the flagged leaf has Count %d, want the 130 bucket", l.Count)
+			}
+		}
+	}
+	if flagged != 1 {
+		t.Errorf("%d leaves flagged needs_split, want exactly the over-cap one", flagged)
+	}
+}
+
+// TestExistingPartitionIgnoresBareYearLeaf: a failed re-split can leave the
+// unresolved-year marker sitting next to the real buckets. Counting it would
+// double the year's total and let a broken partition pass the coverage check.
+func TestExistingPartitionIgnoresBareYearLeaf(t *testing.T) {
+	d, c, conf := planCrawler(t)
+	ctx := context.Background()
+
+	upsertYearTasks(t, d, conf.ID, 2024, db.StatusPending, 90, 60) // covers 150
+	if _, err := d.UpsertTask(ctx, &db.Task{
+		ConferenceID: conf.ID, Query: `"Conf"`, YearFrom: 2024, YearTo: 2024,
+		Status: db.StatusNeedsSplit, TotalEstimate: 900, // the bare-year marker
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	year := split.Leaf{Query: `"Conf"`, YearFrom: 2024, YearTo: 2024, Count: 150, HasCount: true, NeedsSplit: true}
+	sub, ok := c.existingPartition(ctx, conf.ID, year)
+	if !ok {
+		t.Fatal("existingPartition = false; the two real buckets cover the year")
+	}
+	if len(sub) != 2 {
+		t.Errorf("got %d leaves, want 2 — the bare-year marker is not a bucket", len(sub))
+	}
+	for _, l := range sub {
+		if len(l.Keywords) == 0 {
+			t.Errorf("leaf %q with no keywords was taken for a bucket", l.Query)
+		}
+	}
+}
+
+// TestRootKeywordIdentifiesTheSharedFirstPredicate: every bucket of a binary
+// partition is conditioned on the root, as an include on one side and an
+// exclude on the other.
+func TestRootKeywordIdentifiesTheSharedFirstPredicate(t *testing.T) {
+	tests := []struct {
+		name    string
+		buckets []partition.Bucket
+		want    string
+		ok      bool
+	}{
+		{
+			name: "the IROS 2020 chain: paper roots every bucket",
+			buckets: []partition.Bucket{
+				{Includes: []string{"paper"}},
+				{Includes: []string{"control"}, Excludes: []string{"paper"}},
+				{Includes: []string{"learning"}, Excludes: []string{"paper", "control"}},
+				{Excludes: []string{"paper", "control", "learning"}},
+			},
+			want: "paper", ok: true,
+		},
+		{
+			name: "a balanced tree still has one root",
+			buckets: []partition.Bucket{
+				{Includes: []string{"a", "b"}},
+				{Includes: []string{"a"}, Excludes: []string{"b"}},
+				{Includes: []string{"c"}, Excludes: []string{"a"}},
+				{Excludes: []string{"a", "c"}},
+			},
+			want: "a", ok: true,
+		},
+		{"a single bucket has no root", []partition.Bucket{{Includes: []string{"a"}}}, "", false},
+		{
+			name: "buckets that disagree yield no root",
+			buckets: []partition.Bucket{
+				{Includes: []string{"a"}},
+				{Includes: []string{"z"}},
+			},
+			want: "", ok: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := rootKeyword(tt.buckets)
+			if got != tt.want || ok != tt.ok {
+				t.Errorf("rootKeyword = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+// TestVerifiedRootKeywordsDropsAScholarHeavyRoot: the corpus can rank a term
+// first while Scholar has it on nine documents out of ten. Measuring the root
+// before anything is built on it is what stops the IROS 2020 shape — a 1040/110
+// split of a 1150-result year, three useless buckets behind it.
+func TestVerifiedRootKeywordsDropsAScholarHeavyRoot(t *testing.T) {
+	_, c, conf := planCrawler(t)
+
+	// 40 docs: "paper" is in 20 of them (perfect corpus balance, ranks first),
+	// "topic" in 10 (a decent but lower-scoring splitter).
+	var docs []partition.Doc
+	body := map[string]string{}
+	for i := range 40 {
+		h := fmt.Sprintf("d%02d", i)
+		docs = append(docs, partition.Doc{Hash: h, Year: 2020})
+		switch {
+		case i < 10:
+			body[h] = "paper topic"
+		case i < 20:
+			body[h] = "paper"
+		default:
+			body[h] = "something else"
+		}
+	}
+	text := func(d partition.Doc) string { return body[d.Hash] }
+
+	// Scholar says "paper" covers 1040 of a 1150-result year: 90%, useless.
+	counts := map[string]int{
+		conf.Query + ` AND "paper"`: 1040,
+		conf.Query + ` AND "topic"`: 500,
+	}
+	count := func(q string, _, _ int) (int, bool) {
+		n, ok := counts[q]
+		return n, ok
+	}
+
+	got := c.verifiedRootKeywords(conf, 2020, 1150, docs,
+		[]string{"paper", "topic"}, text, 20, count, bigBudget())
+
+	for _, k := range got {
+		if k == "paper" {
+			t.Error(`"paper" survived: it covers 90% of the year on Scholar and can root nothing`)
+		}
+	}
+	if len(got) == 0 {
+		t.Error("every candidate was dropped; the usable one must remain")
+	}
+}
+
+// TestVerifiedRootKeywordsKeepsAnAgreeingRoot: when the corpus and Scholar
+// agree, the offline choice must stand and cost nothing further.
+func TestVerifiedRootKeywordsKeepsAnAgreeingRoot(t *testing.T) {
+	_, c, conf := planCrawler(t)
+
+	var docs []partition.Doc
+	body := map[string]string{}
+	for i := range 40 {
+		h := fmt.Sprintf("d%02d", i)
+		docs = append(docs, partition.Doc{Hash: h, Year: 2020})
+		if i < 20 {
+			body[h] = "control"
+		} else {
+			body[h] = "other"
+		}
+	}
+	text := func(d partition.Doc) string { return body[d.Hash] }
+
+	probes := 0
+	count := func(q string, _, _ int) (int, bool) {
+		probes++
+		return 500, true // half of a 1000-result year: healthy
+	}
+
+	got := c.verifiedRootKeywords(conf, 2020, 1000, docs,
+		[]string{"control"}, text, 20, count, bigBudget())
+
+	if len(got) != 1 || got[0] != "control" {
+		t.Errorf("candidates = %v, want [control] kept", got)
+	}
+	if probes != 1 {
+		t.Errorf("%d probes spent, want exactly 1 — only the finalist is measured", probes)
+	}
+}
+
+// TestOfflineDocLimitIsDrivenByScholarNotCorpusSize: the partitioner counts
+// documents while max_results counts Scholar results. Mixing the two made the
+// bucket count follow the corpus, so it grew with every venue crawled — CHI
+// 2016 drew six buckets from 2901 mostly-unrelated documents for a year of
+// 1150 that needs two.
+func TestOfflineDocLimitIsDrivenByScholarNotCorpusSize(t *testing.T) {
+	const maxResults, headroom = 1000, 0.9 // 900 results per bucket
+
+	groups := func(corpus, trueCount int) int {
+		lim := offlineDocLimit(maxResults, headroom, corpus, trueCount)
+		return (corpus + lim - 1) / lim // ceil
+	}
+
+	// CHI 2016, as observed.
+	if got := groups(2901, 1150); got != 2 {
+		t.Errorf("CHI 2016 (D=2901, N=1150) -> %d buckets, want 2", got)
+	}
+
+	// The same year once four more venues have been crawled: the corpus
+	// quadruples, the answer must not move.
+	for _, corpus := range []int{2901, 6000, 12000, 40000} {
+		if got := groups(corpus, 1150); got != 2 {
+			t.Errorf("D=%d, N=1150 -> %d buckets, want 2 regardless of corpus size", corpus, got)
+		}
+	}
+
+	// A year that genuinely needs four.
+	if got := groups(3000, 3480); got != 4 {
+		t.Errorf("N=3480 -> %d buckets, want 4", got)
+	}
+
+	// A year already under the budget needs exactly one.
+	if got := groups(2901, 800); got != 1 {
+		t.Errorf("N=800 -> %d buckets, want 1", got)
+	}
+}
+
+// TestOfflineDocLimitFallsBackWithoutACount: with no usable count there is no
+// ratio to scale by, so the raw result budget stands rather than a number
+// derived from a division by zero.
+func TestOfflineDocLimitFallsBackWithoutACount(t *testing.T) {
+	for _, tc := range []struct{ corpus, trueCount int }{{2901, 0}, {2901, -1}, {0, 1150}} {
+		if got := offlineDocLimit(1000, 0.9, tc.corpus, tc.trueCount); got != 900 {
+			t.Errorf("offlineDocLimit(corpus=%d, count=%d) = %d, want the raw 900",
+				tc.corpus, tc.trueCount, got)
+		}
+	}
+	if got := offlineDocLimit(1000, 0.9, 1, 100000); got < 1 {
+		t.Errorf("limit = %d, must never fall below 1", got)
 	}
 }

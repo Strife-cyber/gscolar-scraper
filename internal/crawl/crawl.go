@@ -38,6 +38,11 @@ import (
 // page ~6-7; we retry a few times before treating it as a TODO).
 const sparseRetries = 3
 
+// exhaustedRuns is how many consecutive full pages may add no new paper before
+// the task is considered finished, however many more "Next" links Scholar is
+// still willing to render.
+const exhaustedRuns = 3
+
 // Browserer is the slice of the browser package the crawler needs, so the
 // crawl logic can be tested offline against recorded HTML with a fake.
 type Browserer interface {
@@ -113,6 +118,12 @@ type probeBudget struct {
 // exhausted reports whether the per-conference probe budget is spent.
 func (b *probeBudget) exhausted() bool { return b == nil || b.left <= 0 }
 
+// partitionCoverage is how much of a year's count a stored partition must add
+// back up to before existingPartition will reuse it. Buckets are disjoint, so
+// the sum should equal the year's count exactly; the slack only absorbs the
+// drift between two Scholar estimates of the same thing, never a missing bucket.
+const partitionCoverage = 0.95
+
 func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, error) {
 	budget := &probeBudget{confID: conf.ID, left: c.cfg.MaxProbesPerConf}
 	live := func(query string, yearFrom, yearTo int) (int, bool) {
@@ -133,7 +144,7 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	// verifying the resulting bucket counts. Probing candidate keywords on
 	// Scholar itself — one search per keyword per node — is what burned the
 	// probe budget on useless terms and risks tripping the block detection.
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance)
+	leaves, err := split.PlanWithWindow(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance, c.cfg.EffectivePlanWindowYears())
 	if err != nil {
 		return 0, err
 	}
@@ -149,7 +160,23 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 			resolved = append(resolved, l)
 			continue
 		}
-		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, live, budget)
+		// Reuse a partition this conference already has for the year. Without
+		// this the planner is stateless about tasks: it re-walks the whole range
+		// and re-runs resolveYear on EVERY over-cap year, every time, because a
+		// cached count still reads over the cap and nothing reads back the split
+		// that already solved it. Three costs followed — the probe budget was
+		// spent re-solving years that were already done (so each run only
+		// cleared a few more of the remaining ones), the chosen keywords drifted
+		// between runs as the corpus grew (a year split on "robots" came back
+		// split on "network"), and emitTasks then pruned the superseded tasks,
+		// which conflicts with page_html's foreign key once a task has been
+		// crawled.
+		if sub, ok := c.existingPartition(ctx, conf.ID, l); ok {
+			c.log.Info(fmt.Sprintf("%s %d: keeping the existing %d-task split", conf.Name, l.YearFrom, len(sub)))
+			resolved = append(resolved, sub...)
+			continue
+		}
+		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, live, budget, false)
 		if ok {
 			resolved = append(resolved, sub...)
 		} else {
@@ -158,6 +185,82 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	}
 
 	return c.emitTasks(ctx, conf, resolved)
+}
+
+// existingPartition returns the split this conference already holds for an
+// over-cap year, when that split is still usable. A stored partition qualifies
+// only if it is complete and crawlable:
+//
+//   - every task covers exactly that single year;
+//   - every task has a positive estimate;
+//   - the estimates add back up to the year's own count. The buckets are built
+//     disjoint, so a sum that falls short means a bucket is missing and the
+//     partition would silently drop papers — the one failure mode worth being
+//     strict about. Counts are Scholar estimates, so a small shortfall is
+//     tolerated; a real hole is far bigger than that.
+//
+// A bucket that is over the cap, or already flagged needs_split, does not
+// disqualify the partition: it is carried over still flagged, so it stays a
+// visible TODO while its five healthy siblings are left alone. Anything short
+// of the conditions above returns false and the year is re-split from scratch.
+func (c *Crawler) existingPartition(ctx context.Context, confID int64, year split.Leaf) ([]split.Leaf, bool) {
+	tasks, err := c.db.AllTasks(ctx, confID)
+	if err != nil {
+		return nil, false
+	}
+	var (
+		sub []split.Leaf
+		sum int
+	)
+	for _, t := range tasks {
+		if t.YearFrom != year.YearFrom || t.YearTo != year.YearTo {
+			continue
+		}
+		// The bare-year leaf is the "this year is unresolved" marker, not a
+		// bucket of a partition. When a failed re-split leaves one sitting
+		// beside real buckets, counting it would double the year.
+		if len(t.Keywords) == 0 && t.Query == year.Query {
+			continue
+		}
+		if t.TotalEstimate <= 0 {
+			return nil, false
+		}
+		sum += t.TotalEstimate
+		// A bucket over the cap, or already flagged, stays flagged — but it no
+		// longer condemns the whole year.
+		//
+		// Refusing the year outright was too blunt. ICRA 2024 is partitioned
+		// into six buckets summing to 3487 against a year of 3480, and exactly
+		// one of them turned out larger than measured once crawled. Rejecting
+		// the partition sent the planner off to re-split the entire year, which
+		// it could not do, so it emitted a bare-year leaf; the prune that
+		// followed then tried to delete the over-cap bucket and hit page_html's
+		// foreign key, failing the whole plan. Five correct buckets were put at
+		// risk by one that overflowed.
+		//
+		// The right granularity for that repair is the bucket, not the year,
+		// and the planner has no such path today. So the partition is kept and
+		// the bucket keeps its TODO, visible for a manual split.
+		needsSplit := t.Status == db.StatusNeedsSplit || t.TotalEstimate > c.cfg.MaxResults
+		sub = append(sub, split.Leaf{
+			Query:      t.Query,
+			YearFrom:   t.YearFrom,
+			YearTo:     t.YearTo,
+			Keywords:   t.Keywords,
+			Count:      t.TotalEstimate,
+			HasCount:   true,
+			NeedsSplit: needsSplit,
+		})
+	}
+	// One task cannot be a split of an over-cap year, and no task means nothing
+	// to reuse.
+	if len(sub) < 2 {
+		return nil, false
+	}
+	if year.HasCount && year.Count > 0 && float64(sum) < partitionCoverage*float64(year.Count) {
+		return nil, false
+	}
+	return sub, true
 }
 
 // emitTasks upserts every leaf as a task (pending, or needs_split with a reason)
@@ -214,7 +317,17 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 // to rank high, so generic vocabulary can never masquerade as a splitter.
 // Mined keywords come first so the partition sees the best splitters first.
 func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string {
-	mined := c.minedKeywords(ctx)
+	// Candidates are mined from THIS conference's papers, every year of them.
+	//
+	// The venue's own vocabulary is what divides the venue; another venue's
+	// promotes words that match none of it. Pooling years is what makes this
+	// affordable: planning harvests a page of results per count probe, so a
+	// conference accumulates its own corpus while being planned — ICASSP had
+	// 1765 papers of its own before a single crawl ran, against 107 for the one
+	// year being planned. A term's frequency does drift between 2000 and 2024,
+	// which is why this list is only the POOL; corpusRank re-scores it per
+	// branch on the year's own papers before anything is probed.
+	mined := c.minedKeywordsFor(ctx, conf)
 	seen := map[string]bool{}
 	var kws []string
 	for _, w := range append(mined, c.cfg.Keywords...) {
@@ -228,7 +341,15 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 	// covering 0 known papers or >75% of them can never produce a clean split,
 	// and plural/substring variants ("network" vs "networks") probe the same
 	// coverage twice.
-	kws = viableKeywords(c.backgroundTexts(ctx), dedupSubstringKeywords(kws))
+	// Viability is judged on the venue too: "speech" covers 1.6% of the 2020
+	// all-venue corpus and would be culled as too rare, while covering 41.7% of
+	// ICASSP. Falling back to the whole corpus when the venue is still unknown
+	// keeps a first-ever plan from having no candidates at all.
+	texts := c.conferenceTexts(ctx, conf)
+	if len(texts) < c.cfg.MinPapersToTrust {
+		texts = c.backgroundTexts(ctx)
+	}
+	kws = viableKeywords(texts, dedupSubstringKeywords(kws))
 	return split.DropDegenerateKeywords(conf.Query, kws)
 }
 
@@ -337,6 +458,51 @@ func (c *Crawler) minedKeywords(ctx context.Context) []string {
 // backgroundTexts returns every stored paper's text, fetched once per Crawler
 // and reused for the IDF denominator of every mining pass. A load failure
 // degrades gracefully to plain Balance ranking (empty background → IDF 1.0).
+// conferenceTexts is every known paper of one conference, all years, as
+// title+snippet. Unlike backgroundTexts it is not cached on the Crawler: a plan
+// run walks several conferences and each needs its own.
+func (c *Crawler) conferenceTexts(ctx context.Context, conf db.Conference) []string {
+	papers, err := c.db.PapersForConference(ctx, conf.ID, 0, 0)
+	if err != nil {
+		c.log.Info(fmt.Sprintf("load %s corpus: %v", conf.Name, err))
+		return nil
+	}
+	out := make([]string, 0, len(papers))
+	for _, p := range papers {
+		out = append(out, p.Title+" "+p.Snippet)
+	}
+	return out
+}
+
+// minedKeywordsFor mines splitter candidates from one conference's corpus,
+// falling back to the whole database while that conference is still unknown.
+// The whole-DB ranking stays cached on the Crawler; a per-conference one is
+// computed fresh, since a plan run visits several conferences in turn.
+func (c *Crawler) minedKeywordsFor(ctx context.Context, conf db.Conference) []string {
+	texts := c.conferenceTexts(ctx, conf)
+	if len(texts) < c.cfg.MinPapersToTrust {
+		return c.minedKeywords(ctx)
+	}
+	opts := mine.DefaultOptions()
+	opts.MinBalance = c.cfg.MinBalance
+	opts.MaxNGram = c.cfg.MineMaxNGram
+	if c.cfg.MineBigrams && opts.MaxNGram < 2 {
+		opts.MaxNGram = 2
+	}
+	opts.PhraseBoost = c.cfg.MinePhraseBoost
+	opts.MaxCandidates = c.cfg.MaxMinedKeywords
+	mp := make([]mine.Paper, 0, len(texts))
+	for i, t := range texts {
+		mp = append(mp, mine.Paper{Hash: fmt.Sprintf("%s-%d", conf.Name, i), Title: t})
+	}
+	cands := mine.MineIDF(mp, texts, opts)
+	kws := make([]string, 0, len(cands))
+	for _, cd := range cands {
+		kws = append(kws, cd.Keyword)
+	}
+	return kws
+}
+
 func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 	c.bgOnce.Do(func() {
 		texts, err := c.db.AllPaperTexts(ctx)
@@ -347,6 +513,164 @@ func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 		c.bgTexts = texts
 	})
 	return c.bgTexts
+}
+
+// offlineDocLimit converts the crawl's result-count budget into the document
+// budget the offline partitioner actually works in.
+//
+// PartitionOpts splits until every group holds at most `limit` DOCUMENTS of the
+// known corpus, and that limit used to be max_results*headroom — a number of
+// SCHOLAR RESULTS. Two different units, and the error grew with the project:
+// the corpus is every paper of that year across ALL venues, so CHI 2016 was
+// partitioned against 2901 documents that are mostly ICRA and IROS. At a limit
+// of 900 documents that forced six buckets — one of them four results wide —
+// for a year Scholar reports at 1150, which needs two. Crawling more venues
+// would have kept inflating it.
+//
+// A group of d documents stands for about d*N/D results, where D is the corpus
+// size and N the year's real count. Asking for at most `budget` results per
+// group therefore means at most budget*D/N documents, and the group count comes
+// out at D/(budget*D/N) = N/budget — driven by Scholar, invariant to how much
+// has been crawled.
+//
+// This scales the buckets; it does not make the corpus representative. The
+// keywords are still chosen from papers that largely belong to other venues,
+// and the sizes are still estimates that each bucket's verification probe may
+// contradict.
+func offlineDocLimit(maxResults int, headroom float64, corpusSize, trueCount int) int {
+	budget := float64(maxResults) * headroom
+	// No usable count: fall back to the raw result budget rather than scaling
+	// by a ratio we cannot compute.
+	if trueCount <= 0 || corpusSize <= 0 {
+		return max(int(budget), 1)
+	}
+	return max(int(budget*float64(corpusSize)/float64(trueCount)), 1)
+}
+
+// maxRootFraction is the share of a year a root splitter may cover before it
+// is judged useless. It mirrors split.resolveNode's own "neither side above
+// 75% of the node" bar, applied one level earlier — to the keyword the entire
+// partition will hang from.
+const maxRootFraction = 0.75
+
+// rootProbeAttempts bounds how many root keywords may be measured and rejected
+// for one year. Each rejection costs one Scholar search, so this is a small
+// constant, not a search.
+const rootProbeAttempts = 3
+
+// verifiedRootKeywords measures the offline partition's root splitter against
+// Scholar and drops it when the two disagree, returning the candidate list to
+// partition with.
+//
+// The offline partitioner ranks candidates by Balance over titles and snippets.
+// Scholar matches full text, and for scholarly boilerplate the gap is enormous:
+// "paper" sits in 36% of this corpus's snippets — the single best Balance of
+// any candidate — while "In this paper..." puts it in about nine documents out
+// of ten. Planning IROS 2020 picked it on that score and split a 1150-result
+// year 1040/110. The large side was still over the cap, the small side
+// fragmented into buckets of 94, 23, 2 and 0, and four further searches were
+// spent trying to rescue a chain that never had a chance.
+//
+// Verification afterwards did not help: by then the partition was built and
+// every bucket was conditioned on the bad keyword. The root has to be checked
+// BEFORE anything is built on it.
+//
+// This is the measure-don't-estimate step Dikoume & Bossou reach by a different
+// route: their adaptive algorithm measures every keyword's cardinality up front
+// and demotes the oversized ones, at a cost of n searches for n candidates.
+// Here only the finalist is measured — the corpus veto and ranking have already
+// discarded the hopeless candidates for free — so the bill is one search per
+// rejected root rather than one per candidate.
+func (c *Crawler) verifiedRootKeywords(
+	conf db.Conference, year, trueCount int,
+	docs []partition.Doc, keywords []string, text func(partition.Doc) string,
+	limit int, count split.CountFunc, budget *probeBudget,
+) []string {
+	if trueCount <= 0 {
+		return keywords // nothing to measure against
+	}
+	ceiling := int(float64(trueCount) * maxRootFraction)
+
+	for range rootProbeAttempts {
+		if len(keywords) == 0 || budget.exhausted() {
+			return keywords
+		}
+		out := partition.PartitionOpts(docs, keywords, text, limit, partition.Options{
+			MinBalance:  c.cfg.MinBalance,
+			PhraseBoost: c.cfg.MinePhraseBoost,
+		})
+		root, ok := rootKeyword(out.Buckets)
+		if !ok {
+			return keywords // one bucket, or no agreed root: nothing to verify
+		}
+		n, okC := count(conf.Query+` AND "`+root+`"`, year, year)
+		if !okC {
+			return keywords // unmeasurable; trust the offline choice
+		}
+		if n > 0 && n <= ceiling {
+			return keywords // the corpus and Scholar agree: keep it
+		}
+		c.log.Info(fmt.Sprintf("%s %d: root %q covers %d of %d on Scholar (offline ranked it first) -> dropped",
+			conf.Name, year, root, n, trueCount))
+		keywords = dropKeyword(keywords, root)
+	}
+	return keywords
+}
+
+// rootKeyword returns the keyword every bucket of a partition is conditioned
+// on, or ok=false when there is no single such keyword.
+//
+// It cannot be read off a bucket's first predicate. Includes and Excludes are
+// separate slices and the order between them is lost, so the bucket
+// {Includes: [control], Excludes: [paper]} gives no clue that "paper" was
+// applied first. What does identify the root is coverage: a binary split puts
+// its keyword on BOTH children, as an include on one side and an exclude on
+// the other, so the root — and in a well-formed tree only the root — appears
+// in every leaf.
+//
+// More than one shared keyword means both sides happened to split on the same
+// second term, and the root is no longer distinguishable. Verification is best
+// effort, so that case simply goes unverified rather than guessing wrong.
+func rootKeyword(buckets []partition.Bucket) (string, bool) {
+	if len(buckets) < 2 {
+		return "", false
+	}
+	shared := map[string]bool{}
+	for _, k := range append(append([]string{}, buckets[0].Includes...), buckets[0].Excludes...) {
+		shared[strings.ToLower(k)] = true
+	}
+	for _, b := range buckets[1:] {
+		here := map[string]bool{}
+		for _, k := range append(append([]string{}, b.Includes...), b.Excludes...) {
+			here[strings.ToLower(k)] = true
+		}
+		for k := range shared {
+			if !here[k] {
+				delete(shared, k)
+			}
+		}
+		if len(shared) == 0 {
+			return "", false
+		}
+	}
+	if len(shared) != 1 {
+		return "", false
+	}
+	for k := range shared {
+		return k, true
+	}
+	return "", false
+}
+
+// dropKeyword removes one keyword from a candidate list, case-insensitively.
+func dropKeyword(keywords []string, drop string) []string {
+	out := make([]string, 0, len(keywords))
+	for _, k := range keywords {
+		if !strings.EqualFold(k, drop) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // resolveYear brings a single over-cap year under the cap using offline
@@ -363,14 +687,25 @@ func (c *Crawler) backgroundTexts(ctx context.Context) []string {
 // small fraction of the true total, every bucket over-verifies and the probes
 // explode (each count() is an expensive Scholar search), so instead of trusting
 // a biased sample we bail to the bounded count-probe chain.
-func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, trueCount int, keywords []string, count split.CountFunc, budget *probeBudget) ([]split.Leaf, bool) {
-	// The corpus is every known paper in this year across ALL conferences, not
-	// just this venue's: a keyword that divides the year's result space is
-	// equally evidenced by papers crawled under other venues, and restricting
-	// to this conference's rows alone would leave most years too thin to
-	// partition. Buckets are still verified against this conference's query, so
-	// an over-broad corpus can only over-estimate a bucket — never under-count.
-	papers, err := c.db.PapersInYears(ctx, year, year)
+func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, trueCount int, keywords []string, count split.CountFunc, budget *probeBudget, offline bool) ([]split.Leaf, bool) {
+	// The corpus is THIS conference's papers for THIS year, and nothing else.
+	//
+	// It used to be every paper of the year across all venues, on the argument
+	// that a keyword dividing the result space is as well evidenced by one
+	// venue as another. ICASSP disproved that. Of the 3593 papers known for
+	// 2020, 81% are ICRA and IROS and only 107 are ICASSP, and the ranking that
+	// came out was not merely noisy but inverted:
+	//
+	//	         all venues 2020   ICASSP
+	//	speech        1.6%          41.7%   best splitter there is — vetoed as too rare
+	//	robots       12.2%           0.8%   ranked highly, matches nothing
+	//	robotic      11.4%           0.6%
+	//
+	// Planning ICASSP 2020 duly produced buckets of 0 and 2 results on
+	// "robotic" and "robots". A corpus made of other venues does not just add
+	// noise, it promotes the words that cannot work and buries the one that
+	// can.
+	papers, err := c.db.PapersForConference(ctx, conf.ID, year, year)
 	if err != nil {
 		return nil, false
 	}
@@ -385,6 +720,10 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
 	}
 	veto := corpusVeto(yearTexts, nil, nil)
+	// Coverage is now this venue's share of its own year, which is what decides
+	// whether an offline split can be trusted. Measured against every venue's
+	// papers it read 3593/1860 — capped to 1.0, "we know this year completely" —
+	// while the planner in fact knew 5.8% of ICASSP 2020.
 	coverage := 1.0
 	if trueCount > len(papers) {
 		coverage = float64(len(papers)) / float64(trueCount)
@@ -408,7 +747,14 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 			p := byHash[d.Hash]
 			return p.Title + " " + p.Snippet
 		}
-		limit := max(int(float64(c.cfg.MaxResults)*c.cfg.Headroom), 1)
+		limit := offlineDocLimit(c.cfg.MaxResults, c.cfg.Headroom, len(docs), trueCount)
+
+		// The offline partition scores candidates on the known corpus — titles
+		// and short snippets — while Scholar matches full text, and for some
+		// terms those two disagree completely. Verify the ROOT splitter, the
+		// one keyword every bucket is conditioned on, against Scholar before
+		// building anything on top of it.
+		keywords = c.verifiedRootKeywords(conf, year, trueCount, docs, keywords, text, limit, count, budget)
 
 		out := partition.PartitionOpts(docs, keywords, text, limit, partition.Options{
 			MinBalance:  c.cfg.MinBalance,
@@ -473,7 +819,13 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 
 	// Online probe: search the bare year query, parse the results, mine fresh
 	// keyword candidates from that year, and try to split with those candidates.
-	if budget.exhausted() {
+	//
+	// -gen-tasks promises to build a plan "purely from the papers and count
+	// cache already in the DB", and main() only connects the browser for -plan
+	// or -crawl. Reaching this fallback from that path therefore called Search
+	// on a Browser whose page is nil and panicked with a nil dereference — the
+	// offline flag is what keeps the offline contract honest.
+	if offline || budget.exhausted() {
 		return nil, false
 	}
 	budget.left--
@@ -816,7 +1168,7 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 	// known-paper corpus below. No background goroutine needed here — nothing
 	// slow runs concurrently to overlap it with.
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, currentYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance)
+	leaves, err := split.PlanWithWindow(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance, c.cfg.EffectivePlanWindowYears())
 	if err != nil {
 		return 0, err
 	}
@@ -830,7 +1182,14 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 			resolved = append(resolved, l)
 			continue
 		}
-		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, cacheOnly, budget)
+		// Same reuse as PlanConference: a year this conference already has a
+		// usable split for is kept as-is instead of being partitioned again.
+		if sub, ok := c.existingPartition(ctx, conf.ID, l); ok {
+			c.log.Info(fmt.Sprintf("%s %d: keeping the existing %d-task split", conf.Name, l.YearFrom, len(sub)))
+			resolved = append(resolved, sub...)
+			continue
+		}
+		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, cacheOnly, budget, true)
 		if ok {
 			resolved = append(resolved, sub...)
 		} else {
@@ -1023,6 +1382,10 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, err.Error())
 		return err
 	}
+	c.refreshEstimate(ctx, &task)
+	if c.alreadyComplete(ctx, task) {
+		return nil
+	}
 
 	// Resume: a fresh search always lands on page 1, so skip forward to the
 	// task's page pointer. If the results actually end before that page (a
@@ -1031,7 +1394,17 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		err := c.br.ClickNext()
 		if err != nil {
 			if _, ok := errors.AsType[*rod.ElementNotFoundError](err); ok {
+				// The result set ended before the pointer did. That is a
+				// completion like any other, so it is judged like any other:
+				// without this check the path was the one way a task could be
+				// marked completed holding almost nothing. CHI 2018's
+				// -"learning" bucket sat at 'completed' against an estimate of
+				// 502 having kept nothing at all, purely because it exited
+				// here.
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
+				if ferr := c.flagIfShortfall(ctx, task); ferr != nil {
+					return ferr
+				}
 				c.log.Info(fmt.Sprintf("task %d: resume pointer %d past end -> completed", task.ID, page))
 				return nil
 			}
@@ -1049,7 +1422,8 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 	const scholarPageSize = 20
 	maxPages := (c.cfg.MaxResults+scholarPageSize-1)/scholarPageSize + 2
 	emptyRuns := 0
-	prevKey := "" // fingerprint of the previous page's results, for stall detection
+	noNewRuns := 0 // consecutive committed pages that added no paper to this task
+	prevKey := ""  // fingerprint of the previous page's results, for stall detection
 
 	for {
 		if c.br.IsBlocked() {
@@ -1098,7 +1472,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			// The "vanish" case: a results page with zero rows but a live Next
 			// link. Retry a few pages; if it persists, flag for re-split.
 			pc.NextPage = page // do not advance the resume pointer
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			if _, err := c.db.CommitPage(ctx, pc); err != nil {
 				return err
 			}
 			emptyRuns++
@@ -1117,7 +1491,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			// to override if Scholar under-delivered.
 			pc.NextPage = page
 			pc.Final = true
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			if _, err := c.db.CommitPage(ctx, pc); err != nil {
 				return err
 			}
 			if err := c.flagIfShortfall(ctx, task); err != nil {
@@ -1128,11 +1502,37 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 
 		default:
 			pc.NextPage = page + 1
-			if err := c.db.CommitPage(ctx, pc); err != nil {
+			added, err := c.db.CommitPage(ctx, pc)
+			if err != nil {
 				return err
 			}
 			emptyRuns = 0
-			c.log.Info(fmt.Sprintf("task %d: page %d committed (%d papers)", task.ID, page, len(p.Items)))
+			c.log.Info(fmt.Sprintf("task %d: page %d committed (%d papers, %d new)", task.ID, page, len(p.Items), added))
+
+			// Exhaustion by yield, not by pagination. Scholar keeps offering a
+			// "Next" link long after it has run out of distinct results and
+			// simply recycles papers it already served: one ICRA bucket handed
+			// over ~700 rows across 35 pages for a result set it consistently
+			// reported as 299, and the crawl only stopped when the link finally
+			// vanished. The consecutive-identical-pages guard below cannot see
+			// that, because the repeats are shuffled rather than served twice in
+			// a row. Full pages that add nothing new are the honest signal that
+			// the set is finished, so stop and bank what we have.
+			if added == 0 {
+				noNewRuns++
+			} else {
+				noNewRuns = 0
+			}
+			if noNewRuns >= exhaustedRuns {
+				// Deliberately not flagIfShortfall: the planner's estimate is
+				// what mismatches here (887 planned against 299 real), and the
+				// pages just proved the set is exhausted. Re-queuing the task
+				// would only replay the same recycled pages.
+				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
+				c.log.Info(fmt.Sprintf("task %d: exhausted at page %d (%d pages added no new papers) -> completed",
+					task.ID, page, noNewRuns))
+				return nil
+			}
 			if !p.HasNext {
 				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
 				if err := c.flagIfShortfall(ctx, task); err != nil {
@@ -1144,9 +1544,42 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		}
 
 		if page >= maxPages {
-			_ = c.db.SetTaskNeedsSplit(ctx, task.ID,
-				fmt.Sprintf("hit %d-page cap (estimate %d)", maxPages, task.TotalEstimate))
-			c.log.Info(fmt.Sprintf("task %d: page cap %d reached -> needs_split", task.ID, maxPages))
+			// The cap is reached for two unrelated reasons, and they call for
+			// opposite responses.
+			//
+			// A bucket genuinely larger than max_results has more behind it than
+			// Scholar will ever serve, so it must be divided: needs_split, as
+			// before.
+			//
+			// A bucket that fits is a different animal. Scholar keeps offering
+			// "Next" long past its own stated total and refills the pages with
+			// papers it already served — seven tasks here walked the full 52
+			// pages, about 1040 rows, for counts between 645 and 1030, and came
+			// away with 424 to 673 distinct papers. Dividing those changes
+			// nothing: they were never too big. Worse, the flag is contagious —
+			// existingPartition refuses to reuse a year holding a needs_split
+			// task, so the next -plan re-splits the whole year from scratch and
+			// spends probes fixing a problem that does not exist.
+			//
+			// So for a bucket within the cap, the cap is simply where Scholar
+			// stopped being useful. Let flagIfShortfall judge the delivery like
+			// any other natural end: completed when the yield clears
+			// min_completion_ratio, incomplete when it does not. An unknown
+			// estimate keeps the conservative old behaviour.
+			if task.TotalEstimate <= 0 || task.TotalEstimate > c.cfg.MaxResults {
+				_ = c.db.SetTaskNeedsSplit(ctx, task.ID,
+					fmt.Sprintf("hit %d-page cap (estimate %d exceeds the %d-result cap)",
+						maxPages, task.TotalEstimate, c.cfg.MaxResults))
+				c.log.Info(fmt.Sprintf("task %d: page cap %d reached, estimate %d over the cap -> needs_split",
+					task.ID, maxPages, task.TotalEstimate))
+				return nil
+			}
+			_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, "")
+			if err := c.flagIfShortfall(ctx, task); err != nil {
+				return err
+			}
+			c.log.Info(fmt.Sprintf("task %d: page cap %d reached on a %d-result bucket (Scholar was repeating itself) -> not a split problem",
+				task.ID, maxPages, task.TotalEstimate))
 			return nil
 		}
 
@@ -1173,6 +1606,164 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 		}
 		page++
 	}
+}
+
+// alreadyComplete short-circuits a task whose stored papers already cover the
+// count Scholar just reported, before the resume loop touches the browser.
+//
+// A page pointer can far outlive the result set it was built against. Scholar
+// keeps serving "Next" past its own stated total, recycling papers it already
+// showed, so a task can advance to page 36 on a result set that is fifteen
+// pages long — which is what happened to ICRA 2014's "control" bucket: 35 pages
+// walked, 304 distinct papers kept, 299 reported. Resuming that pointer means
+// clicking "Next" thirty-five times, each behind a between_pages pause, only to
+// find the link gone and mark the task completed anyway. Minutes of browser
+// traffic, and more requests aimed at a host that rate-limits, to reach a
+// conclusion the database already holds.
+//
+// The guard is deliberately strict: it fires only when the papers on hand meet
+// or exceed the live count, never on a ratio. Anything less and the task
+// resumes normally, because a shortfall is exactly what the crawl should go and
+// check.
+func (c *Crawler) alreadyComplete(ctx context.Context, task db.Task) bool {
+	if task.TotalEstimate <= 0 || task.Page <= 1 {
+		return false
+	}
+	got, err := c.db.CountPapersForTask(ctx, task.ID)
+	if err != nil || got < task.TotalEstimate {
+		return false
+	}
+	if err := c.db.SetTaskStatus(ctx, task.ID, db.StatusCompleted, ""); err != nil {
+		return false
+	}
+	c.log.Info(fmt.Sprintf("task %d: already holds %d papers for %d reported results -> completed without resuming (pointer was page %d)",
+		task.ID, got, task.TotalEstimate, task.Page))
+	return true
+}
+
+// refreshEstimate reconciles the task's planned result count with the one
+// Scholar shows on the search that was just issued, and writes the new figure
+// through before a single page is collected.
+//
+// The planned number comes from one reading of "About N results" on page 1,
+// taken whenever the conference was last planned. It is not a measurement that
+// holds: the same ICRA 2014 bucket was planned at 887 and reported 299 on every
+// one of the 35 pages the crawl then walked, while a sibling bucket went the
+// other way, planned at 163 and reported 1060. TotalEstimate is what
+// flagIfShortfall judges delivery against, so a stale figure either invents a
+// shortfall that never happened or hides a real one.
+//
+// Everything here is best effort. A missing or unreadable count leaves the
+// planned figure in place; nothing about the crawl depends on this succeeding.
+func (c *Crawler) refreshEstimate(ctx context.Context, task *db.Task) {
+	html, err := c.br.Content()
+	if err != nil {
+		return
+	}
+	p, err := parse.Parse(html)
+	if err != nil || p.Blocked || !p.HasCount || p.Count <= 0 {
+		return
+	}
+	if p.Count == task.TotalEstimate {
+		return
+	}
+	if err := c.db.UpdateTaskEstimate(ctx, task.ID, p.Count); err != nil {
+		c.log.Info(fmt.Sprintf("task %d: could not refresh the estimate: %v", task.ID, err))
+		return
+	}
+	c.log.Info(fmt.Sprintf("task %d: estimate refreshed %d -> %d (Scholar's count now)",
+		task.ID, task.TotalEstimate, p.Count))
+	task.TotalEstimate = p.Count
+}
+
+// BackfillPaperTasks rebuilds the task <-> paper relation from the archived
+// pages, then re-judges every completed task against it.
+//
+// Two things made the old per-task count unusable, and both are repaired here.
+// papers.task_id named an owner and the owner moved: the last task to see a
+// paper took it from the first, so a bucket's figure kept changing after the
+// bucket was finished. And flagIfShortfall judged delivery on that moving
+// figure, which is why fifteen tasks sat at 'completed' holding under half
+// their estimate while only one was ever flagged.
+//
+// page_html is the record of what each task actually saw, so the relation is
+// replayed from it rather than guessed from the current ownership. Pages are
+// streamed one at a time: page_html is the bulk of the database.
+//
+// Re-judging is the point of the exercise and is deliberately two-way — a task
+// the corrected count now shows as well delivered keeps its 'completed'.
+func (c *Crawler) BackfillPaperTasks(ctx context.Context) error {
+	empty, err := c.db.PaperTasksEmpty(ctx)
+	if err != nil {
+		return err
+	}
+	if empty {
+		c.log.Info("paper_tasks is empty: rebuilding it from the archived pages")
+	} else {
+		c.log.Info("paper_tasks already holds rows: replaying the archived pages to complete it")
+	}
+
+	ids, err := c.db.ArchivedPageIDs(ctx)
+	if err != nil {
+		return err
+	}
+	c.log.Info(fmt.Sprintf("backfill: %d archived pages to replay", len(ids)))
+
+	var pages, links, unparsed int
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ap, aerr := c.db.ArchivedPage(ctx, id)
+		if aerr != nil {
+			return aerr
+		}
+		pages++
+		p, perr := parse.Parse(ap.HTML)
+		if perr != nil || len(p.Items) == 0 {
+			unparsed++
+			continue
+		}
+		hashes := make([]string, 0, len(p.Items))
+		for _, it := range p.Items {
+			hashes = append(hashes, hash.PaperHash(it.Title, it.Year, it.Authors))
+		}
+		n, lerr := c.db.LinkPapersToTask(ctx, ap.TaskID, hashes)
+		if lerr != nil {
+			return lerr
+		}
+		links += n
+		if pages%200 == 0 {
+			c.log.Info(fmt.Sprintf("backfill: %d/%d pages replayed, %d links written", pages, len(ids), links))
+		}
+	}
+	c.log.Info(fmt.Sprintf("backfill: %d pages replayed, %d links written, %d pages held no parsable result",
+		pages, links, unparsed))
+
+	tasks, err := c.db.CompletedTasks(ctx)
+	if err != nil {
+		return err
+	}
+	flagged := 0
+	for _, t := range tasks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		before := t.Status
+		if err := c.flagIfShortfall(ctx, t); err != nil {
+			return err
+		}
+		if before == db.StatusCompleted {
+			got, cerr := c.db.CountPapersForTask(ctx, t.ID)
+			if cerr == nil && t.TotalEstimate > 0 &&
+				float64(got) < float64(t.TotalEstimate)*c.cfg.MinCompletionRatio {
+				flagged++
+			}
+		}
+	}
+	c.log.Info(fmt.Sprintf("requalification: %d completed tasks re-judged, %d moved to incomplete",
+		len(tasks), flagged))
+	return nil
 }
 
 // flagIfShortfall overrides a just-completed task's status to 'incomplete'
@@ -1282,8 +1873,4 @@ func papersFromItemsForPlan(items []model.ResultItem, confID int64) []db.Paper {
 		out = append(out, p)
 	}
 	return out
-}
-
-func currentYear() int {
-	return time.Now().Year()
 }
