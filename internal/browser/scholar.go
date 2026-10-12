@@ -367,7 +367,15 @@ func (b *Browser) applyCitationFilter() error {
 		// ScrollIntoView on it — CDP answers "cannot find object: … class
 		// HTMLAnchorElement". That used to propagate out of Search() and lose
 		// the whole count probe for that year.
-		el, err := b.page.Element(selCitationsIncluded)
+		//
+		// It must also be the VISIBLE copy: Scholar renders two matching
+		// elements — a hidden template (zero box, no offsetParent) and the real
+		// sidebar toggle — and page.Element returns the first in document
+		// order, the hidden one. Clicking it parked the whole run inside
+		// ScrollIntoView's WaitVisible, which retries forever (no timeout is
+		// configured anywhere): on a source: results page the run sat
+		// permanently on the first plan probe with nothing committed.
+		el, err := b.visibleCitationToggle()
 		if err != nil {
 			b.sleepRange(400, 900)
 			continue
@@ -385,6 +393,28 @@ func (b *Browser) applyCitationFilter() error {
 		}
 	}
 	return fmt.Errorf("could not untick \"include citations\" after %d attempts", citationFilterAttempts)
+}
+
+// visibleCitationToggle returns the rendered "include citations" checkbox link.
+// Scholar emits two elements matching selCitationsIncluded: a hidden template
+// (getBoundingClientRect all-zero, offsetParent null) and the live sidebar
+// control. Only the second is clickable, so the candidates are filtered by
+// layout box instead of taking the first DOM match.
+func (b *Browser) visibleCitationToggle() (*rod.Element, error) {
+	els, err := b.page.Elements(selCitationsIncluded)
+	if err != nil {
+		return nil, err
+	}
+	for _, el := range els {
+		ro, err := el.Eval(`() => {
+			const r = this.getBoundingClientRect();
+			return this.offsetParent !== null && r.width > 0 && r.height > 0;
+		}`)
+		if err == nil && ro.Value.Bool() {
+			return el, nil
+		}
+	}
+	return nil, &rod.ElementNotFoundError{}
 }
 
 // typeInto selects and types text into a form field, then reads the field's
