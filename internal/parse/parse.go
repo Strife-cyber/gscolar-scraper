@@ -67,6 +67,30 @@ func IsBlocked(htmlStr string) bool {
 	return isBlockedDoc(doc)
 }
 
+// HasCaptchaChallenge reports whether a block page actually offers something a
+// human can solve. Google serves two very different pages under the same
+// "blocked" umbrella:
+//
+//   - a CAPTCHA challenge — solvable, so waiting for the user is the right move;
+//   - a flat refusal ("your computer or network may be sending automated
+//     queries … we can't process your request right now") with no widget at
+//     all — nothing to click, and only time or a different IP will clear it.
+//
+// Telling them apart matters because the scraper's block handler otherwise
+// asks the user to "solve it in the browser window" and polls forever for a
+// challenge that was never there.
+func HasCaptchaChallenge(htmlStr string) bool {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlStr))
+	if err != nil {
+		return false
+	}
+	return hasCaptchaChallengeDoc(doc)
+}
+
+func hasCaptchaChallengeDoc(doc *goquery.Document) bool {
+	return doc.Find("form#captcha-form, .g-recaptcha, #g-recaptcha-response, #captcha, iframe[src*=\"recaptcha\"]").Length() > 0
+}
+
 func isBlockedDoc(doc *goquery.Document) bool {
 	if doc.Find("form#captcha-form").Length() > 0 {
 		return true

@@ -21,7 +21,6 @@ type Config struct {
 	StartYear          int             `json:"start_year"`           // lower bound for "2000 to present" (default 2000)
 	EndYear            int             `json:"end_year"`             // upper bound of the planning range; 0 = the current year (see EffectiveEndYear)
 	MaxResults         int             `json:"max_results"`          // Scholar's cap (default 1000)
-	PlanWindowYears    int             `json:"plan_window_years"`    // base year-window width the planner walks: 1 = one task per year, 2 = chronological pairs (default 2)
 	IncludeCitations   bool            `json:"include_citations"`    // keep Scholar's citation-only records (entries with no document, known only from being cited). Default false: they inflate every count, can push a window that holds ~900 real articles over the 1000 cap and trigger a pointless keyword split, and they land in the papers table as rows that are not articles
 	MinBalance         float64         `json:"min_balance"`          // splitter: min balance score for a keyword to be used (default 0.15)
 	MaxProbes          int             `json:"max_probes"`           // splitter: max count() probes per node (default 8)
@@ -124,16 +123,6 @@ func (c *Config) EffectiveEndYear() int {
 	return time.Now().Year()
 }
 
-// EffectivePlanWindowYears returns the planner's base year-window width,
-// falling back to 2 when unset. Like EffectiveEndYear, resolving it here keeps
-// a Config built as a struct literal (which never runs applyDefaults) valid.
-func (c *Config) EffectivePlanWindowYears() int {
-	if c.PlanWindowYears > 0 {
-		return c.PlanWindowYears
-	}
-	return 2
-}
-
 func (c *Config) applyDefaults() {
 	if c.Database == "" {
 		c.Database = "scholar.db"
@@ -143,9 +132,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxResults == 0 {
 		c.MaxResults = 1000
-	}
-	if c.PlanWindowYears == 0 {
-		c.PlanWindowYears = 2
 	}
 	if c.MaxKeywords == 0 {
 		c.MaxKeywords = 5
@@ -287,9 +273,6 @@ func (c *Config) validate() error {
 	}
 	if c.EndYear > 0 && c.EndYear < c.StartYear {
 		return fmt.Errorf("config: end_year (%d) must be >= start_year (%d)", c.EndYear, c.StartYear)
-	}
-	if c.PlanWindowYears < 1 {
-		return fmt.Errorf("config: plan_window_years must be >= 1")
 	}
 	if c.MaxKeywords < 0 {
 		return fmt.Errorf("config: max_keywords must be >= 0")
