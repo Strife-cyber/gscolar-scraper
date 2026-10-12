@@ -2,14 +2,13 @@
 //
 // Usage:
 //
-//	gscolar -config config.json -status
-//	gscolar -config config.json -plan            # plan every conference
-//	gscolar -config config.json -plan -conference ICML
-//	gscolar -config config.json -crawl           # crawl pending tasks
-//	gscolar -config config.json -crawl -conference ICML
-//	gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
-//	gscolar -config config.json -gen-tasks       # build tasks from the DB only (no browser)
-//	gscolar -config config.json -rerun-shortfall -crawl -conference ICML  # retry under-delivered tasks
+//		gscolar -config config.json -status
+//	 	.\bin\gscolar.exe -config config.json -plan -conference ICRA
+//		gscolar -config config.json -crawl           # crawl pending tasks
+//		.\bin\gscolar.exe -config config.json -crawl -conference ICRA
+//		gscolar -config config.json -plan -crawl -conference ICML   # plan then crawl
+//		gscolar -config config.json -gen-tasks       # build tasks from the DB only (no browser)
+//		.\bin\gscolar.exe -config config.json -rerun-shortfall -crawl -conference ICRA  # retry under-delivered tasks
 //
 // -plan and -crawl both drive the real browser and are resumable: re-running
 // them continues from the database's checkpoints (every page is committed
@@ -43,6 +42,7 @@ func main() {
 	doCrawl := flag.Bool("crawl", false, "crawl pending tasks (drives the browser)")
 	doGen := flag.Bool("gen-tasks", false, "build tasks from the DB only (no browser)")
 	doRerunShortfall := flag.Bool("rerun-shortfall", false, "re-queue incomplete/error tasks to pending (no browser)")
+	doBackfill := flag.Bool("backfill-tasks", false, "rebuild the task/paper relation from archived pages and re-judge completed tasks (no browser)")
 	doStatus := flag.Bool("status", false, "print progress statistics and exit")
 	confName := flag.String("conference", "", "restrict -plan/-crawl/-gen-tasks/-rerun-shortfall to one conference by name")
 	flag.Usage = usage
@@ -81,13 +81,13 @@ func main() {
 
 	if *doStatus {
 		printStatus(ctx, d)
-		if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
+		if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall && !*doBackfill {
 			return
 		}
 		fmt.Println()
 	}
 
-	if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
+	if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall && !*doBackfill {
 		flag.Usage()
 		return
 	}
@@ -144,6 +144,20 @@ func main() {
 		}
 		os.Exit(130)
 	}()
+
+	// -backfill-tasks works off page_html alone -- no browser, no conference
+	// loop -- but it walks the whole archive, so it sits after the signal
+	// handler to stay interruptible. Combined with -crawl it runs first, so
+	// the crawl resumes against corrected task statuses.
+	if *doBackfill {
+		if err := c.BackfillPaperTasks(ctx); err != nil {
+			logger.Error("backfill", "err", err)
+			os.Exit(1)
+		}
+		if !*doPlan && !*doCrawl && !*doGen && !*doRerunShortfall {
+			return
+		}
+	}
 
 	for _, conf := range confs {
 		if err := ctx.Err(); err != nil {

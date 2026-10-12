@@ -144,7 +144,7 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 	// verifying the resulting bucket counts. Probing candidate keywords on
 	// Scholar itself — one search per keyword per node — is what burned the
 	// probe budget on useless terms and risks tripping the block detection.
-	leaves, err := split.PlanWithWindow(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance, c.cfg.EffectivePlanWindowYears())
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
@@ -1168,7 +1168,7 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 	// known-paper corpus below. No background goroutine needed here — nothing
 	// slow runs concurrently to overlap it with.
 	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.PlanWithWindow(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance, c.cfg.EffectivePlanWindowYears())
+	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance)
 	if err != nil {
 		return 0, err
 	}
