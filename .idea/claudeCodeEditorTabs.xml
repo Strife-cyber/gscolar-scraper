@@ -5,20 +5,17 @@
     <option name="openSessionIds">
       <list>
         <option value="e2dc1fa1-851e-427e-a1b0-dea5b34363a4" />
-        <option value="27593cf8-84e3-4332-9e8a-c1331b6abea5" />
         <option value="7121ebdf-7a35-4de8-b8fd-e3623b8e8f3d" />
       </list>
     </option>
     <option name="sessionPaths">
       <map>
-        <entry key="27593cf8-84e3-4332-9e8a-c1331b6abea5" value="/sessions/84f3342e-f5ee-4b7f-9bb8-bc04ddfe3a1b" />
         <entry key="7121ebdf-7a35-4de8-b8fd-e3623b8e8f3d" value="/sessions/new" />
         <entry key="e2dc1fa1-851e-427e-a1b0-dea5b34363a4" value="/sessions/fe95a5f0-4587-4746-9e4b-4d799d222f93" />
       </map>
     </option>
     <option name="sessionTitles">
       <map>
-        <entry key="27593cf8-84e3-4332-9e8a-c1331b6abea5" value="if you check samples you will se in the form we ha" />
         <entry key="7121ebdf-7a35-4de8-b8fd-e3623b8e8f3d" value="Claude Code" />
         <entry key="e2dc1fa1-851e-427e-a1b0-dea5b34363a4" value="You are working on a Go package named `split` that" />
       </map>

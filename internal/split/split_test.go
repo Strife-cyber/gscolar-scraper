@@ -918,3 +918,17 @@ func predicates(query string) (includes, excludes []string) {
 	}
 	return includes, excludes
 }
+
+// TestPlanUnreadableCountNeedsSplit: a window whose count cannot be read is an
+// unknown size, so it must be a needs_split TODO — never a pending leaf that the
+// crawler would walk blind (ICML 2020-2021, ~7,500 results, was planned that way).
+func TestPlanUnreadableCountNeedsSplit(t *testing.T) {
+	count := func(string, int, int) (int, bool) { return 0, false }
+	leaves, err := Plan(`"X"`, 2020, 2021, 1000, 0, 5, nil, count, 0.15)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(leaves) != 1 || !leaves[0].NeedsSplit || leaves[0].HasCount {
+		t.Fatalf("expected one needs_split leaf without a count, got %+v", leaves)
+	}
+}
