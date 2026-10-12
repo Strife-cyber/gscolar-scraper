@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
 
 	"gscolar-scraper/internal/notify"
@@ -18,6 +19,9 @@ import (
 // hamburger menu; its drawer link id differs between the homepage (gs_hp_drw_adv)
 // and the results page (gs_res_drw_adv), so both are handled.
 const (
+	// scholarBase carries no hl=; scholarURL() appends it from the configured
+	// locale so Scholar cannot fall back to the IP's language (see
+	// BrowserConfig.Locale for why hl=fr is actively harmful here).
 	selScholarPage = "https://scholar.google.com/"
 	selSearchInput = `#gs_hdr_tsi`
 	selResults     = `.gs_r.gs_or`
@@ -38,7 +42,55 @@ const (
 	selAdvYearFrom    = `#gs_asd_ylo`
 	selAdvYearTo      = `#gs_asd_yhi`
 	selAdvSubmit      = `#gs_asd_psb`
+
+	// "include citations" toggle. Scholar renders it as an <a role="checkbox">
+	// (twice: once in the sidebar, once in the results dropdown), where
+	// aria-checked is the CURRENT state and the href carries the state the link
+	// would switch TO. So an element whose href sets as_vis=1 AND whose
+	// aria-checked is "true" is exactly "citations are included, click me to
+	// exclude them". Matching on the href rather than the label keeps this
+	// locale-independent — "inclure les citations" / "include citations" is
+	// translated, the parameter is not. The neighbouring "include patents"
+	// toggle flips as_sdt instead, so it can never match this selector.
+	selCitationsIncluded = `a.gs_in_cb[href*="as_vis=1"][aria-checked="true"]`
 )
+
+// citationFilterAttempts bounds applyCitationFilter's re-find-and-click loop.
+const citationFilterAttempts = 3
+
+// emptyPollsRequired is how many consecutive 400ms polls a fully-rendered,
+// row-less results page must hold before WaitForResults accepts it as "no
+// results". See WaitForResults for why this is deliberately generous.
+const emptyPollsRequired = 15
+
+// hardBlockTimeoutMS bounds the wait on a block page that offers no CAPTCHA,
+// when the config leaves captcha_timeout_ms at "wait forever". There is nothing
+// for a human to do on such a page, so an unbounded wait just hangs the run.
+const hardBlockTimeoutMS = 900000 // 15 min
+
+// hasCaptchaChallenge reports whether the current page offers something
+// solvable, as opposed to a flat refusal.
+func (b *Browser) hasCaptchaChallenge() bool {
+	html, err := b.page.HTML()
+	if err != nil {
+		return false
+	}
+	return parse.HasCaptchaChallenge(html)
+}
+
+// blockMessage is the operator-facing text for each kind of block. Telling the
+// user to "solve it in the browser window" when Google served a page with no
+// widget on it is worse than useless: it implies the run can be rescued by
+// hand when only time or a different IP will clear it.
+func blockMessage(solvable bool) string {
+	if solvable {
+		return "CAPTCHA detected. Solve it in the browser window. " +
+			"The scraper will resume automatically once Scholar is reachable again."
+	}
+	return "Google is REFUSING requests from this network — a block page with no CAPTCHA on it. " +
+		"Nothing to solve in the browser: the block is on the IP address, not on this session. " +
+		"The scraper will keep checking for a while, then give up so you can retry later or from another network."
+}
 
 // The splitter emits main-box style queries such as
 //
@@ -124,12 +176,23 @@ func quotePhrase(term string) string {
 	return term
 }
 
+// scholarURL is the Scholar entry point with the configured UI language pinned
+// in the query string. hl= is the parameter Scholar echoes into every
+// subsequent link, so setting it once here carries through the whole session.
+func (b *Browser) scholarURL() string {
+	lang := b.locale()
+	if i := strings.Index(lang, "-"); i > 0 {
+		lang = lang[:i]
+	}
+	return selScholarPage + "?hl=" + lang
+}
+
 // Search runs the full navigation recipe for one task: open Scholar, open the
 // advanced-search dialog from the hamburger menu, fill the equivalent form
 // fields for the query (venue → "published in", keywords → "with/without the
 // words") and the year range, then submit and wait for results.
 func (b *Browser) Search(query string, yearFrom, yearTo int) error {
-	if err := b.page.Navigate(selScholarPage); err != nil {
+	if err := b.page.Navigate(b.scholarURL()); err != nil {
 		return err
 	}
 	// The Scholar homepage has no results to wait for — wait for the search box
@@ -266,7 +329,62 @@ func (b *Browser) submitAdvancedSearch() error {
 			return err
 		}
 	}
-	return b.WaitForResults(60 * time.Second)
+	if err := b.WaitForResults(60 * time.Second); err != nil {
+		return err
+	}
+	return b.applyCitationFilter()
+}
+
+// applyCitationFilter unticks Scholar's "include citations" box when the config
+// asks for articles only (the default). Citation-only records — entries Scholar
+// knows purely from a bibliography, with no document behind them — are counted
+// in "About N results" and served as result rows, so leaving them in both
+// inflates the planner's counts (a window holding ~900 real articles can read
+// over the 1000 cap and trigger a keyword split that buys nothing) and writes
+// non-articles into the papers table.
+//
+// The toggle is a link, so clicking it reloads the results with as_vis=1. That
+// parameter then rides along every link Scholar renders on the new page,
+// including "Next", so one click per search covers the whole pagination.
+// Missing control (empty result set, block page) is not an error.
+func (b *Browser) applyCitationFilter() error {
+	if b.cfg.IncludeCitations {
+		return nil
+	}
+	for attempt := 1; attempt <= citationFilterAttempts; attempt++ {
+		// Idempotency guard: once the results carry as_vis=1 the citations are
+		// already out, and every link Scholar renders keeps the parameter.
+		if strings.Contains(b.URL(), "as_vis=1") {
+			return nil
+		}
+		// No toggle at all: an empty result set or a block page. Not an error.
+		if !b.elementExists(selCitationsIncluded) {
+			return nil
+		}
+		// The handle must be taken fresh on every attempt. Scholar keeps
+		// re-rendering its sidebar while the results stream in, and a handle
+		// taken before a re-render is dead by the time humanClick calls
+		// ScrollIntoView on it — CDP answers "cannot find object: … class
+		// HTMLAnchorElement". That used to propagate out of Search() and lose
+		// the whole count probe for that year.
+		el, err := b.page.Element(selCitationsIncluded)
+		if err != nil {
+			b.sleepRange(400, 900)
+			continue
+		}
+		before := b.URL()
+		if err := b.humanClick(el); err != nil {
+			b.sleepRange(400, 900)
+			continue
+		}
+		for range 20 { // ~5s for the reload to register
+			if u := b.URL(); u != "" && u != before {
+				return b.WaitForResults(60 * time.Second)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("could not untick \"include citations\" after %d attempts", citationFilterAttempts)
 }
 
 // typeInto selects and types text into a form field, then reads the field's
@@ -339,6 +457,25 @@ func (b *Browser) hasHashAnchor(id string) bool {
 // a stalled pagination surfaces as an error rather than the crawl silently
 // re-committing the same page until the page-cap backstop flags it.
 func (b *Browser) ClickNext() error {
+	// Ask whether the link exists before asking rod for it. page.Element retries
+	// through rod's DefaultSleeper — BackoffSleeper(100ms, 1s, nil) — and that
+	// nil is the attempt limit, so there is none: requesting an element that is
+	// not on the page never returns, it just polls until the process dies. No
+	// page timeout is configured here either.
+	//
+	// The crawl loop never hit this because it checks HasNext on the parsed HTML
+	// before paginating. The resume walk does not: it clicks forward blindly to
+	// reach the task's page pointer, so a pointer past the end of the results —
+	// routine, since Scholar paginates beyond its own count and the pointer
+	// outlives the result set — parked the whole crawl on the last page. One run
+	// sat there 25 minutes for 0.6s of CPU before anyone noticed.
+	//
+	// elementExists is a single JS query with no retry, and returning
+	// ElementNotFoundError keeps the contract the resume walk already handles:
+	// "pointer past the end" means the task is done.
+	if !b.elementExists(selNext) {
+		return &rod.ElementNotFoundError{}
+	}
 	icon, err := b.page.Element(selNext)
 	if err != nil {
 		return fmt.Errorf("next link not found: %w", err)
@@ -411,13 +548,34 @@ func (b *Browser) IsBlocked() bool {
 func (b *Browser) WaitForResults(timeout time.Duration) error {
 	emptyObs := 0
 	return b.waitForCondition(timeout, "no Scholar results", func() bool {
-		// 1 = result rows present, 2 = results-header shell present but no rows
-		// and no pagination (candidate no-results page), 0 = still loading.
+		// 1 = result rows present.
+		// 2 = no rows, no pagination, and the page is FULLY rendered.
+		// 0 = still loading.
+		//
+		// There is deliberately no "Scholar says it found nothing" fast path.
+		// The obvious candidates are not what they look like: .gs_alrt is the
+		// create-an-alert widget and appears on every page, empty or not, so
+		// keying on it would declare full pages empty. The wording of the real
+		// message is localized. Structure is the only reliable signal here.
+		//
+		// The "fully rendered" test is what makes state 2 trustworthy. The
+		// results header (#gs_ab_md) arrives early in Scholar's streamed
+		// response, long before the rows, so "header present and no rows" was
+		// true for a second or two on every normal page — and four polls
+		// (~1.6s) of it was enough to declare a 900-result task empty, commit a
+		// blank page and flag the task incomplete. Measured on the pages this
+		// actually happened to: all of them were missing the filter toggles
+		// (.gs_in_cb), which Scholar emits with the sidebar once the response
+		// is complete, while all 309 correctly-crawled pages had them. So the
+		// toggles are the marker that the response finished, and only then does
+		// "no rows" mean "no results".
 		ro, err := b.page.Eval(`() => {
 			if (document.querySelectorAll('.gs_r.gs_or').length > 0) return 1;
-			const md = document.querySelector('#gs_ab_md');
-			const next = document.querySelector('#gs_n a[href*="start="]');
-			return (md && !next) ? 2 : 0;
+			const md       = document.querySelector('#gs_ab_md');
+			const shell    = document.querySelector('#gs_res_ccl');
+			const rendered = document.querySelectorAll('.gs_in_cb').length > 0;
+			const next     = document.querySelector('#gs_n a[href*="start="]');
+			return (md && shell && rendered && !next) ? 2 : 0;
 		}`)
 		if err != nil {
 			emptyObs = 0
@@ -428,8 +586,11 @@ func (b *Browser) WaitForResults(timeout time.Duration) error {
 			emptyObs = 0
 			return true
 		case 2:
+			// ~6s of a stable, fully-rendered, row-less page. Slower than the
+			// old 1.6s, but this only ever delays a genuinely empty bucket;
+			// getting it wrong silently drops a whole task's papers.
 			emptyObs++
-			return emptyObs >= 4
+			return emptyObs >= emptyPollsRequired
 		default:
 			emptyObs = 0
 			return false
@@ -560,16 +721,24 @@ func (b *Browser) WaitForLoginResolved() error {
 // real Scholar page is visible, then waits like a human returning from a break
 // before reloading to continue.
 func (b *Browser) WaitForCaptchaResolved() error {
-	msg := "CAPTCHA or block page detected. Solve it in the browser window. " +
-		"The scraper will resume automatically once Scholar is reachable again."
-	_ = notify.Captcha("Scholar Scraper", msg)
-	fmt.Println("\n" + msg)
+	solvable := b.hasCaptchaChallenge()
+	_ = notify.Captcha("Scholar Scraper", blockMessage(solvable))
+	fmt.Println("\n" + blockMessage(solvable))
 
 	poll := time.Duration(b.cfg.Timing.CaptchaPollIntervalMS) * time.Millisecond
 	if poll <= 0 {
 		poll = 10 * time.Second
 	}
+	// A solvable challenge may legitimately wait forever: a human is coming for
+	// it. A flat refusal has nothing to wait for but time, so it always gets a
+	// bound — without one the run hangs until it is killed, which is exactly
+	// what a "your computer or network may be sending automated queries" page
+	// did: it has no widget on it, so "solve it in the browser" was impossible
+	// advice and the poll loop never terminated.
 	timeout := b.cfg.Timing.CaptchaTimeoutMS
+	if timeout <= 0 && !solvable {
+		timeout = hardBlockTimeoutMS
+	}
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(time.Duration(timeout) * time.Millisecond)
@@ -579,8 +748,21 @@ func (b *Browser) WaitForCaptchaResolved() error {
 			fmt.Println("Page unblocked; resuming...")
 			break
 		}
+		// A refusal can turn into a challenge once Google decides to offer one.
+		// That makes it solvable, so lift the bound the refusal had imposed.
+		if !solvable && b.hasCaptchaChallenge() {
+			solvable = true
+			fmt.Println(blockMessage(true))
+			if b.cfg.Timing.CaptchaTimeoutMS <= 0 {
+				deadline = time.Time{}
+			}
+		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			return fmt.Errorf("CAPTCHA not resolved within %d ms", timeout)
+			if solvable {
+				return fmt.Errorf("CAPTCHA not resolved within %d ms", timeout)
+			}
+			return fmt.Errorf("still refused by Google after %d ms and no CAPTCHA was ever offered: "+
+				"the block is on this IP, not on this session — retry later or from another network", timeout)
 		}
 		fmt.Println("Still blocked, waiting...")
 		time.Sleep(poll)

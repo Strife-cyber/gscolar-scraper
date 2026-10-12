@@ -14,7 +14,7 @@ technical implementation only.
 ## How it works
 
 1. **Plan** (`-plan`) — for each conference phrase, the planner asks Scholar
-   for the result count of the whole `2000→present` range, then recursively
+   for the result count of the whole `start_year→end_year` range, then recursively
    **halves oversized year ranges**. A single year still over the 1000-result
    cap is partitioned by **sequential keyword subtraction**
    (`q AND "A"`, `q AND "B" -"A"`, `q AND "C" -"A" -"B"`, … plus a residual
@@ -72,13 +72,19 @@ Edit `config.json`:
 | --- | --- |
 | `database` | SQLite file path (default `scholar.db`) |
 | `start_year` | lower bound of the date range (default `2000`) |
+| `end_year` | upper bound of the date range; `0` or absent = the current year |
+| `plan_window_years` | planner window width in years: `1` = one task per year, `2` = chronological pairs (default `2`) |
 | `max_results` | Scholar's per-query cap (default `1000`) |
+| `include_citations` | keep Scholar's citation-only records (default `false`). They have no document behind them, they inflate every count — a window holding ~900 real articles can read over the 1000 cap and trigger a keyword split that buys nothing — and they land in `papers` as rows that are not articles |
 | `browser.kind` | `chrome`, `edge`, or `auto` (detect) |
 | `browser.profile_dir` | override the user-data dir; empty = your real profile |
 | `browser.debug_port` | CDP port (default `9222`) |
 | `browser.headless` | keep `false` — headless looks like a bot |
+| `browser.stealth` | keep `false` — the stealth patches break Scholar's browser sniffer, which then serves a degraded page (unstable counts, no pagination) |
+| `browser.locale` | UI language, default `en-US`. Keep it: under `hl=fr` Scholar treats "and" as a mandatory query word instead of a stopword, slashing the counts of ICRA, KDD, AAMAS and every other venue whose name contains it |
 | `timing.*` | all `[min,max]` millisecond ranges for human delays |
 | `adaptive_throttle` | delay multiplier growth per CAPTCHA |
+| `timing.captcha_timeout_ms` | how long to wait on a block page before giving up; `0` = forever. A block page that offers **no** CAPTCHA is always bounded (15 min) whatever this says — there is nothing for a human to solve on it |
 | `keywords` | ordered subtraction chain (order matters, see above) |
 | `conferences` | `name` + `query` per venue; `use_short_name` uses `name` as the query |
 | `max_probes` | max keyword searches per split node (default 8) — the first keyword keeping both sides ≤75% of the node is used |
@@ -167,7 +173,22 @@ GROUP BY c.name ORDER BY COUNT(p.hash) DESC;
 ## Anti-detection posture
 
 - Real browser profile (your cookies, history, JS fingerprint), never headless.
-- `stealth` patches automation telltales (`navigator.webdriver`, …).
+  `resolveExecutable` always prefers an installed Chrome/Edge: letting rod fall
+  back to its own downloaded Chromium gives you a bare, historyless binary —
+  the exact fingerprint this design exists to avoid.
+- `--enable-automation` is explicitly removed from rod's default flags.
+- `NoDefaultDevice()` on both connect paths. rod otherwise emulates a laptop
+  device on every page, and that emulation ends in `SetUserAgent` with a
+  hardcoded "Macintosh … Chrome/114" — while the real binary's Client Hints
+  still announce Windows/Chrome 154. Scholar answers that contradiction with a
+  soft block: no CAPTCHA, just degraded pages whose "About N results" swings
+  by 10x between identical queries.
+- `stealth` is available (`browser.stealth`) but **off by default**: its
+  `window.chrome` / `navigator` patches make Scholar's own sniffer fail, and
+  Scholar answers with a degraded page — unstable result counts, no pagination.
+- The UI language is pinned to `browser.locale` four ways (`--lang`,
+  `--accept-lang`, the `Accept-Language` header and Google's `PREF` cookie)
+  plus `hl=` on the entry URL.
 - Query typed 80–250 ms/char; mouse moves along Bézier curves in small steps
   with ±4 px click offsets; occasional "reading" scrolls.
 - 30–60 s between pages, 60–120 s between searches, longer after a CAPTCHA.

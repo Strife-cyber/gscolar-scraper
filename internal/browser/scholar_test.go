@@ -1,6 +1,13 @@
 package browser
 
-import "testing"
+import (
+	"bytes"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/PuerkitoBio/goquery"
+)
 
 func TestDecomposeAdvancedQuery(t *testing.T) {
 	tests := []struct {
@@ -70,6 +77,39 @@ func TestDecomposeAdvancedQuery(t *testing.T) {
 				t.Errorf("decomposeAdvancedQuery(%q) = (%q, %q, %q, %q, %v), want (%q, %q, %q, %q, %v)",
 					tt.query, venue, exact, all, without, ok,
 					tt.wantVenue, tt.wantExact, tt.wantAll, tt.wantWithout, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestCitationsToggleSelectorMatchesRealMarkup pins selCitationsIncluded against
+// the captured Scholar pages in samples/. It must match the "include citations"
+// control while it is ON, and must never match the neighbouring "include
+// patents" control — the two are visually identical and differ only by the
+// parameter their href flips.
+func TestCitationsToggleSelectorMatchesRealMarkup(t *testing.T) {
+	for _, name := range []string{"../../samples/normal.html", "../../samples/opened.html"} {
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+
+		sel := doc.Find(selCitationsIncluded)
+		if sel.Length() == 0 {
+			t.Errorf("%s: selector matched nothing, want the citations toggle", name)
+			continue
+		}
+		sel.Each(func(_ int, s *goquery.Selection) {
+			href, _ := s.Attr("href")
+			if !strings.Contains(href, "as_vis=1") {
+				t.Errorf("%s: matched a control whose href is %q, want one setting as_vis=1", name, href)
+			}
+			if label := strings.ToLower(s.Find(".gs_lbl").Text()); strings.Contains(label, "brevet") || strings.Contains(label, "patent") {
+				t.Errorf("%s: matched the patents toggle (%q), not the citations one", name, label)
 			}
 		})
 	}

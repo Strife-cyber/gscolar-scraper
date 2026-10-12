@@ -115,6 +115,18 @@ func Tokenize(s string) []string {
 // Auxiliary verbs, pronouns, determiners and generic adverbs are included so
 // they cannot masquerade as high-Balance splitters — words like "has", "have"
 // and "been" split titles evenly but barely reduce a Scholar count.
+//
+// The scholarly-boilerplate group at the end is there for a subtler reason.
+// Balance is measured on titles and short snippets, while Scholar matches the
+// full text, and the gap between the two is enormous for writing vocabulary:
+// "paper" sits in 36% of this corpus's snippets and scores the single best
+// Balance of any candidate (0.72), yet "In this paper..." puts it in roughly
+// nine documents out of ten. Planning IROS 2020 picked it on that score and
+// got a 1040/110 split of a 1150-result year — the large side still over the
+// cap, three useless buckets behind it, and four more searches spent trying to
+// rescue it. A topical word does not have this gap: a paper about graphs says
+// so in its title, so its snippet frequency predicts its Scholar frequency.
+// These terms cannot be out-ranked, only excluded.
 var stopWords = map[string]bool{
 	"the": true, "a": true, "an": true, "of": true, "for": true, "with": true,
 	"on": true, "at": true, "in": true, "from": true, "to": true, "and": true,
@@ -133,6 +145,25 @@ var stopWords = map[string]bool{
 	"me": true, "him": true, "her": true, "us": true, "them": true,
 	"my": true, "mine": true, "your": true, "yours": true, "his": true,
 	"hers": true, "our": true, "ours": true, "theirs": true,
+	// scholarly boilerplate: vocabulary of writing about research rather than
+	// of any research topic. Frequent in full text, far rarer in snippets.
+	"paper": true, "papers": true, "presents": true, "present": true,
+	"presented": true, "propose": true, "proposes": true, "proposed": true,
+	"approach": true, "approaches": true, "method": true, "methods": true,
+	"problem": true, "problems": true, "result": true, "results": true,
+	"show": true, "shows": true, "shown": true, "study": true, "studies": true,
+	"work": true, "works": true, "research": true, "article": true,
+	"section": true, "abstract": true, "introduction": true, "conclusion": true,
+	"experiment": true, "experiments": true, "experimental": true,
+	"demonstrate": true, "demonstrates": true, "evaluate": true,
+	"evaluation": true, "novel": true, "challenging": true,
+	"effective": true, "efficient": true, "improved": true, "improve": true,
+	"provide": true, "provides": true, "consider": true, "considered": true,
+	"introduce": true, "introduces": true, "describe": true, "describes": true,
+	"compared": true, "comparison": true, "applied": true, "application": true,
+	"applications": true, "technique": true, "techniques": true,
+	"important": true, "recent": true, "current": true, "general": true,
+	"related": true, "require": true, "requires": true, "case": true,
 	"myself": true, "yourself": true, "himself": true, "herself": true,
 	"itself": true, "ourselves": true, "themselves": true,
 	// determiners / quantifiers / conjunctions / adverbs
