@@ -1284,7 +1284,7 @@ func TestViableKeywords(t *testing.T) {
 		"data mining approach", "data analysis method", "data pipeline",
 		"data system", "data storage", "data processing", "data model", "data network",
 	}
-	got := viableKeywords(texts, []string{"learning", "data", "nonexistent"})
+	got := viableKeywords(texts, []string{"learning", "data", "nonexistent"}, 0.75)
 	if len(got) != 1 || got[0] != "learning" {
 		t.Fatalf("viableKeywords = %v, want [learning]", got)
 	}

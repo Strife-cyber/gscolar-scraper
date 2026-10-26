@@ -41,7 +41,7 @@ const sparseRetries = 3
 // exhaustedRuns is how many consecutive full pages may add no new paper before
 // the task is considered finished, however many more "Next" links Scholar is
 // still willing to render.
-const exhaustedRuns = 3
+const exhaustedRuns = 6
 
 // Browserer is the slice of the browser package the crawler needs, so the
 // crawl logic can be tested offline against recorded HTML with a fake.
@@ -125,35 +125,78 @@ func (b *probeBudget) exhausted() bool { return b == nil || b.left <= 0 }
 const partitionCoverage = 0.95
 
 func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, error) {
-	budget := &probeBudget{confID: conf.ID, left: c.cfg.MaxProbesPerConf}
-	live := func(query string, yearFrom, yearTo int) (int, bool) {
-		return c.budgetCount(ctx, budget, query, yearFrom, yearTo)
-	}
-
 	// Keyword mining runs on its own goroutine: it is pure DB+CPU work and
 	// overlaps the plan's slow count probes (each search carries a human-like
 	// pause), so by the time an over-cap year needs split candidates the
-	// TF-IDF ranking is ready.
+	// TF-IDF ranking is ready. The pool is mined once from the venue's papers
+	// and shared by all of its names.
 	kwCh := make(chan []string, 1)
 	go func() { kwCh <- c.planKeywords(ctx, conf) }()
+	var pool []string
+	poolReady := false
 
-	// maxKeywords=0 disables the inline online split inside split.Plan: an
-	// over-cap single year is emitted as a needs_split leaf and resolved below
-	// by resolveYear, which picks split keywords on the conference's known
-	// papers (offline corpus partitioning) and spends live Scholar probes only
-	// verifying the resulting bucket counts. Probing candidate keywords on
-	// Scholar itself — one search per keyword per node — is what burned the
-	// probe budget on useless terms and risks tripping the block detection.
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance)
-	if err != nil {
-		return 0, err
+	// A venue that changed names is planned once per name, each over the whole
+	// start_year..end_year range: Scholar's dating of a rename is unreliable,
+	// so no name is fenced off to the years it was officially in use. Every
+	// name gets its own probe budget, otherwise the aliases planned last would
+	// find the main name had spent it all.
+	needsSplit := 0
+	for _, name := range conf.Names() {
+		if err := ctx.Err(); err != nil {
+			return needsSplit, err
+		}
+		v := conf
+		v.Query = name
+		budget := &probeBudget{confID: conf.ID, left: c.cfg.MaxProbesPerConf}
+		live := func(query string, yearFrom, yearTo int) (int, bool) {
+			return c.budgetCount(ctx, budget, query, yearFrom, yearTo)
+		}
+
+		// maxKeywords=0 disables the inline online split inside split.Plan: an
+		// over-cap single year is emitted as a needs_split leaf and resolved below
+		// by resolveYear, which picks split keywords on the conference's known
+		// papers (offline corpus partitioning) and spends live Scholar probes only
+		// verifying the resulting bucket counts. Probing candidate keywords on
+		// Scholar itself — one search per keyword per node — is what burned the
+		// probe budget on useless terms and risks tripping the block detection.
+		leaves, err := split.Plan(name, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, live, c.cfg.MinBalance)
+		if err != nil {
+			return needsSplit, fmt.Errorf("%s: %w", name, err)
+		}
+		if !poolReady {
+			pool = <-kwCh
+			poolReady = true
+		}
+
+		// The probe budget is shared across the name's years so no single year
+		// can consume its whole CAPTCHA allowance.
+		resolved := c.resolveOverCapYears(ctx, v, leaves, split.DropDegenerateKeywords(name, pool), live, budget, false)
+		n, err := c.emitTasks(ctx, v, resolved, otherNames(conf, name))
+		if err != nil {
+			return needsSplit, err
+		}
+		needsSplit += n
 	}
+	return needsSplit, nil
+}
 
-	pl := <-kwCh
+// otherNames lists the venue's names other than name. The per-name copy of
+// the conference handed to the planning helpers has its Query swapped for the
+// name being planned, so it cannot answer this itself.
+func otherNames(conf db.Conference, name string) []string {
+	var out []string
+	for _, n := range conf.Names() {
+		if n != name {
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
-	// Resolve any single-year over-cap leaf into finer pending tasks. The probe
-	// budget is shared so no single year can consume the conference's whole
-	// CAPTCHA allowance.
+// resolveOverCapYears turns every single-year leaf over the cap into finer
+// buckets, leaving the other leaves as they are. conf.Query is the name being
+// planned.
+func (c *Crawler) resolveOverCapYears(ctx context.Context, conf db.Conference, leaves []split.Leaf, keywords []string, count split.CountFunc, budget *probeBudget, offline bool) []split.Leaf {
 	var resolved []split.Leaf
 	for _, l := range leaves {
 		if !l.NeedsSplit || l.YearFrom != l.YearTo {
@@ -176,15 +219,14 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 			resolved = append(resolved, sub...)
 			continue
 		}
-		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, live, budget, false)
+		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, keywords, count, budget, offline)
 		if ok {
 			resolved = append(resolved, sub...)
 		} else {
 			resolved = append(resolved, l)
 		}
 	}
-
-	return c.emitTasks(ctx, conf, resolved)
+	return resolved
 }
 
 // existingPartition returns the split this conference already holds for an
@@ -214,6 +256,11 @@ func (c *Crawler) existingPartition(ctx context.Context, confID int64, year spli
 	)
 	for _, t := range tasks {
 		if t.YearFrom != year.YearFrom || t.YearTo != year.YearTo {
+			continue
+		}
+		// A venue searched under several names holds one partition per name;
+		// year.Query is the name being planned, so only its buckets count.
+		if !db.TaskHasBase(t.Query, year.Query) {
 			continue
 		}
 		// The bare-year leaf is the "this year is unresolved" marker, not a
@@ -265,7 +312,7 @@ func (c *Crawler) existingPartition(ctx context.Context, confID int64, year spli
 
 // emitTasks upserts every leaf as a task (pending, or needs_split with a reason)
 // and prunes obsolete tasks, returning how many leaves remained needs_split.
-func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []split.Leaf) (int, error) {
+func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []split.Leaf, others []string) (int, error) {
 	keepKeys := make([]string, 0, len(resolved))
 	needsSplit := 0
 	for _, l := range resolved {
@@ -302,17 +349,19 @@ func (c *Crawler) emitTasks(ctx context.Context, conf db.Conference, resolved []
 		}
 	}
 
-	if err := c.db.ReplaceConferencePlan(ctx, conf.ID, keepKeys); err != nil {
+	// conf.Query is the name just planned; the venue's other names keep their
+	// own tasks.
+	if err := c.db.ReplaceNamePlan(ctx, conf.ID, keepKeys, others); err != nil {
 		return 0, err
 	}
-	c.log.Info(fmt.Sprintf("planned %s: %d tasks (%d need re-split)", conf.Name, len(resolved), needsSplit))
+	c.log.Info(fmt.Sprintf("planned %s %s: %d tasks (%d need re-split)", conf.Name, conf.Query, len(resolved), needsSplit))
 	return needsSplit, nil
 }
 
 // planKeywords returns the keyword candidates fed to the planner: splitter
 // words mined from EVERY stored paper (not just this conference's) merged with
-// the configured defaults, minus degenerate terms that are substrings of the
-// venue query. Candidates are ranked by Balance × IDF over the same whole-DB
+// the configured defaults. Degenerate terms (substrings of a venue name) are
+// left for the caller to drop per name. Candidates are ranked by Balance × IDF over the same whole-DB
 // corpus — a word must divide the corpus evenly AND be topically distinctive
 // to rank high, so generic vocabulary can never masquerade as a splitter.
 // Mined keywords come first so the partition sees the best splitters first.
@@ -349,15 +398,16 @@ func (c *Crawler) planKeywords(ctx context.Context, conf db.Conference) []string
 	if len(texts) < c.cfg.MinPapersToTrust {
 		texts = c.backgroundTexts(ctx)
 	}
-	kws = viableKeywords(texts, dedupSubstringKeywords(kws))
-	return split.DropDegenerateKeywords(conf.Query, kws)
+	// Terms degenerate for a venue name (substrings of it) are dropped per name
+	// by the caller, since a venue can be searched under several.
+	return viableKeywords(texts, dedupSubstringKeywords(kws), c.cfg.EffectiveMaxSideFraction())
 }
 
 // viableKeywords drops candidates the corpus already proves cannot split: a
 // term appearing in 0 texts has no evidence of coverage, and a term appearing
-// in more than 75% of them can only return a dominant count — probing either
+// in more than maxCoverage (max_side_fraction) of them can only return a dominant count — probing either
 // on Scholar wastes a search.
-func viableKeywords(texts []string, kws []string) []string {
+func viableKeywords(texts []string, kws []string, maxCoverage float64) []string {
 	if len(texts) == 0 || len(kws) == 0 {
 		return kws
 	}
@@ -365,7 +415,6 @@ func viableKeywords(texts []string, kws []string) []string {
 	for _, t := range texts {
 		lower = append(lower, strings.ToLower(t))
 	}
-	const maxCoverage = 0.75
 	out := make([]string, 0, len(kws))
 	for _, kw := range kws {
 		lkw := strings.ToLower(kw)
@@ -547,12 +596,6 @@ func offlineDocLimit(maxResults int, headroom float64, corpusSize, trueCount int
 	return max(int(budget*float64(corpusSize)/float64(trueCount)), 1)
 }
 
-// maxRootFraction is the share of a year a root splitter may cover before it
-// is judged useless. It mirrors split.resolveNode's own "neither side above
-// 75% of the node" bar, applied one level earlier — to the keyword the entire
-// partition will hang from.
-const maxRootFraction = 0.75
-
 // rootProbeAttempts bounds how many root keywords may be measured and rejected
 // for one year. Each rejection costs one Scholar search, so this is a small
 // constant, not a search.
@@ -589,7 +632,10 @@ func (c *Crawler) verifiedRootKeywords(
 	if trueCount <= 0 {
 		return keywords // nothing to measure against
 	}
-	ceiling := int(float64(trueCount) * maxRootFraction)
+	// A root covering more than max_side_fraction of the year is judged
+	// useless, the same bar split.resolveNode applies to every node, applied
+	// one level earlier — to the keyword the entire partition will hang from.
+	ceiling := int(float64(trueCount) * c.cfg.EffectiveMaxSideFraction())
 
 	for range rootProbeAttempts {
 		if len(keywords) == 0 || budget.exhausted() {
@@ -719,7 +765,7 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	for _, p := range papers {
 		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
 	}
-	veto := corpusVeto(yearTexts, nil, nil)
+	veto := corpusVeto(yearTexts, nil, nil, c.cfg.EffectiveMaxSideFraction())
 	// Coverage is now this venue's share of its own year, which is what decides
 	// whether an offline split can be trusted. Measured against every venue's
 	// papers it read 3593/1860 — capped to 1.0, "we know this year completely" —
@@ -756,9 +802,21 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		// building anything on top of it.
 		keywords = c.verifiedRootKeywords(conf, year, trueCount, docs, keywords, text, limit, count, budget)
 
+		// Before the partition divides a group its corpus estimate puts over
+		// the limit, Scholar is asked for the group's real count: a group that
+		// already fits stays one bucket instead of being cut on an estimate.
+		// Each check is a count search (cached, so the bucket verification
+		// below reuses it); when it cannot be made the corpus decides as before.
+		target := int(float64(c.cfg.MaxResults) * c.cfg.Headroom)
+		fits := func(inc, exc []string) bool {
+			q := partition.Bucket{Includes: inc, Excludes: exc}.Query(conf.Query)
+			n, ok := count(q, year, year)
+			return ok && n <= target
+		}
 		out := partition.PartitionOpts(docs, keywords, text, limit, partition.Options{
 			MinBalance:  c.cfg.MinBalance,
 			PhraseBoost: c.cfg.MinePhraseBoost,
+			Fits:        fits,
 		})
 		// An unresolved group means every candidate in `keywords` is either
 		// near-universal or near-absent inside that specific group — the
@@ -788,22 +846,25 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 				break
 			}
 			leaf := split.Leaf{Query: q, YearFrom: year, YearTo: year, Keywords: append(append([]string{}, b.Includes...), b.Excludes...), Count: n, HasCount: true}
-			if n <= c.cfg.MaxResults {
+			// Strictly under the cap: a bucket AT max_results is exactly the
+			// size Scholar stops serving at, so it may already be clipped.
+			if n < c.cfg.MaxResults {
 				leaf.NeedsSplit = false
 				sub = append(sub, leaf)
 				continue
 			}
 			// Offline underestimate (a bucket that "fit" offline is really bigger):
-			// re-split it online, still under the shared probe budget.
+			// re-split it online, still under the shared probe budget, into
+			// leaves strictly under the cap (resolveNode keeps size <= limit).
 			leaf.NeedsSplit = true
 			// The leaf's own predicates are the veto's base context: a
 			// candidate is measured inside the bucket's conditioned corpus.
 			// The rank uses the same base predicates so a chained keyword
 			// inside this bucket is scored on how well it splits the
 			// bucket's subset, not the whole year.
-			bv := corpusVeto(yearTexts, b.Includes, b.Excludes)
+			bv := corpusVeto(yearTexts, b.Includes, b.Excludes, c.cfg.EffectiveMaxSideFraction())
 			br := corpusRank(yearTexts, b.Includes, b.Excludes, c.cfg.MinePhraseBoost)
-			rs, ok := split.ResolveOverCapVR(leaf, keywords, liveOnly(count, budget), bv, br, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+			rs, ok := split.ResolveOverCapVRS(leaf, keywords, liveOnly(count, budget), bv, br, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults-1, c.cfg.EffectiveMaxSideFraction())
 			if !ok || budget.exhausted() {
 				offlineOK = false
 				break
@@ -897,18 +958,20 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	// up front; corpusVeto then re-checks each surviving term CONDITIONALLY
 	// inside resolveNode, so a term that is uniform within a branch's subset
 	// is never probed there either.
-	merged = viableKeywords(yearTexts, dedupSubstringKeywords(merged))
+	merged = viableKeywords(yearTexts, dedupSubstringKeywords(merged), c.cfg.EffectiveMaxSideFraction())
 	if len(merged) == 0 {
 		return nil, false
 	}
 	rank := corpusRank(yearTexts, nil, nil, c.cfg.MinePhraseBoost)
-	return split.ResolveOverCapVR(split.Leaf{
+	// MaxResults-1: leaves must be strictly under the cap, as in the bucket
+	// verification above.
+	return split.ResolveOverCapVRS(split.Leaf{
 		Query:    query,
 		YearFrom: year,
 		YearTo:   year,
 		Count:    trueCount,
 		HasCount: true,
-	}, merged, liveOnly(count, budget), veto, rank, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults)
+	}, merged, liveOnly(count, budget), veto, rank, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults-1, c.cfg.EffectiveMaxSideFraction())
 }
 
 // escalateUnresolved retries every Unresolved group from an initial
@@ -998,11 +1061,11 @@ func escalateUnresolved(out partition.Outcome, allDocs []partition.Doc, keywords
 // corpusVeto builds a split.VetoFunc over a set of document texts: a keyword
 // may be probed on a branch only when the texts already satisfying that
 // branch's include/exclude predicates show it can divide — the term must
-// appear in more than 0 and at most ~75% of the conditioned subset.
-// baseInc/baseExc carry predicates already baked into the leaf's query (the
+// appear in more than 0 and at most maxCoverage (max_side_fraction) of the
+// conditioned subset. baseInc/baseExc carry predicates already baked into the leaf's query (the
 // resolver starts its own inc/exc empty). With no corpus evidence for a
 // branch the probe is allowed through.
-func corpusVeto(texts []string, baseInc, baseExc []string) split.VetoFunc {
+func corpusVeto(texts []string, baseInc, baseExc []string, maxCoverage float64) split.VetoFunc {
 	if len(texts) == 0 {
 		return nil
 	}
@@ -1014,7 +1077,7 @@ func corpusVeto(texts []string, baseInc, baseExc []string) split.VetoFunc {
 		if subset == 0 {
 			return true // no corpus evidence for this branch — cannot prove
 		}
-		return with > 0 && float64(with)/float64(subset) <= 0.75
+		return with > 0 && float64(with)/float64(subset) <= maxCoverage
 	}
 }
 
@@ -1166,37 +1229,28 @@ func (c *Crawler) OfflineGenTasks(ctx context.Context, conf db.Conference) (int,
 	// Same as PlanConference: maxKeywords=0 keeps split.Plan from probing
 	// candidate keywords; every over-cap year is resolved by resolveYear on the
 	// known-paper corpus below. No background goroutine needed here — nothing
-	// slow runs concurrently to overlap it with.
-	pl := c.planKeywords(ctx, conf)
-	leaves, err := split.Plan(conf.Query, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance)
-	if err != nil {
-		return 0, err
+	// slow runs concurrently to overlap it with. Each name of the venue is
+	// planned on its own, as in PlanConference.
+	pool := c.planKeywords(ctx, conf)
+	needsSplit := 0
+	for _, name := range conf.Names() {
+		v := conf
+		v.Query = name
+		leaves, err := split.Plan(name, c.cfg.StartYear, c.cfg.EffectiveEndYear(), c.cfg.MaxResults, 0, c.cfg.MaxProbes, nil, cacheOnly, c.cfg.MinBalance)
+		if err != nil {
+			return needsSplit, fmt.Errorf("%s: %w", name, err)
+		}
+		// The offline budget is effectively unlimited: cache hits are free and
+		// resolveYear's verify/re-split probes also read count_cache only.
+		budget := &probeBudget{confID: conf.ID, left: int(^uint(0) >> 1)} // max int
+		resolved := c.resolveOverCapYears(ctx, v, leaves, split.DropDegenerateKeywords(name, pool), cacheOnly, budget, true)
+		n, err := c.emitTasks(ctx, v, resolved, otherNames(conf, name))
+		if err != nil {
+			return needsSplit, err
+		}
+		needsSplit += n
 	}
-	// The offline budget is effectively unlimited: cache hits are free and
-	// resolveYear's verify/re-split probes also read count_cache only.
-	budget := &probeBudget{confID: conf.ID, left: int(^uint(0) >> 1)} // max int
-
-	var resolved []split.Leaf
-	for _, l := range leaves {
-		if !l.NeedsSplit || l.YearFrom != l.YearTo {
-			resolved = append(resolved, l)
-			continue
-		}
-		// Same reuse as PlanConference: a year this conference already has a
-		// usable split for is kept as-is instead of being partitioned again.
-		if sub, ok := c.existingPartition(ctx, conf.ID, l); ok {
-			c.log.Info(fmt.Sprintf("%s %d: keeping the existing %d-task split", conf.Name, l.YearFrom, len(sub)))
-			resolved = append(resolved, sub...)
-			continue
-		}
-		sub, ok := c.resolveYear(ctx, conf, l.YearFrom, l.Count, pl, cacheOnly, budget, true)
-		if ok {
-			resolved = append(resolved, sub...)
-		} else {
-			resolved = append(resolved, l)
-		}
-	}
-	return c.emitTasks(ctx, conf, resolved)
+	return needsSplit, nil
 }
 
 // budgetCount checks the cache and, only on a miss, spends one unit of the
