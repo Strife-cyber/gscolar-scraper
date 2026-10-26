@@ -117,6 +117,15 @@ type Options struct {
 	// individual node's ties simply because there are more single-word
 	// candidates than phrase candidates competing).
 	PhraseBoost float64
+
+	// Fits, when set, is asked before an over-limit group is divided: a true
+	// return keeps the group whole as one bucket. The known corpus only
+	// estimates a group's size, and a group it reads as too big may well fit
+	// on Scholar — ICML 2005's "-paper" branch, about 130 results, was cut into
+	// seven buckets of 4 to 63 on the corpus's say-so. inc/exc are the group's
+	// predicates. It is never asked about the root (no predicates), which the
+	// caller already knows is over the cap.
+	Fits func(inc, exc []string) bool
 }
 
 // PartitionOpts is Partition/PartitionMinBalance with full control over
@@ -145,16 +154,16 @@ func PartitionOpts(docs []Doc, keywords []string, text textOf, limit int, opts O
 	}
 
 	var out Outcome
-	split(&out, newBitsetFull(len(sorted)), nil, nil, sorted, keywords, kwBits, isPhrase, limit, opts.MinBalance, phraseBoost)
+	split(&out, newBitsetFull(len(sorted)), nil, nil, sorted, keywords, kwBits, isPhrase, limit, opts.MinBalance, phraseBoost, opts.Fits)
 	return out
 }
 
-func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords []string, kwBits []*bitset, isPhrase []bool, limit int, minBalance, phraseBoost float64) {
+func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords []string, kwBits []*bitset, isPhrase []bool, limit int, minBalance, phraseBoost float64, fits func(inc, exc []string) bool) {
 	size := set.count()
 	if size == 0 {
 		return
 	}
-	if size <= limit {
+	if size <= limit || (fits != nil && len(inc)+len(exc) > 0 && fits(inc, exc)) {
 		out.Buckets = append(out.Buckets, Bucket{
 			Papers:   hashesOf(sorted, set),
 			Includes: inc,
@@ -209,8 +218,8 @@ func split(out *Outcome, set *bitset, inc, exc []string, sorted []Doc, keywords 
 		return
 	}
 
-	split(out, bestWith, appendPred(inc, keywords[bestK]), exc, sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost)
-	split(out, bestWithout, inc, appendPred(exc, keywords[bestK]), sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost)
+	split(out, bestWith, appendPred(inc, keywords[bestK]), exc, sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost, fits)
+	split(out, bestWithout, inc, appendPred(exc, keywords[bestK]), sorted, keywords, kwBits, isPhrase, limit, minBalance, phraseBoost, fits)
 }
 
 // subsetBalance is the paper's Balance restricted to the current group: 1.0

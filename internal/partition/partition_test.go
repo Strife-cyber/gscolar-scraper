@@ -390,3 +390,35 @@ func TestPartitionOptsPhraseBoostBreaksTies(t *testing.T) {
 		t.Errorf("expected 'alpha beta' to win the boosted tie, got %+v", boosted.Buckets)
 	}
 }
+
+// TestPartitionFitsKeepsGroupWhole: when Fits says a group the corpus reads
+// as over the limit already fits, it becomes one bucket instead of being
+// divided — and the root is never put to Fits.
+func TestPartitionFitsKeepsGroupWhole(t *testing.T) {
+	ds := docs()
+	var asked [][2][]string
+	fits := func(inc, exc []string) bool {
+		asked = append(asked, [2][]string{inc, exc})
+		// The "-alpha" branch (6 docs, over the limit of 5) fits on Scholar.
+		return len(inc) == 0 && len(exc) == 1 && exc[0] == "alpha"
+	}
+	out := PartitionOpts(ds, []string{"alpha", "beta"}, text, 5, Options{Fits: fits})
+
+	if len(out.Buckets) != 3 {
+		t.Fatalf("got %d buckets, want 3 (alpha split by beta, -alpha whole): %+v", len(out.Buckets), out.Buckets)
+	}
+	var whole bool
+	for _, b := range out.Buckets {
+		if len(b.Includes) == 0 && len(b.Excludes) == 1 && b.Excludes[0] == "alpha" {
+			whole = len(b.Papers) == 6
+		}
+	}
+	if !whole {
+		t.Errorf("the -alpha group was divided; Fits said it fits: %+v", out.Buckets)
+	}
+	for _, a := range asked {
+		if len(a[0])+len(a[1]) == 0 {
+			t.Error("Fits was asked about the root")
+		}
+	}
+}
