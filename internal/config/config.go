@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,7 @@ type Config struct {
 	MinePhraseBoost    float64         `json:"mine_phrase_boost"`    // multiplies a multi-word candidate's ranking score so phrases are preferred as splitters over comparably-scored single words (default 1.5, 1.0 = no effect)
 	MaxMinedKeywords   int             `json:"max_mined_keywords"`   // cap on mined keyword candidates fed to the planner (default 200)
 	MinCompletionRatio float64         `json:"min_completion_ratio"` // a task reaching the natural end of results with fewer than this fraction of TotalEstimate papers is flagged incomplete instead of completed (default 0.5)
+	MaxSideFraction    float64         `json:"max_side_fraction"`    // splitter: a keyword is rejected when either side of its split keeps more than this share of the node (default 0.75)
 }
 
 // BrowserConfig describes which browser to drive and where its profile lives.
@@ -65,6 +67,15 @@ type ConferenceCfg struct {
 	Name         string `json:"name"`           // display label, e.g. "ICML"
 	Query        string `json:"query"`          // search-box phrase, e.g. "\"International Conference on Machine Learning\""
 	UseShortName bool   `json:"use_short_name"` // when true, the conference name is used as the query instead of query
+
+	// Type is "conference" (default) or "journal".
+	Type string `json:"type"`
+
+	// Aliases are the other names the venue has been published under, in the
+	// same quoted-phrase form as Query. Each is planned and crawled as its own
+	// search over the whole start_year..end_year range, and its papers belong
+	// to this venue.
+	Aliases []string `json:"aliases"`
 }
 
 // TimingConfig holds the [min,max] delay ranges in milliseconds.
@@ -123,6 +134,15 @@ func (c *Config) EffectiveEndYear() int {
 	return time.Now().Year()
 }
 
+// EffectiveMaxSideFraction returns MaxSideFraction, or its 0.75 default when
+// unset — so a Config built as a struct literal still gets a usable bar.
+func (c *Config) EffectiveMaxSideFraction() float64 {
+	if c.MaxSideFraction > 0 {
+		return c.MaxSideFraction
+	}
+	return 0.75
+}
+
 func (c *Config) applyDefaults() {
 	if c.Database == "" {
 		c.Database = "scholar.db"
@@ -166,9 +186,15 @@ func (c *Config) applyDefaults() {
 	if c.MinCompletionRatio == 0 {
 		c.MinCompletionRatio = 0.5
 	}
+	if c.MaxSideFraction == 0 {
+		c.MaxSideFraction = 0.75
+	}
 	for i := range c.Conferences {
 		if c.Conferences[i].UseShortName {
 			c.Conferences[i].Query = fmt.Sprintf("\"%s\"", c.Conferences[i].Name)
+		}
+		if c.Conferences[i].Type == "" {
+			c.Conferences[i].Type = "conference"
 		}
 	}
 	if c.Browser.DebugPort == 0 {
@@ -243,6 +269,19 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: duplicate conference name %q", conf.Name)
 		}
 		seen[conf.Name] = true
+		if conf.Type != "conference" && conf.Type != "journal" {
+			return fmt.Errorf("config: %s: type must be \"conference\" or \"journal\"", conf.Name)
+		}
+		names := map[string]bool{conf.Query: true}
+		for _, a := range conf.Aliases {
+			if strings.TrimSpace(a) == "" {
+				return fmt.Errorf("config: %s: empty alias", conf.Name)
+			}
+			if names[a] {
+				return fmt.Errorf("config: %s: alias %s repeats another name of the venue", conf.Name, a)
+			}
+			names[a] = true
+		}
 	}
 	if c.Browser.Kind != "" && c.Browser.Kind != "chrome" && c.Browser.Kind != "edge" {
 		return fmt.Errorf("config: browser.kind must be \"chrome\", \"edge\" or empty")
@@ -300,6 +339,9 @@ func (c *Config) validate() error {
 	}
 	if c.MinePhraseBoost <= 0 {
 		return fmt.Errorf("config: mine_phrase_boost must be > 0")
+	}
+	if c.MaxSideFraction < 0.5 || c.MaxSideFraction >= 1 {
+		return fmt.Errorf("config: max_side_fraction must be in [0.5,1)")
 	}
 	if c.MinCompletionRatio <= 0 || c.MinCompletionRatio > 1 {
 		return fmt.Errorf("config: min_completion_ratio must be in (0,1]")
