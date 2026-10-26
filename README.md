@@ -86,8 +86,9 @@ Edit `config.json`:
 | `adaptive_throttle` | delay multiplier growth per CAPTCHA |
 | `timing.captcha_timeout_ms` | how long to wait on a block page before giving up; `0` = forever. A block page that offers **no** CAPTCHA is always bounded (15 min) whatever this says — there is nothing for a human to solve on it |
 | `keywords` | ordered subtraction chain (order matters, see above) |
-| `conferences` | `name` + `query` per venue; `use_short_name` uses `name` as the query |
-| `max_probes` | max keyword searches per split node (default 8) — the first keyword keeping both sides ≤75% of the node is used |
+| `conferences` | `name` + `query` per venue; `use_short_name` uses `name` as the query; `type` is `conference` (default) or `journal`; `aliases` lists the other names the venue was published under (e.g. TNNLS's former "IEEE Transactions on Neural Networks") — each alias is planned and crawled as its own search over the whole `start_year`..`end_year` range, and its papers belong to the venue |
+| `max_probes` | max keyword searches per split node (default 8) — the first keyword keeping both sides ≤ `max_side_fraction` of the node is used |
+| `max_side_fraction` | a split keyword is rejected when either side keeps more than this share of the node (default 0.75). Raising it (e.g. 0.85) accepts more lopsided splits: fewer rejected keywords, but the big side is more often still over the cap and needs another split |
 | `max_probes_per_conf` | hard cap on live Scholar count searches per conference plan (default 60) |
 | `min_balance` / `headroom` / `min_papers_to_trust` / `min_coverage` | split-quality floor / offline bucket size / offline-corpus trust gates |
 | `mine_max_ngram` / `max_mined_keywords` / `min_completion_ratio` | phrase mining depth (2–3-word candidates) and shortfall tuning |
@@ -154,7 +155,8 @@ adds what's new, and machines can merge each other's files both ways.
 
 | table | contents |
 | --- | --- |
-| `conferences` | name + search phrase |
+| `conferences` | name + search phrase (the main name) + `type` (`conference` / `journal`) |
+| `conference_aliases` | the venue's other names; tasks built on an alias carry the venue's `conference_id` |
 | `tasks` | one row per query × year-range × keyword-chain; `page` is the resume pointer |
 | `papers` | deduped papers (hash PK, title/authors/year/snippet/citations/URL, raw `.gs_r` HTML block) |
 | `page_html` | the full raw HTML of every results page |
