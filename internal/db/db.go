@@ -74,7 +74,19 @@ func (d *DB) migrate() error {
 CREATE TABLE IF NOT EXISTS conferences (
     id    INTEGER PRIMARY KEY,
     name  TEXT UNIQUE NOT NULL,
-    query TEXT NOT NULL
+    query TEXT NOT NULL,
+    type  TEXT NOT NULL DEFAULT 'conference' CHECK (type IN ('conference', 'journal'))
+);
+
+-- conference_aliases holds the other names a venue has been published under
+-- (TNNLS was "IEEE Transactions on Neural Networks" until 2011). Each alias is
+-- planned and crawled as its own search over the whole year range, and every
+-- task it produces carries the venue's conference_id, so papers found under
+-- any name belong to the same venue. conferences.query stays the main name.
+CREATE TABLE IF NOT EXISTS conference_aliases (
+    conference_id INTEGER NOT NULL REFERENCES conferences(id),
+    query         TEXT NOT NULL,
+    UNIQUE(conference_id, query)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -168,10 +180,29 @@ CREATE TABLE IF NOT EXISTS plan_harvest_pages (
 	if err := d.ensurePapersColumns(); err != nil {
 		return err
 	}
+	if err := d.ensureConferenceType(); err != nil {
+		return err
+	}
 	if err := d.backfillCitationZero(); err != nil {
 		return err
 	}
 	return d.backfillPaperConferences()
+}
+
+// ensureConferenceType adds conferences.type to a database that predates it.
+// Existing venues take the 'conference' default; the config seeding then sets
+// the journals to 'journal' on the next start.
+func (d *DB) ensureConferenceType() error {
+	var n int
+	if err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('conferences') WHERE name = 'type'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := d.db.Exec(`ALTER TABLE conferences ADD COLUMN type TEXT NOT NULL DEFAULT 'conference' CHECK (type IN ('conference', 'journal'))`)
+	return err
 }
 
 // backfillCitationZero rewrites the NULL citations left by older versions to 0.
@@ -248,29 +279,92 @@ func (d *DB) UpsertConference(ctx context.Context, name, query string) (int64, e
 	return id, err
 }
 
-// Conference is the db layer's view of a conference row.
-type Conference struct {
-	ID    int64
-	Name  string
-	Query string
+// Venue types stored in conferences.type.
+const (
+	TypeConference = "conference"
+	TypeJournal    = "journal"
+)
+
+// SetConferenceType records whether a venue is a conference or a journal.
+func (d *DB) SetConferenceType(ctx context.Context, id int64, typ string) error {
+	_, err := d.db.ExecContext(ctx, `UPDATE conferences SET type = ? WHERE id = ?`, typ, id)
+	return err
 }
 
-// ListConferences returns all conferences ordered by id.
+// SetConferenceAliases makes the venue's stored aliases exactly the given
+// list. Removing an alias only forgets the name: the tasks and papers it
+// already produced are left untouched.
+func (d *DB) SetConferenceAliases(ctx context.Context, id int64, aliases []string) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conference_aliases WHERE conference_id = ?`, id); err != nil {
+		return err
+	}
+	for _, a := range aliases {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO conference_aliases (conference_id, query) VALUES (?, ?)`, id, a); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Conference is the db layer's view of a conference row.
+type Conference struct {
+	ID      int64
+	Name    string
+	Query   string   // main name
+	Type    string   // TypeConference or TypeJournal
+	Aliases []string // other names of the same venue, in insertion order
+}
+
+// Names returns every name the venue is searched under: the main query first,
+// then the aliases.
+func (c Conference) Names() []string {
+	return append([]string{c.Query}, c.Aliases...)
+}
+
+// ListConferences returns all conferences ordered by id, with their aliases.
 func (d *DB) ListConferences(ctx context.Context) ([]Conference, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT id, name, query FROM conferences ORDER BY id`)
+	rows, err := d.db.QueryContext(ctx, `SELECT id, name, query, type FROM conferences ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []Conference
+	idx := map[int64]int{}
 	for rows.Next() {
 		var c Conference
-		if err := rows.Scan(&c.ID, &c.Name, &c.Query); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Query, &c.Type); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		idx[c.ID] = len(out)
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	arows, err := d.db.QueryContext(ctx, `SELECT conference_id, query FROM conference_aliases ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer arows.Close()
+	for arows.Next() {
+		var id int64
+		var q string
+		if err := arows.Scan(&id, &q); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[id]; ok {
+			out[i].Aliases = append(out[i].Aliases, q)
+		}
+	}
+	return out, arows.Err()
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1023,23 @@ func taskIDOrNull(id int64) any {
 // removed so the crawl never re-runs an obsolete query — or, when it already
 // has committed pages, marked 'superseded' (see StatusSuperseded).
 func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keepKeys []string) error {
+	return d.ReplaceNamePlan(ctx, conferenceID, keepKeys, nil)
+}
+
+// TaskHasBase reports whether a task query was built on base: either the bare
+// name itself or the name followed by AND / -NOT keyword terms. Names are
+// quoted phrases, so the closing quote keeps one name from matching a longer
+// one ("IEEE Transactions on Neural Networks" vs "… and Learning Systems").
+func TaskHasBase(query, base string) bool {
+	return query == base || strings.HasPrefix(query, base+" ")
+}
+
+// ReplaceNamePlan is ReplaceConferencePlan for a venue searched under several
+// names, where each name is planned on its own: the tasks built on any of
+// otherNames belong to another name's plan and are left alone, so planning an
+// alias never prunes the main name's tasks or vice versa. Tasks built on a
+// name the venue no longer has are still pruned, as before.
+func (d *DB) ReplaceNamePlan(ctx context.Context, conferenceID int64, keepKeys []string, otherNames []string) error {
 	keep := map[string]bool{}
 	for _, k := range keepKeys {
 		keep[k] = true
@@ -970,6 +1081,9 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 			rows.Close()
 			return err
 		}
+		if hasAnyBase(q, otherNames) {
+			continue
+		}
 		key := taskKey(q, yf, yt, kw)
 		if !keep[key] {
 			stales = append(stales, stale{id: id, key: key, hasPages: hasPages})
@@ -1004,6 +1118,15 @@ func (d *DB) ReplaceConferencePlan(ctx context.Context, conferenceID int64, keep
 		}
 	}
 	return tx.Commit()
+}
+
+func hasAnyBase(query string, bases []string) bool {
+	for _, b := range bases {
+		if TaskHasBase(query, b) {
+			return true
+		}
+	}
+	return false
 }
 
 func taskKey(query string, yearFrom, yearTo int, keywords string) string {
@@ -1194,4 +1317,145 @@ func (d *DB) GetStats(ctx context.Context) (Stats, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// NameStats is the progress of one name of a venue (its main query or an
+// alias): the tasks built on it and the distinct papers those tasks served.
+// A paper found under two names counts under both.
+type NameStats struct {
+	Query     string
+	IsAlias   bool
+	Tasks     int
+	Completed int
+	Papers    int
+}
+
+// VenueStats is the per-venue progress printed by -status. Tasks and
+// Completed cover every task of the venue, including ones built on a name it
+// no longer has; Names is filled per name only for venues with aliases.
+type VenueStats struct {
+	Name      string
+	Type      string
+	Papers    int // distinct papers attributed to the venue (papers.conference_id)
+	Tasks     int
+	Completed int
+	Names     []NameStats
+}
+
+// GetVenueStats reports progress per venue and, for venues with aliases, per
+// name. A task belongs to a name by its query (see TaskHasBase); a paper was
+// served by a task when paper_tasks links them or the task owns it
+// (papers.task_id, the only record for crawls that predate paper_tasks).
+func (d *DB) GetVenueStats(ctx context.Context) ([]VenueStats, error) {
+	confs, err := d.ListConferences(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VenueStats, len(confs))
+	byID := map[int64]int{}
+	for i, c := range confs {
+		byID[c.ID] = i
+		out[i] = VenueStats{Name: c.Name, Type: c.Type}
+		if len(c.Aliases) == 0 {
+			continue
+		}
+		for j, n := range c.Names() {
+			out[i].Names = append(out[i].Names, NameStats{Query: n, IsAlias: j > 0})
+		}
+	}
+
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT conference_id, COUNT(*) FROM papers WHERE conference_id IS NOT NULL GROUP BY conference_id`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if i, ok := byID[id]; ok {
+			out[i].Papers = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// taskName maps a task of an aliased venue to its name's NameStats.
+	taskName := map[int64]*NameStats{}
+	rows, err = d.db.QueryContext(ctx, `SELECT id, conference_id, query, status FROM tasks`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, confID int64
+		var q, status string
+		if err := rows.Scan(&id, &confID, &q, &status); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		i, ok := byID[confID]
+		if !ok {
+			continue
+		}
+		v := &out[i]
+		done := status == StatusCompleted
+		v.Tasks++
+		if done {
+			v.Completed++
+		}
+		for j := range v.Names {
+			if TaskHasBase(q, v.Names[j].Query) {
+				v.Names[j].Tasks++
+				if done {
+					v.Names[j].Completed++
+				}
+				taskName[id] = &v.Names[j]
+				break
+			}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(taskName) == 0 {
+		return out, nil
+	}
+
+	served := map[*NameStats]map[string]struct{}{}
+	rows, err = d.db.QueryContext(ctx, `
+		SELECT hash, task_id FROM paper_tasks
+		UNION
+		SELECT hash, task_id FROM papers WHERE task_id IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash string
+		var taskID int64
+		if err := rows.Scan(&hash, &taskID); err != nil {
+			return nil, err
+		}
+		n, ok := taskName[taskID]
+		if !ok {
+			continue
+		}
+		if served[n] == nil {
+			served[n] = map[string]struct{}{}
+		}
+		served[n][hash] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for n, hashes := range served {
+		n.Papers = len(hashes)
+	}
+	return out, nil
 }
