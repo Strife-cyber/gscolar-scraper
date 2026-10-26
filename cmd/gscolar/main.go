@@ -227,11 +227,19 @@ func main() {
 	}
 }
 
-// seedConferences upserts every config entry into the conferences table.
+// seedConferences upserts every config entry into the conferences table,
+// with its type and aliases.
 func seedConferences(ctx context.Context, d *db.DB, cfgs []config.ConferenceCfg) error {
 	for _, c := range cfgs {
-		if _, err := d.UpsertConference(ctx, c.Name, c.Query); err != nil {
+		id, err := d.UpsertConference(ctx, c.Name, c.Query)
+		if err != nil {
 			return fmt.Errorf("%s: %w", c.Name, err)
+		}
+		if err := d.SetConferenceType(ctx, id, c.Type); err != nil {
+			return fmt.Errorf("%s type: %w", c.Name, err)
+		}
+		if err := d.SetConferenceAliases(ctx, id, c.Aliases); err != nil {
+			return fmt.Errorf("%s aliases: %w", c.Name, err)
 		}
 	}
 	return nil
@@ -279,6 +287,27 @@ func printStatus(ctx context.Context, d *db.DB) {
 	fmt.Printf("pages:        %d raw pages stored\n", s.Pages)
 	fmt.Printf("tasks:        %d pending, %d running, %d completed, %d needs_split, %d incomplete, %d superseded\n",
 		s.Pending, s.Running, s.Completed, s.NeedsSplit, s.Incomplete, s.Superseded)
+
+	venues, err := d.GetVenueStats(ctx)
+	if err != nil {
+		slog.Error("status", "err", err)
+		return
+	}
+	fmt.Println()
+	fmt.Printf("%-16s %-10s %8s %13s\n", "venue", "type", "papers", "tasks done")
+	for _, v := range venues {
+		fmt.Printf("%-16s %-10s %8d %13s\n", v.Name, v.Type, v.Papers, fmt.Sprintf("%d/%d", v.Completed, v.Tasks))
+		// Per-name lines (filled only for venues with aliases). A paper found
+		// under two names counts under both, so these can add up to more than
+		// the venue.
+		for _, n := range v.Names {
+			label := "name "
+			if n.IsAlias {
+				label = "alias"
+			}
+			fmt.Printf("  %s %-60s %8d %13s\n", label, n.Query, n.Papers, fmt.Sprintf("%d/%d", n.Completed, n.Tasks))
+		}
+	}
 }
 
 func usage() {
