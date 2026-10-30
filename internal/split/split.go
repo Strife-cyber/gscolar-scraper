@@ -233,6 +233,16 @@ func ResolveOverCapV(leaf Leaf, keywords []string, count CountFunc, veto VetoFun
 // expected to split THAT branch (not the whole corpus) before any of them
 // are probed. A nil rank leaves the incoming (global-rank) order untouched.
 func ResolveOverCapVR(leaf Leaf, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int) ([]Leaf, bool) {
+	return ResolveOverCapVRS(leaf, keywords, count, veto, rank, probesPerNode, minBalance, limit, DefaultMaxSideFraction)
+}
+
+// DefaultMaxSideFraction is the share of a node either side of a split may
+// keep before the split counts as lopsided (see resolveNode).
+const DefaultMaxSideFraction = 0.75
+
+// ResolveOverCapVRS is ResolveOverCapVR with the lopsided-split threshold
+// given explicitly instead of DefaultMaxSideFraction.
+func ResolveOverCapVRS(leaf Leaf, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int, maxSideFraction float64) ([]Leaf, bool) {
 	var out []Leaf
 
 	resolved := resolveNode(
@@ -248,6 +258,7 @@ func ResolveOverCapVR(leaf Leaf, keywords []string, count CountFunc, veto VetoFu
 		probesPerNode,
 		minBalance,
 		limit,
+		maxSideFraction,
 		nil,
 		nil,
 		&out,
@@ -262,7 +273,7 @@ func ResolveOverCapVR(leaf Leaf, keywords []string, count CountFunc, veto VetoFu
 // positive/negative keyword predicates accumulated along the path; the current
 // node covers 'size' results. A partial split is never returned: if any subtree
 // fails, resolved=false and out is left in an undefined state (caller discards).
-func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int, inc, exc []string, out *[]Leaf, depth int) bool {
+func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []string, count CountFunc, veto VetoFunc, rank RankFunc, probesPerNode int, minBalance float64, limit int, maxSideFraction float64, inc, exc []string, out *[]Leaf, depth int) bool {
 	if size == 0 {
 		return true
 	}
@@ -300,8 +311,9 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	// Probe candidates in (ranked) order; the FIRST one that produces a clean
 	// split is selected and the remaining candidates are never searched. A
 	// split is clean when NEITHER side keeps more than maxSideFraction of the
-	// node — a keyword covering >75% of the results (or leaving >75% behind)
-	// barely divides the corpus, so the next candidate is probed instead.
+	// node (max_side_fraction, 0.75 by default) — a keyword covering more than
+	// that share of the results (or leaving more than that behind) barely
+	// divides the corpus, so the next candidate is probed instead.
 	//
 	// When no probed candidate produces a clean split the node does NOT fail:
 	// the best-dividing candidate seen is used anyway — a forced split. Each
@@ -310,7 +322,6 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	// until it fits or the depth bound is reached. The node only fails when no
 	// probed candidate divides it at all (one side empty) or every valid
 	// candidate is below minBalance.
-	const maxSideFraction = 0.75
 	maxSide := int(float64(size) * maxSideFraction)
 
 	bestIdx := -1
@@ -370,13 +381,13 @@ func resolveNode(base string, yFrom, yTo, size int, hasCount bool, keywords []st
 	withOK := resolveNode(
 		base, yFrom, yTo, bestWith, true,
 		remaining, count, veto, rank, probesPerNode,
-		minBalance, limit,
+		minBalance, limit, maxSideFraction,
 		appendPred(inc, bestKey), exc,
 		&withLeaves, depth+1)
 	withoutOK := resolveNode(
 		base, yFrom, yTo, bestWithout, true,
 		remaining, count, veto, rank, probesPerNode,
-		minBalance, limit,
+		minBalance, limit, maxSideFraction,
 		inc, appendPred(exc, bestKey),
 		&withoutLeaves, depth+1)
 	if !withOK || !withoutOK {

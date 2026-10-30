@@ -75,6 +75,8 @@ func TestTuningValidation(t *testing.T) {
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"max_mined_keywords":-1}`,
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_completion_ratio":1.5}`,
 		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"min_completion_ratio":-0.1}`,
+		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"max_side_fraction":0.4}`,
+		`{"conferences":[{"name":"ICML","query":"\"ICML\""}],"max_side_fraction":1}`,
 	}
 	for _, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {
@@ -93,5 +95,42 @@ func TestUseShortName(t *testing.T) {
 	}
 	if c.Conferences[0].Query != `"AAAI"` {
 		t.Errorf("use_short_name query = %q, want %q", c.Conferences[0].Query, `"AAAI"`)
+	}
+}
+
+// TestVenueTypeAndAliases: type defaults to conference, only conference and
+// journal are accepted, and aliases are loaded as given.
+func TestVenueTypeAndAliases(t *testing.T) {
+	c, err := Parse([]byte(`{"conferences":[
+		{"name":"ICML","query":"\"ICML\""},
+		{"name":"TCYB","query":"\"IEEE Transactions on Cybernetics\"","type":"journal",
+		 "aliases":["\"IEEE Transactions on Systems, Man, and Cybernetics, Part B\""]}]}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.Conferences[0].Type; got != "conference" {
+		t.Errorf("default type = %q, want conference", got)
+	}
+	tcyb := c.Conferences[1]
+	if tcyb.Type != "journal" || len(tcyb.Aliases) != 1 {
+		t.Errorf("TCYB = %+v, want a journal with one alias", tcyb)
+	}
+
+	for _, bad := range []string{
+		`{"conferences":[{"name":"X","query":"\"X\"","type":"magazine"}]}`,
+		`{"conferences":[{"name":"X","query":"\"X\"","aliases":[" "]}]}`,
+		`{"conferences":[{"name":"X","query":"\"X\"","aliases":["\"X\""]}]}`,
+		`{"conferences":[{"name":"X","query":"\"X\"","aliases":["\"Y\"","\"Y\""]}]}`,
+	} {
+		if _, err := Parse([]byte(bad)); err == nil {
+			t.Errorf("Parse(%s) accepted an invalid venue", bad)
+		}
+	}
+}
+
+// TestShippedConfigLoads: the repository's config.json must stay valid.
+func TestShippedConfigLoads(t *testing.T) {
+	if _, err := Load("../../config.json"); err != nil {
+		t.Fatalf("config.json: %v", err)
 	}
 }

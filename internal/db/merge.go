@@ -134,21 +134,30 @@ func affected(res sql.Result) int {
 	return int(n)
 }
 
-// mergeConferences adds the source's unknown conferences and builds
+// mergeConferences adds the source's unknown conferences (with their type
+// and aliases) and builds
 // temp.conf_map (source id -> local id), matched by name.
 func mergeConferences(ctx context.Context, tx *sql.Tx, st *MergeStats) error {
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO main.conferences (name, query)
-		SELECT name, query FROM src.conferences WHERE true
+		INSERT INTO main.conferences (name, query, type)
+		SELECT name, query, type FROM src.conferences WHERE true
 		ON CONFLICT(name) DO NOTHING`)
 	if err != nil {
 		return err
 	}
 	st.Conferences = affected(res)
-	_, err = tx.ExecContext(ctx, `
+	if _, err = tx.ExecContext(ctx, `
 		CREATE TEMP TABLE conf_map AS
 		SELECT s.id AS src_id, m.id AS dst_id
-		FROM src.conferences s JOIN main.conferences m ON m.name = s.name`)
+		FROM src.conferences s JOIN main.conferences m ON m.name = s.name`); err != nil {
+		return err
+	}
+	// Aliases are added, never removed: the local config re-syncs them on the
+	// next start anyway, and the source's tasks may have been built on them.
+	_, err = tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO main.conference_aliases (conference_id, query)
+		SELECT cm.dst_id, a.query
+		FROM src.conference_aliases a JOIN temp.conf_map cm ON cm.src_id = a.conference_id`)
 	return err
 }
 
