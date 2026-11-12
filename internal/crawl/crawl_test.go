@@ -346,10 +346,13 @@ func mkScholarPageCount(items []string, withNext bool, count int) string {
 				`<div class="gs_a">Author %d - Venue, 2005</div>`+
 				`<div class="gs_rs">snippet</div></div></div>`, i, title, i)
 	}
+	// #gs_res_ccl_bot closes every complete results page (it holds the
+	// pagination), so a page built without it reads as cut off.
+	sb.WriteString(`<div id="gs_res_ccl_bot">`)
 	if withNext {
 		sb.WriteString(`<div id="gs_n"><a href="/scholar?start=20"><span class="gs_ico_nav_next"></span></a></div>`)
 	}
-	sb.WriteString(`</body></html>`)
+	sb.WriteString(`</div></body></html>`)
 	return sb.String()
 }
 

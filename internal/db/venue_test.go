@@ -197,3 +197,41 @@ func TestGetVenueStats(t *testing.T) {
 		t.Errorf("names = %+v, want %+v", v.Names, want)
 	}
 }
+
+// TestCommitPageCompleteReplacesCutOffCopy: re-reading a page that was stored
+// cut off replaces it once the new copy is complete; an incomplete copy never
+// overwrites what is stored.
+func TestCommitPageCompleteReplacesCutOffCopy(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "C", `"C"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := d.UpsertTask(ctx, &Task{ConferenceID: confID, Query: `"C"`, YearFrom: 2020, YearTo: 2020})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := func() string {
+		var h string
+		if err := d.db.QueryRow(`SELECT html FROM page_html WHERE task_id = ? AND page_number = 1`, taskID).Scan(&h); err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	commit := func(html string, complete bool) {
+		if _, err := d.CommitPage(ctx, PageCommit{TaskID: taskID, PageNumber: 1, HTML: html, NextPage: 2, Complete: complete}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	commit("cut", false)
+	commit("cut again", false)
+	if got := stored(); got != "cut" {
+		t.Errorf("after an incomplete re-read: %q, want the first copy kept", got)
+	}
+	commit("whole", true)
+	if got := stored(); got != "whole" {
+		t.Errorf("after a complete re-read: %q, want it to replace the cut-off copy", got)
+	}
+}

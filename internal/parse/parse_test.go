@@ -237,10 +237,10 @@ func TestFirstInt(t *testing.T) {
 // TestParseMetaLine covers author/venue/year splitting.
 func TestParseMetaLine(t *testing.T) {
 	cases := []struct {
-		in          string
-		authors     string
-		venue       string
-		year        int
+		in      string
+		authors string
+		venue   string
+		year    int
 	}{
 		{"J Lockwood - Proceedings of the... Innovative Applications of Artificial, 2001 - AAAI Press",
 			"J Lockwood", "Proceedings of the... Innovative Applications of Artificial", 2001},
@@ -321,5 +321,25 @@ func TestParseFallbackItem(t *testing.T) {
 	}
 	if p.Items[1].Title != "Fallback Title Via Bare H3" || p.Items[1].URL != "https://x.org/p2" {
 		t.Errorf("item 1 = %+v", p.Items[1])
+	}
+}
+
+// TestParseComplete: a page is complete only once #gs_res_ccl_bot, which
+// follows the last result, has arrived.
+func TestParseComplete(t *testing.T) {
+	for _, tc := range []struct {
+		html string
+		want bool
+	}{
+		{`<html><body><div class="gs_r gs_or"></div><div id="gs_res_ccl_bot"></div></body></html>`, true},
+		{`<html><body><div class="gs_r gs_or"><div class="gs_ri"></div></div></body></html>`, false},
+	} {
+		p, err := Parse(tc.html)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Complete != tc.want {
+			t.Errorf("Complete = %v for %s, want %v", p.Complete, tc.html, tc.want)
+		}
 	}
 }

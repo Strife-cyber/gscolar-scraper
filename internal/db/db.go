@@ -816,6 +816,11 @@ type PageCommit struct {
 	Papers     []Paper
 	NextPage   int    // new tasks.page pointer
 	Final      bool   // if true, mark the task completed too
+	// Complete marks HTML captured whole (see parse.Page.Complete). A complete
+	// page replaces the stored copy of the same page number, which may be one
+	// cut off by an earlier, too-early read; an incomplete one never
+	// overwrites what is stored.
+	Complete bool
 	ErrMsg     string // if non-empty, set status 'error' with this message
 }
 
@@ -843,9 +848,13 @@ func (d *DB) CommitPage(ctx context.Context, pc PageCommit) (int, error) {
 		return 0, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO page_html (task_id, page_number, html) VALUES (?, ?, ?)`,
-		pc.TaskID, pc.PageNumber, pc.HTML); err != nil {
+	pageSQL := `INSERT OR IGNORE INTO page_html (task_id, page_number, html) VALUES (?, ?, ?)`
+	if pc.Complete {
+		pageSQL = `INSERT INTO page_html (task_id, page_number, html) VALUES (?, ?, ?)
+			ON CONFLICT(task_id, page_number) DO UPDATE SET
+				html = excluded.html, scraped_at = CURRENT_TIMESTAMP`
+	}
+	if _, err := tx.ExecContext(ctx, pageSQL, pc.TaskID, pc.PageNumber, pc.HTML); err != nil {
 		return 0, err
 	}
 

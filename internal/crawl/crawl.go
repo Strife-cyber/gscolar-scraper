@@ -755,17 +755,6 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if err != nil {
 		return nil, false
 	}
-	// The branch-conditional corpus veto: a candidate may only be probed on a
-	// branch when the papers already satisfying that branch's predicates show
-	// it can divide — the term must appear in more than 0 and at most ~75% of
-	// the conditioned subset. "data" inside the AND "network" branch is
-	// measured against network papers only, so a term universal inside the
-	// parent's subset is never searched there.
-	yearTexts := make([]string, 0, len(papers))
-	for _, p := range papers {
-		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
-	}
-	veto := corpusVeto(yearTexts, nil, nil, c.cfg.EffectiveMaxSideFraction())
 	// Coverage is now this venue's share of its own year, which is what decides
 	// whether an offline split can be trusted. Measured against every venue's
 	// papers it read 3593/1860 — capped to 1.0, "we know this year completely" —
@@ -781,6 +770,37 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		return nil, false
 	}
 	trust := len(papers) >= c.cfg.MinPapersToTrust && coverage >= c.cfg.MinCoverage
+
+	// A year known too thinly is partitioned on its neighbours instead: the
+	// venue's papers from year-w to year+w, when there are enough of them.
+	// The thin year's own papers are not just few, they are skewed — mostly
+	// pages harvested while probing, so they over-represent the probed terms.
+	// ICIP 2022 knew 122 papers, 23% of them on "point cloud", against 3% of
+	// the 1611 papers of 2020-2024. A neighbouring window is a fairer sample of
+	// the venue. offlineDocLimit scales the group size from the corpus size,
+	// so a window standing in for one year sizes its buckets correctly, and
+	// every bucket is still verified against Scholar below.
+	if !trust {
+		if wp, ok := c.windowCorpus(ctx, conf, year); ok {
+			c.log.Info(fmt.Sprintf("%s %d: %d known papers (%.1f%% of %d) -> partitioning on %d-%d instead (%d papers)",
+				conf.Name, year, len(papers), 100*coverage, trueCount,
+				year-c.cfg.CoverageWindowYears, year+c.cfg.CoverageWindowYears, len(wp)))
+			papers = wp
+			trust = true
+		}
+	}
+
+	// The branch-conditional corpus veto: a candidate may only be probed on a
+	// branch when the papers already satisfying that branch's predicates show
+	// it can divide — the term must appear in more than 0 and at most
+	// max_side_fraction of the conditioned subset. "data" inside the AND
+	// "network" branch is measured against network papers only, so a term
+	// universal inside the parent's subset is never searched there.
+	yearTexts := make([]string, 0, len(papers))
+	for _, p := range papers {
+		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
+	}
+	veto := corpusVeto(yearTexts, nil, nil, c.cfg.EffectiveMaxSideFraction())
 
 	if trust {
 		byHash := make(map[string]db.Paper, len(papers))
@@ -972,6 +992,21 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		Count:    trueCount,
 		HasCount: true,
 	}, merged, liveOnly(count, budget), veto, rank, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults-1, c.cfg.EffectiveMaxSideFraction())
+}
+
+// windowCorpus returns the venue's papers from year-w to year+w
+// (coverage_window_years), or ok=false when the window is disabled (w = 0)
+// or holds fewer than min_window_papers papers.
+func (c *Crawler) windowCorpus(ctx context.Context, conf db.Conference, year int) ([]db.Paper, bool) {
+	w := c.cfg.CoverageWindowYears
+	if w <= 0 {
+		return nil, false
+	}
+	papers, err := c.db.PapersForConference(ctx, conf.ID, max(year-w, 1), year+w)
+	if err != nil || len(papers) < max(c.cfg.MinWindowPapers, c.cfg.MinPapersToTrust, 1) {
+		return nil, false
+	}
+	return papers, true
 }
 
 // escalateUnresolved retries every Unresolved group from an initial
@@ -1519,6 +1554,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			PageNumber: page,
 			HTML:       html,
 			Papers:     papersFromItems(p.Items, task.ID),
+			Complete:   p.Complete,
 		}
 
 		switch {
@@ -1556,12 +1592,26 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 
 		default:
 			pc.NextPage = page + 1
+			if !p.Complete {
+				// Cut off mid-result: its rows are saved, but it cannot say
+				// whether a next page exists, so the pointer stays on it for
+				// the retry to read it whole.
+				pc.NextPage = page
+			}
 			added, err := c.db.CommitPage(ctx, pc)
 			if err != nil {
 				return err
 			}
 			emptyRuns = 0
 			c.log.Info(fmt.Sprintf("task %d: page %d committed (%d papers, %d new)", task.ID, page, len(p.Items), added))
+			if !p.Complete {
+				// A cut-off page has lost its Next link along with its later
+				// rows; taking that for the last page is what closed tasks
+				// early. Flag it for -rerun-shortfall instead.
+				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, fmt.Sprintf("page %d was read before it finished loading", page))
+				c.log.Info(fmt.Sprintf("task %d: page %d cut off before it finished loading -> error (retry with -rerun-shortfall)", task.ID, page))
+				return nil
+			}
 
 			// Exhaustion by yield, not by pagination. Scholar keeps offering a
 			// "Next" link long after it has run out of distinct results and

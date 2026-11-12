@@ -29,6 +29,11 @@ type Page struct {
 	Blocked   bool
 	NoResults bool // Scholar's "did not match any articles" empty state
 	HasCount  bool
+	// Complete reports that the page was captured whole: Scholar streams the
+	// results page, and #gs_res_ccl_bot (the block holding the pagination)
+	// only arrives after the last result. A page read before it is cut off
+	// mid-result, missing its later rows and its Next link.
+	Complete bool
 }
 
 // Parse inspects a full results-page HTML string (as produced by
@@ -42,6 +47,7 @@ func Parse(htmlStr string) (Page, error) {
 	p.Blocked = isBlockedDoc(doc)
 	p.Count, p.HasCount = resultsCount(doc)
 	p.HasNext = hasNext(doc)
+	p.Complete = doc.Find("#gs_res_ccl_bot").Length() > 0
 	p.NoResults = noResults(doc)
 	if p.NoResults {
 		// A settled zero-result page carries no count text at all ("did not

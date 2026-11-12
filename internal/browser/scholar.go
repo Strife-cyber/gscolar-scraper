@@ -599,8 +599,17 @@ func (b *Browser) WaitForResults(timeout time.Duration) error {
 		// is complete, while all 309 correctly-crawled pages had them. So the
 		// toggles are the marker that the response finished, and only then does
 		// "no rows" mean "no results".
+		//
+		// Rows alone are not "ready" either. Scholar streams the rows too, and
+		// reading the page as soon as the first one appeared captured it cut off
+		// mid-result: 740 of 24,207 stored pages ended inside a result, without
+		// their later rows and without the pagination, so the crawl took them
+		// for the last page and closed 255 tasks early. #gs_res_ccl_bot holds
+		// the pagination and arrives after the last row; it was present on
+		// every complete page and absent from every cut one.
 		ro, err := b.page.Eval(`() => {
-			if (document.querySelectorAll('.gs_r.gs_or').length > 0) return 1;
+			if (document.querySelectorAll('.gs_r.gs_or').length > 0)
+				return document.querySelector('#gs_res_ccl_bot') ? 1 : 0;
 			const md       = document.querySelector('#gs_ab_md');
 			const shell    = document.querySelector('#gs_res_ccl');
 			const rendered = document.querySelectorAll('.gs_in_cb').length > 0;
