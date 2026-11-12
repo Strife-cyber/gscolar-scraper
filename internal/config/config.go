@@ -12,29 +12,31 @@ import (
 // Config is the top-level configuration. All timing values are [min,max]
 // millisecond ranges used to draw uniform-random delays (with jitter).
 type Config struct {
-	Browser            BrowserConfig   `json:"browser"`
-	Conferences        []ConferenceCfg `json:"conferences"`
-	Timing             TimingConfig    `json:"timing"`
-	AdaptiveThrottle   ThrottleConfig  `json:"adaptive_throttle"`
-	Keywords           []string        `json:"keywords"`
-	MaxKeywords        int             `json:"max_keywords"`         // max keywords the split chain may use per query (default 5)
-	Database           string          `json:"database"`             // SQLite file path (default "scholar.db")
-	StartYear          int             `json:"start_year"`           // lower bound for "2000 to present" (default 2000)
-	EndYear            int             `json:"end_year"`             // upper bound of the planning range; 0 = the current year (see EffectiveEndYear)
-	MaxResults         int             `json:"max_results"`          // Scholar's cap (default 1000)
-	IncludeCitations   bool            `json:"include_citations"`    // keep Scholar's citation-only records (entries with no document, known only from being cited). Default false: they inflate every count, can push a window that holds ~900 real articles over the 1000 cap and trigger a pointless keyword split, and they land in the papers table as rows that are not articles
-	MinBalance         float64         `json:"min_balance"`          // splitter: min balance score for a keyword to be used (default 0.15)
-	MaxProbes          int             `json:"max_probes"`           // splitter: max count() probes per node (default 8)
-	Headroom           float64         `json:"headroom"`             // target bucket capacity as a fraction of MaxResults (default 0.8)
-	MinPapersToTrust   int             `json:"min_papers_to_trust"`  // if a year's known-paper corpus is smaller than this, fall back to the count-probe chain (default 10)
-	MinCoverage        float64         `json:"min_coverage"`         // known/true fraction required before offline partitioning is trusted (default 0.5)
-	MaxProbesPerConf   int             `json:"max_probes_per_conf"`  // hard cap on real count searches (browser round-trips) per conference plan (default 60)
-	MineBigrams        bool            `json:"mine_bigrams"`         // legacy: mine two-word phrase candidates (default false) — subsumed by mine_max_ngram
-	MineMaxNGram       int             `json:"mine_max_ngram"`       // mine contiguous phrase candidates up to this many tokens (default 3)
-	MinePhraseBoost    float64         `json:"mine_phrase_boost"`    // multiplies a multi-word candidate's ranking score so phrases are preferred as splitters over comparably-scored single words (default 1.5, 1.0 = no effect)
-	MaxMinedKeywords   int             `json:"max_mined_keywords"`   // cap on mined keyword candidates fed to the planner (default 200)
-	MinCompletionRatio float64         `json:"min_completion_ratio"` // a task reaching the natural end of results with fewer than this fraction of TotalEstimate papers is flagged incomplete instead of completed (default 0.5)
-	MaxSideFraction    float64         `json:"max_side_fraction"`    // splitter: a keyword is rejected when either side of its split keeps more than this share of the node (default 0.75)
+	Browser             BrowserConfig   `json:"browser"`
+	Conferences         []ConferenceCfg `json:"conferences"`
+	Timing              TimingConfig    `json:"timing"`
+	AdaptiveThrottle    ThrottleConfig  `json:"adaptive_throttle"`
+	Keywords            []string        `json:"keywords"`
+	MaxKeywords         int             `json:"max_keywords"`          // max keywords the split chain may use per query (default 5)
+	Database            string          `json:"database"`              // SQLite file path (default "scholar.db")
+	StartYear           int             `json:"start_year"`            // lower bound for "2000 to present" (default 2000)
+	EndYear             int             `json:"end_year"`              // upper bound of the planning range; 0 = the current year (see EffectiveEndYear)
+	MaxResults          int             `json:"max_results"`           // Scholar's cap (default 1000)
+	IncludeCitations    bool            `json:"include_citations"`     // keep Scholar's citation-only records (entries with no document, known only from being cited). Default false: they inflate every count, can push a window that holds ~900 real articles over the 1000 cap and trigger a pointless keyword split, and they land in the papers table as rows that are not articles
+	MinBalance          float64         `json:"min_balance"`           // splitter: min balance score for a keyword to be used (default 0.15)
+	MaxProbes           int             `json:"max_probes"`            // splitter: max count() probes per node (default 8)
+	Headroom            float64         `json:"headroom"`              // target bucket capacity as a fraction of MaxResults (default 0.8)
+	MinPapersToTrust    int             `json:"min_papers_to_trust"`   // if a year's known-paper corpus is smaller than this, fall back to the count-probe chain (default 10)
+	MinCoverage         float64         `json:"min_coverage"`          // known/true fraction required before offline partitioning is trusted (default 0.5)
+	MaxProbesPerConf    int             `json:"max_probes_per_conf"`   // hard cap on real count searches (browser round-trips) per conference plan (default 60)
+	MineBigrams         bool            `json:"mine_bigrams"`          // legacy: mine two-word phrase candidates (default false) — subsumed by mine_max_ngram
+	MineMaxNGram        int             `json:"mine_max_ngram"`        // mine contiguous phrase candidates up to this many tokens (default 3)
+	MinePhraseBoost     float64         `json:"mine_phrase_boost"`     // multiplies a multi-word candidate's ranking score so phrases are preferred as splitters over comparably-scored single words (default 1.5, 1.0 = no effect)
+	MaxMinedKeywords    int             `json:"max_mined_keywords"`    // cap on mined keyword candidates fed to the planner (default 200)
+	MinCompletionRatio  float64         `json:"min_completion_ratio"`  // a task reaching the natural end of results with fewer than this fraction of TotalEstimate papers is flagged incomplete instead of completed (default 0.5)
+	MaxSideFraction     float64         `json:"max_side_fraction"`     // splitter: a keyword is rejected when either side of its split keeps more than this share of the node (default 0.75)
+	CoverageWindowYears int             `json:"coverage_window_years"` // a year known below min_coverage is partitioned on the venue's papers from year-w to year+w instead (default 2; negative disables)
+	MinWindowPapers     int             `json:"min_window_papers"`     // the window is used only when it holds at least this many papers (default 300)
 }
 
 // BrowserConfig describes which browser to drive and where its profile lives.
@@ -189,6 +191,12 @@ func (c *Config) applyDefaults() {
 	if c.MaxSideFraction == 0 {
 		c.MaxSideFraction = 0.75
 	}
+	if c.CoverageWindowYears == 0 {
+		c.CoverageWindowYears = 2
+	}
+	if c.MinWindowPapers == 0 {
+		c.MinWindowPapers = 300
+	}
 	for i := range c.Conferences {
 		if c.Conferences[i].UseShortName {
 			c.Conferences[i].Query = fmt.Sprintf("\"%s\"", c.Conferences[i].Name)
@@ -339,6 +347,9 @@ func (c *Config) validate() error {
 	}
 	if c.MinePhraseBoost <= 0 {
 		return fmt.Errorf("config: mine_phrase_boost must be > 0")
+	}
+	if c.MinWindowPapers < 0 {
+		return fmt.Errorf("config: min_window_papers must be >= 0")
 	}
 	if c.MaxSideFraction < 0.5 || c.MaxSideFraction >= 1 {
 		return fmt.Errorf("config: max_side_fraction must be in [0.5,1)")
