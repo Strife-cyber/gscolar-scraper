@@ -9,6 +9,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -794,13 +795,32 @@ func (d *DB) PaperCount(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// CountPapersForTask reports how many papers are currently attributed to one
-// task, used to detect Scholar under-delivering relative to TotalEstimate.
+// CountPapersForTask reports how many distinct papers a task served, used to
+// detect Scholar under-delivering relative to TotalEstimate. Both records
+// count: paper_tasks, and papers.task_id, the only one kept by crawls older
+// than paper_tasks. Counting paper_tasks alone read those tasks as empty — ICML
+// 2009's "neural" bucket owned 304 papers and was judged "got 0 of ~405".
 func (d *DB) CountPapersForTask(ctx context.Context, taskID int64) (int, error) {
 	var n int
-	err := d.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM paper_tasks WHERE task_id = ?`, taskID).Scan(&n)
+	err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT hash FROM paper_tasks WHERE task_id = ?
+			UNION
+			SELECT hash FROM papers WHERE task_id = ?
+		)`, taskID, taskID).Scan(&n)
 	return n, err
+}
+
+// LastStoredPage returns the highest-numbered page stored for a task and its
+// HTML; ok is false when the task has no stored page.
+func (d *DB) LastStoredPage(ctx context.Context, taskID int64) (page int, html string, ok bool, err error) {
+	err = d.db.QueryRowContext(ctx,
+		`SELECT page_number, html FROM page_html WHERE task_id = ? ORDER BY page_number DESC LIMIT 1`,
+		taskID).Scan(&page, &html)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	return page, html, err == nil, err
 }
 
 // ---------------------------------------------------------------------------
@@ -814,14 +834,14 @@ type PageCommit struct {
 	PageNumber int
 	HTML       string // raw page HTML
 	Papers     []Paper
-	NextPage   int    // new tasks.page pointer
-	Final      bool   // if true, mark the task completed too
+	NextPage   int  // new tasks.page pointer
+	Final      bool // if true, mark the task completed too
 	// Complete marks HTML captured whole (see parse.Page.Complete). A complete
 	// page replaces the stored copy of the same page number, which may be one
 	// cut off by an earlier, too-early read; an incomplete one never
 	// overwrites what is stored.
 	Complete bool
-	ErrMsg     string // if non-empty, set status 'error' with this message
+	ErrMsg   string // if non-empty, set status 'error' with this message
 }
 
 // CommitPage atomically saves a page: raw HTML, dedup'd papers and the task

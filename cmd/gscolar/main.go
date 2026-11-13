@@ -33,6 +33,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -212,6 +213,10 @@ func main() {
 		}
 		if *doPlan && ctx.Err() == nil {
 			need, err := c.PlanConference(ctx, conf)
+			if errors.Is(err, crawl.ErrBrowserGone) {
+				logger.Error(fmt.Sprintf("plan %s: %v. The browser was closed or crashed; restart the scraper.", conf.Name, err))
+				break
+			}
 			if err != nil {
 				logger.Info(fmt.Sprintf("plan %s: %v", conf.Name, err))
 				continue
@@ -220,6 +225,10 @@ func main() {
 		}
 		if *doCrawl && ctx.Err() == nil {
 			if err := c.CrawlConference(ctx, conf.ID); err != nil {
+				if errors.Is(err, crawl.ErrBrowserGone) {
+					logger.Error(fmt.Sprintf("crawl %s: %v. The browser was closed or crashed; restart the scraper.", conf.Name, err))
+					break
+				}
 				logger.Info(fmt.Sprintf("crawl %s: %v", conf.Name, err))
 				continue
 			}

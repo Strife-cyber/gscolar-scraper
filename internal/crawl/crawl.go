@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -74,6 +75,11 @@ type Crawler struct {
 	// per Crawler and persisted in keyword_rank across runs.
 	kwOnce   sync.Once
 	minedKws []string
+
+	// browserLost is set once a plan search finds the browser connection dead.
+	// Count probes then stop searching, and the plan stops before writing a
+	// plan built on counts it never got.
+	browserLost bool
 }
 
 // New builds a Crawler. The browser must already be connected.
@@ -171,6 +177,12 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 		// The probe budget is shared across the name's years so no single year
 		// can consume its whole CAPTCHA allowance.
 		resolved := c.resolveOverCapYears(ctx, v, leaves, split.DropDegenerateKeywords(name, pool), live, budget, false)
+		// Counts that failed because the browser died would be written as a
+		// page of needs_split TODOs (estimate 0) and prune the name's real
+		// plan; keep the stored plan instead.
+		if c.browserLost {
+			return needsSplit, fmt.Errorf("%s %s: %w", conf.Name, name, ErrBrowserGone)
+		}
 		n, err := c.emitTasks(ctx, v, resolved, otherNames(conf, name))
 		if err != nil {
 			return needsSplit, err
@@ -1313,7 +1325,7 @@ func (c *Crawler) budgetCount(ctx context.Context, budget *probeBudget, query st
 	if n, ok, err := c.db.GetCachedCount(ctx, query, yearFrom, yearTo); err == nil && ok {
 		return n, true
 	}
-	if budget.exhausted() {
+	if budget.exhausted() || c.browserLost {
 		return 0, false
 	}
 	budget.left--
@@ -1338,6 +1350,9 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 		}
 		if err != nil {
 			c.log.Info(fmt.Sprintf("plan count search failed (%q %d-%d): %v", query, yearFrom, yearTo, err))
+			if isBrowserGone(err) {
+				c.browserLost = true
+			}
 			return 0, false
 		}
 		break
@@ -1424,6 +1439,19 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			c.log.Info(fmt.Sprintf("task %d page reconciliation failed: %v", t.ID, rerr))
 			continue
 		}
+		// A stored last page that was cut off mid-result is not done: resume
+		// ON it, so it is read whole (and replaces the cut copy), instead of
+		// after it. Moving past it is what kept re-queued tasks from ever
+		// recovering the rows the cut lost.
+		if pn, ok := c.cutOffLastPage(ctx, t.ID); ok {
+			committedNext = pn
+			if t.Page > pn {
+				if uerr := c.db.UpdateTaskPage(ctx, t.ID, pn); uerr == nil {
+					t.Page = pn
+					c.log.Info(fmt.Sprintf("task %d: page %d was stored cut off, resuming on it", t.ID, pn))
+				}
+			}
+		}
 		if committedNext > t.Page {
 			if uerr := c.db.UpdateTaskPage(ctx, t.ID, committedNext); uerr != nil {
 				c.log.Info(fmt.Sprintf("task %d update page failed: %v", t.ID, uerr))
@@ -1442,9 +1470,49 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
+			// With the browser gone every remaining task would fail the same
+			// way within a second, each marked error. Stop instead, leaving
+			// this task pending: nothing about it was at fault.
+			if isBrowserGone(err) {
+				_ = c.db.SetTaskStatus(ctx, t.ID, db.StatusPending, "")
+				return fmt.Errorf("%w: %v", ErrBrowserGone, err)
+			}
 		}
 	}
 	return nil
+}
+
+// cutOffLastPage reports the task's last stored page when that page was cut
+// off mid-result (rows present, pagination block missing).
+func (c *Crawler) cutOffLastPage(ctx context.Context, taskID int64) (int, bool) {
+	pn, html, ok, err := c.db.LastStoredPage(ctx, taskID)
+	if err != nil || !ok {
+		return 0, false
+	}
+	p, err := parse.Parse(html)
+	if err != nil || len(p.Items) == 0 || p.Complete {
+		return 0, false
+	}
+	return pn, true
+}
+
+// ErrBrowserGone reports that the connection to the browser was lost (it was
+// closed or crashed). Every later search would fail the same way, so the plan
+// or crawl stops instead of marking task after task.
+var ErrBrowserGone = errors.New("browser connection lost")
+
+// isBrowserGone recognizes a dead DevTools connection.
+func isBrowserGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "websocket: close") ||
+		strings.Contains(msg, "connection refused")
 }
 
 // RerunShortfall re-queues a conference's 'incomplete' and 'error' tasks back

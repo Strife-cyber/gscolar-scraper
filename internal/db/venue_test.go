@@ -235,3 +235,34 @@ func TestCommitPageCompleteReplacesCutOffCopy(t *testing.T) {
 		t.Errorf("after a complete re-read: %q, want it to replace the cut-off copy", got)
 	}
 }
+
+// TestCountPapersForTaskCountsOwnedPapers: papers a task owns through
+// papers.task_id count even without a paper_tasks row (crawls older than
+// paper_tasks), and a paper recorded both ways counts once.
+func TestCountPapersForTaskCountsOwnedPapers(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	confID, err := d.UpsertConference(ctx, "C", `"C"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := d.UpsertTask(ctx, &Task{ConferenceID: confID, Query: `"C"`, YearFrom: 2009, YearTo: 2009})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CommitPage(ctx, PageCommit{TaskID: taskID, PageNumber: 1, HTML: "<p/>", NextPage: 2,
+		Papers: []Paper{{Hash: "both", Title: "Both", Year: 2009, TaskID: taskID}}}); err != nil {
+		t.Fatal(err)
+	}
+	// An old-style paper: owned by the task, no paper_tasks row.
+	if _, err := d.db.Exec(`INSERT INTO papers (hash, title, year, task_id, conference_id) VALUES ('old', 'Old', 2009, ?, ?)`, taskID, confID); err != nil {
+		t.Fatal(err)
+	}
+	n, err := d.CountPapersForTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("CountPapersForTask = %d, want 2", n)
+	}
+}
