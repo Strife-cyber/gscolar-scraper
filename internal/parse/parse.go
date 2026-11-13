@@ -38,7 +38,19 @@ type Page struct {
 
 // Parse inspects a full results-page HTML string (as produced by
 // page.Content()) and returns everything the crawler needs for one page.
+// A result block it cannot read (no title) is skipped and logged.
 func Parse(htmlStr string) (Page, error) {
+	return parse(htmlStr, func(msg string) { slog.Error(msg) })
+}
+
+// ParseQuiet is Parse without logging unreadable result blocks. It is for
+// pages already known, or expected, to be cut off — re-reading a stored page
+// to check whether it was — where a truncated last block is no news.
+func ParseQuiet(htmlStr string) (Page, error) {
+	return parse(htmlStr, func(string) {})
+}
+
+func parse(htmlStr string, warn func(string)) (Page, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlStr))
 	if err != nil {
 		return Page{}, err
@@ -57,7 +69,7 @@ func Parse(htmlStr string) (Page, error) {
 	}
 
 	doc.Find(".gs_r.gs_or").Each(func(_ int, block *goquery.Selection) {
-		if item, ok := parseItem(block); ok {
+		if item, ok := parseItem(block, warn); ok {
 			p.Items = append(p.Items, item)
 		}
 	})
@@ -225,7 +237,7 @@ func stripToInt(s string) (int, bool) {
 // Result items
 // ---------------------------------------------------------------------------
 
-func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
+func parseItem(block *goquery.Selection, warn func(string)) (model.ResultItem, bool) {
 	// Title container: normally h3.gs_rt, but Scholar occasionally emits
 	// variant markup — try a fallback chain before giving up.
 	h3 := block.Find("h3.gs_rt").First()
@@ -237,7 +249,7 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 		h3 = block.Find(".gs_ri h3").First()
 	}
 	if h3.Length() == 0 {
-		slog.Error(fmt.Sprintf("parse: no title element in result block: %.500s", ItemHTML(block)))
+		warn(fmt.Sprintf("parse: no title element in result block: %.500s", ItemHTML(block)))
 		return model.ResultItem{}, false
 	}
 
@@ -285,7 +297,7 @@ func parseItem(block *goquery.Selection) (model.ResultItem, bool) {
 	}
 
 	if it.Title == "" {
-		slog.Error(fmt.Sprintf("parse: empty title in result block: %.500s", it.RawHTML))
+		warn(fmt.Sprintf("parse: empty title in result block: %.500s", it.RawHTML))
 		return model.ResultItem{}, false
 	}
 	return it, true

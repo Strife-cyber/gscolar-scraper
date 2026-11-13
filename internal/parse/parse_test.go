@@ -1,6 +1,8 @@
 package parse
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -341,5 +343,38 @@ func TestParseComplete(t *testing.T) {
 		if p.Complete != tc.want {
 			t.Errorf("Complete = %v for %s, want %v", p.Complete, tc.html, tc.want)
 		}
+	}
+}
+
+// TestParseQuietDoesNotLog: ParseQuiet reads a page with an unreadable
+// (title-less) block exactly as Parse does, but logs nothing about it.
+func TestParseQuietDoesNotLog(t *testing.T) {
+	html := `<html><body>` +
+		`<div class="gs_r gs_or"><div class="gs_ri"><h3 class="gs_rt"><a href="/x">Kept</a></h3>` +
+		`<div class="gs_a">A Author - Venue, 2020</div></div></div>` +
+		`<div class="gs_r gs_or"><div class="gs_ggs"></div></div>` + // cut off before its title
+		`</body></html>`
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	quiet, err := ParseQuiet(html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("ParseQuiet logged: %s", buf.String())
+	}
+	loud, err := Parse(html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		t.Error("Parse did not log the title-less block")
+	}
+	if len(quiet.Items) != 1 || len(loud.Items) != 1 {
+		t.Errorf("items: quiet %d, loud %d, want 1 each", len(quiet.Items), len(loud.Items))
 	}
 }

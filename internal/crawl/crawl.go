@@ -1489,7 +1489,9 @@ func (c *Crawler) cutOffLastPage(ctx context.Context, taskID int64) (int, bool) 
 	if err != nil || !ok {
 		return 0, false
 	}
-	p, err := parse.Parse(html)
+	// Quiet: the page is being checked precisely because it may be cut off,
+	// and a cut-off last block is then expected, not worth an error line.
+	p, err := parse.ParseQuiet(html)
 	if err != nil || len(p.Items) == 0 || p.Complete {
 		return 0, false
 	}
