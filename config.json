@@ -13,11 +13,13 @@
   "min_coverage": 0.2,
   "max_probes_per_conf": 150,
   "mine_bigrams": false,
-  "mine_max_ngram": 3,
+  "mine_max_ngram": 2,
   "mine_phrase_boost": 4,
   "max_mined_keywords": 200,
   "min_completion_ratio": 0.5,
   "max_side_fraction": 0.85,
+  "coverage_window_years": 2,
+  "min_window_papers": 300,
 
   "browser": {
     "kind": "chrome",
@@ -103,7 +105,7 @@
 
     { "name": "ICPR",        "query": "\"International Conference on Pattern Recognition\"" },
     { "name": "IJCNN",       "query": "\"International Joint Conference on Neural Networks\"" },
-    { "name": "ICIP",        "query": "\"IEEE International Conference on Image Processing\"" },
+    { "name": "ICIP",        "query": "\"International Conference on Image Processing\"" },
     { "name": "IEEEBigData", "query": "\"IEEE International Conference on Big Data\"" },
     { "name": "ESWA",        "query": "\"Expert Systems with Applications\"", "type": "journal" },
     { "name": "TNNLS",       "query": "\"IEEE Transactions on Neural Networks and Learning Systems\"", "type": "journal",

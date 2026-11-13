@@ -1,6 +1,8 @@
 package parse
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,10 +239,10 @@ func TestFirstInt(t *testing.T) {
 // TestParseMetaLine covers author/venue/year splitting.
 func TestParseMetaLine(t *testing.T) {
 	cases := []struct {
-		in          string
-		authors     string
-		venue       string
-		year        int
+		in      string
+		authors string
+		venue   string
+		year    int
 	}{
 		{"J Lockwood - Proceedings of the... Innovative Applications of Artificial, 2001 - AAAI Press",
 			"J Lockwood", "Proceedings of the... Innovative Applications of Artificial", 2001},
@@ -321,5 +323,58 @@ func TestParseFallbackItem(t *testing.T) {
 	}
 	if p.Items[1].Title != "Fallback Title Via Bare H3" || p.Items[1].URL != "https://x.org/p2" {
 		t.Errorf("item 1 = %+v", p.Items[1])
+	}
+}
+
+// TestParseComplete: a page is complete only once #gs_res_ccl_bot, which
+// follows the last result, has arrived.
+func TestParseComplete(t *testing.T) {
+	for _, tc := range []struct {
+		html string
+		want bool
+	}{
+		{`<html><body><div class="gs_r gs_or"></div><div id="gs_res_ccl_bot"></div></body></html>`, true},
+		{`<html><body><div class="gs_r gs_or"><div class="gs_ri"></div></div></body></html>`, false},
+	} {
+		p, err := Parse(tc.html)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Complete != tc.want {
+			t.Errorf("Complete = %v for %s, want %v", p.Complete, tc.html, tc.want)
+		}
+	}
+}
+
+// TestParseQuietDoesNotLog: ParseQuiet reads a page with an unreadable
+// (title-less) block exactly as Parse does, but logs nothing about it.
+func TestParseQuietDoesNotLog(t *testing.T) {
+	html := `<html><body>` +
+		`<div class="gs_r gs_or"><div class="gs_ri"><h3 class="gs_rt"><a href="/x">Kept</a></h3>` +
+		`<div class="gs_a">A Author - Venue, 2020</div></div></div>` +
+		`<div class="gs_r gs_or"><div class="gs_ggs"></div></div>` + // cut off before its title
+		`</body></html>`
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	quiet, err := ParseQuiet(html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("ParseQuiet logged: %s", buf.String())
+	}
+	loud, err := Parse(html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		t.Error("Parse did not log the title-less block")
+	}
+	if len(quiet.Items) != 1 || len(loud.Items) != 1 {
+		t.Errorf("items: quiet %d, loud %d, want 1 each", len(quiet.Items), len(loud.Items))
 	}
 }

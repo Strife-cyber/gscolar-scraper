@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -74,6 +75,11 @@ type Crawler struct {
 	// per Crawler and persisted in keyword_rank across runs.
 	kwOnce   sync.Once
 	minedKws []string
+
+	// browserLost is set once a plan search finds the browser connection dead.
+	// Count probes then stop searching, and the plan stops before writing a
+	// plan built on counts it never got.
+	browserLost bool
 }
 
 // New builds a Crawler. The browser must already be connected.
@@ -171,6 +177,12 @@ func (c *Crawler) PlanConference(ctx context.Context, conf db.Conference) (int, 
 		// The probe budget is shared across the name's years so no single year
 		// can consume its whole CAPTCHA allowance.
 		resolved := c.resolveOverCapYears(ctx, v, leaves, split.DropDegenerateKeywords(name, pool), live, budget, false)
+		// Counts that failed because the browser died would be written as a
+		// page of needs_split TODOs (estimate 0) and prune the name's real
+		// plan; keep the stored plan instead.
+		if c.browserLost {
+			return needsSplit, fmt.Errorf("%s %s: %w", conf.Name, name, ErrBrowserGone)
+		}
 		n, err := c.emitTasks(ctx, v, resolved, otherNames(conf, name))
 		if err != nil {
 			return needsSplit, err
@@ -755,17 +767,6 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 	if err != nil {
 		return nil, false
 	}
-	// The branch-conditional corpus veto: a candidate may only be probed on a
-	// branch when the papers already satisfying that branch's predicates show
-	// it can divide — the term must appear in more than 0 and at most ~75% of
-	// the conditioned subset. "data" inside the AND "network" branch is
-	// measured against network papers only, so a term universal inside the
-	// parent's subset is never searched there.
-	yearTexts := make([]string, 0, len(papers))
-	for _, p := range papers {
-		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
-	}
-	veto := corpusVeto(yearTexts, nil, nil, c.cfg.EffectiveMaxSideFraction())
 	// Coverage is now this venue's share of its own year, which is what decides
 	// whether an offline split can be trusted. Measured against every venue's
 	// papers it read 3593/1860 — capped to 1.0, "we know this year completely" —
@@ -781,6 +782,37 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		return nil, false
 	}
 	trust := len(papers) >= c.cfg.MinPapersToTrust && coverage >= c.cfg.MinCoverage
+
+	// A year known too thinly is partitioned on its neighbours instead: the
+	// venue's papers from year-w to year+w, when there are enough of them.
+	// The thin year's own papers are not just few, they are skewed — mostly
+	// pages harvested while probing, so they over-represent the probed terms.
+	// ICIP 2022 knew 122 papers, 23% of them on "point cloud", against 3% of
+	// the 1611 papers of 2020-2024. A neighbouring window is a fairer sample of
+	// the venue. offlineDocLimit scales the group size from the corpus size,
+	// so a window standing in for one year sizes its buckets correctly, and
+	// every bucket is still verified against Scholar below.
+	if !trust {
+		if wp, ok := c.windowCorpus(ctx, conf, year); ok {
+			c.log.Info(fmt.Sprintf("%s %d: %d known papers (%.1f%% of %d) -> partitioning on %d-%d instead (%d papers)",
+				conf.Name, year, len(papers), 100*coverage, trueCount,
+				year-c.cfg.CoverageWindowYears, year+c.cfg.CoverageWindowYears, len(wp)))
+			papers = wp
+			trust = true
+		}
+	}
+
+	// The branch-conditional corpus veto: a candidate may only be probed on a
+	// branch when the papers already satisfying that branch's predicates show
+	// it can divide — the term must appear in more than 0 and at most
+	// max_side_fraction of the conditioned subset. "data" inside the AND
+	// "network" branch is measured against network papers only, so a term
+	// universal inside the parent's subset is never searched there.
+	yearTexts := make([]string, 0, len(papers))
+	for _, p := range papers {
+		yearTexts = append(yearTexts, p.Title+" "+p.Snippet)
+	}
+	veto := corpusVeto(yearTexts, nil, nil, c.cfg.EffectiveMaxSideFraction())
 
 	if trust {
 		byHash := make(map[string]db.Paper, len(papers))
@@ -972,6 +1004,21 @@ func (c *Crawler) resolveYear(ctx context.Context, conf db.Conference, year, tru
 		Count:    trueCount,
 		HasCount: true,
 	}, merged, liveOnly(count, budget), veto, rank, c.cfg.MaxProbes, c.cfg.MinBalance, c.cfg.MaxResults-1, c.cfg.EffectiveMaxSideFraction())
+}
+
+// windowCorpus returns the venue's papers from year-w to year+w
+// (coverage_window_years), or ok=false when the window is disabled (w = 0)
+// or holds fewer than min_window_papers papers.
+func (c *Crawler) windowCorpus(ctx context.Context, conf db.Conference, year int) ([]db.Paper, bool) {
+	w := c.cfg.CoverageWindowYears
+	if w <= 0 {
+		return nil, false
+	}
+	papers, err := c.db.PapersForConference(ctx, conf.ID, max(year-w, 1), year+w)
+	if err != nil || len(papers) < max(c.cfg.MinWindowPapers, c.cfg.MinPapersToTrust, 1) {
+		return nil, false
+	}
+	return papers, true
 }
 
 // escalateUnresolved retries every Unresolved group from an initial
@@ -1278,7 +1325,7 @@ func (c *Crawler) budgetCount(ctx context.Context, budget *probeBudget, query st
 	if n, ok, err := c.db.GetCachedCount(ctx, query, yearFrom, yearTo); err == nil && ok {
 		return n, true
 	}
-	if budget.exhausted() {
+	if budget.exhausted() || c.browserLost {
 		return 0, false
 	}
 	budget.left--
@@ -1303,6 +1350,9 @@ func (c *Crawler) countForPlan(ctx context.Context, confID int64, query string, 
 		}
 		if err != nil {
 			c.log.Info(fmt.Sprintf("plan count search failed (%q %d-%d): %v", query, yearFrom, yearTo, err))
+			if isBrowserGone(err) {
+				c.browserLost = true
+			}
 			return 0, false
 		}
 		break
@@ -1389,6 +1439,19 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			c.log.Info(fmt.Sprintf("task %d page reconciliation failed: %v", t.ID, rerr))
 			continue
 		}
+		// A stored last page that was cut off mid-result is not done: resume
+		// ON it, so it is read whole (and replaces the cut copy), instead of
+		// after it. Moving past it is what kept re-queued tasks from ever
+		// recovering the rows the cut lost.
+		if pn, ok := c.cutOffLastPage(ctx, t.ID); ok {
+			committedNext = pn
+			if t.Page > pn {
+				if uerr := c.db.UpdateTaskPage(ctx, t.ID, pn); uerr == nil {
+					t.Page = pn
+					c.log.Info(fmt.Sprintf("task %d: page %d was stored cut off, resuming on it", t.ID, pn))
+				}
+			}
+		}
 		if committedNext > t.Page {
 			if uerr := c.db.UpdateTaskPage(ctx, t.ID, committedNext); uerr != nil {
 				c.log.Info(fmt.Sprintf("task %d update page failed: %v", t.ID, uerr))
@@ -1407,9 +1470,51 @@ func (c *Crawler) CrawlConference(ctx context.Context, confID int64) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
+			// With the browser gone every remaining task would fail the same
+			// way within a second, each marked error. Stop instead, leaving
+			// this task pending: nothing about it was at fault.
+			if isBrowserGone(err) {
+				_ = c.db.SetTaskStatus(ctx, t.ID, db.StatusPending, "")
+				return fmt.Errorf("%w: %v", ErrBrowserGone, err)
+			}
 		}
 	}
 	return nil
+}
+
+// cutOffLastPage reports the task's last stored page when that page was cut
+// off mid-result (rows present, pagination block missing).
+func (c *Crawler) cutOffLastPage(ctx context.Context, taskID int64) (int, bool) {
+	pn, html, ok, err := c.db.LastStoredPage(ctx, taskID)
+	if err != nil || !ok {
+		return 0, false
+	}
+	// Quiet: the page is being checked precisely because it may be cut off,
+	// and a cut-off last block is then expected, not worth an error line.
+	p, err := parse.ParseQuiet(html)
+	if err != nil || len(p.Items) == 0 || p.Complete {
+		return 0, false
+	}
+	return pn, true
+}
+
+// ErrBrowserGone reports that the connection to the browser was lost (it was
+// closed or crashed). Every later search would fail the same way, so the plan
+// or crawl stops instead of marking task after task.
+var ErrBrowserGone = errors.New("browser connection lost")
+
+// isBrowserGone recognizes a dead DevTools connection.
+func isBrowserGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "websocket: close") ||
+		strings.Contains(msg, "connection refused")
 }
 
 // RerunShortfall re-queues a conference's 'incomplete' and 'error' tasks back
@@ -1519,6 +1624,7 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 			PageNumber: page,
 			HTML:       html,
 			Papers:     papersFromItems(p.Items, task.ID),
+			Complete:   p.Complete,
 		}
 
 		switch {
@@ -1556,12 +1662,26 @@ func (c *Crawler) crawlTask(ctx context.Context, task db.Task) error {
 
 		default:
 			pc.NextPage = page + 1
+			if !p.Complete {
+				// Cut off mid-result: its rows are saved, but it cannot say
+				// whether a next page exists, so the pointer stays on it for
+				// the retry to read it whole.
+				pc.NextPage = page
+			}
 			added, err := c.db.CommitPage(ctx, pc)
 			if err != nil {
 				return err
 			}
 			emptyRuns = 0
 			c.log.Info(fmt.Sprintf("task %d: page %d committed (%d papers, %d new)", task.ID, page, len(p.Items), added))
+			if !p.Complete {
+				// A cut-off page has lost its Next link along with its later
+				// rows; taking that for the last page is what closed tasks
+				// early. Flag it for -rerun-shortfall instead.
+				_ = c.db.SetTaskStatus(ctx, task.ID, db.StatusError, fmt.Sprintf("page %d was read before it finished loading", page))
+				c.log.Info(fmt.Sprintf("task %d: page %d cut off before it finished loading -> error (retry with -rerun-shortfall)", task.ID, page))
+				return nil
+			}
 
 			// Exhaustion by yield, not by pagination. Scholar keeps offering a
 			// "Next" link long after it has run out of distinct results and

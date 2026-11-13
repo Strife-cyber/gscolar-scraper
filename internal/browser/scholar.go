@@ -506,25 +506,50 @@ func (b *Browser) ClickNext() error {
 	if !b.elementExists(selNext) {
 		return &rod.ElementNotFoundError{}
 	}
-	icon, err := b.page.Element(selNext)
-	if err != nil {
-		return fmt.Errorf("next link not found: %w", err)
-	}
-	link, err := icon.Parent() // the <a href="...start=..."> anchor
-	if err != nil {
-		return err
-	}
 	before := b.URL()
+	advanced := func() bool {
+		u := b.URL()
+		return u != "" && u != before
+	}
+	// The link is looked up afresh for every attempt. A click whose navigation
+	// registers late — Scholar can take well over 5s, especially right after a
+	// CAPTCHA — replaces the page under the old anchor, and clicking that
+	// stale node again failed with "cannot find object: HTMLAnchorElement",
+	// erroring a task whose next page was in fact loading.
 	for range 3 {
-		if err := b.humanClick(link); err != nil {
+		if advanced() {
+			return b.WaitForResults(60 * time.Second)
+		}
+		if !b.elementExists(selNext) {
+			// Not on the old page any more, nor yet on a new one: give a
+			// navigation in flight a moment to show up in the URL.
+			time.Sleep(time.Second)
+			continue
+		}
+		icon, err := b.page.Element(selNext)
+		if err != nil {
+			return fmt.Errorf("next link not found: %w", err)
+		}
+		link, err := icon.Parent() // the <a href="...start=..."> anchor
+		if err != nil {
 			return err
 		}
-		for range 20 { // up to ~5s for the navigation to register
-			if u := b.URL(); u != "" && u != before {
+		if err := b.humanClick(link); err != nil {
+			if advanced() {
+				// The page moved on mid-click: the earlier click took.
+				return b.WaitForResults(60 * time.Second)
+			}
+			return err
+		}
+		for range 40 { // up to ~10s for the navigation to register
+			if advanced() {
 				return b.WaitForResults(60 * time.Second)
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
+	}
+	if advanced() {
+		return b.WaitForResults(60 * time.Second)
 	}
 	return fmt.Errorf("next click did not advance the page (URL stayed %q)", before)
 }
@@ -599,8 +624,17 @@ func (b *Browser) WaitForResults(timeout time.Duration) error {
 		// is complete, while all 309 correctly-crawled pages had them. So the
 		// toggles are the marker that the response finished, and only then does
 		// "no rows" mean "no results".
+		//
+		// Rows alone are not "ready" either. Scholar streams the rows too, and
+		// reading the page as soon as the first one appeared captured it cut off
+		// mid-result: 740 of 24,207 stored pages ended inside a result, without
+		// their later rows and without the pagination, so the crawl took them
+		// for the last page and closed 255 tasks early. #gs_res_ccl_bot holds
+		// the pagination and arrives after the last row; it was present on
+		// every complete page and absent from every cut one.
 		ro, err := b.page.Eval(`() => {
-			if (document.querySelectorAll('.gs_r.gs_or').length > 0) return 1;
+			if (document.querySelectorAll('.gs_r.gs_or').length > 0)
+				return document.querySelector('#gs_res_ccl_bot') ? 1 : 0;
 			const md       = document.querySelector('#gs_ab_md');
 			const shell    = document.querySelector('#gs_res_ccl');
 			const rendered = document.querySelectorAll('.gs_in_cb').length > 0;

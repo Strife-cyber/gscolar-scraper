@@ -2,3 +2,5 @@ scholar.db
 scholar.db-shm
 scholar.db-wal
 merge
+scholar.db
+.idea/db-forest-config.xml
